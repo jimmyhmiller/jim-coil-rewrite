@@ -155,7 +155,7 @@
                               :edge-width (p/call-ptr f 23)
                               :edge-distance (p/call-ptr f 24)
                               :edge-strength (p/call-ptr f 25))]
-                      (if (valid? c) (do (store! out c) (store! accepted true)) 0))
+                      (if (valid? c) (do (set! out c) (set! accepted true)) 0))
                     0)
                 0)
             (dlclose image)

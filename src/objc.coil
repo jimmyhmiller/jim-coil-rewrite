@@ -1,4 +1,4 @@
-(module experiments.coil_gpui.objc)
+(module jim.objc)
 (import "coil.primitive" :as primitive)
 
 (export class sel msg objc_getClass sel_registerName objc_msgSend)

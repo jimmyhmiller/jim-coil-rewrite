@@ -41,4 +41,5 @@ future work.
 The Ghostty dependency is pinned to `7aa9591746ffa4d2eee458960c76554352832595`.
 Its C header is retained under `vendor/`, and the used ABI subset has checks in
 both C and Coil. The Objective-C messaging and animation modules come from the
-existing Coil GPU UI experiment; see `vendor/PROVENANCE.md`.
+existing Coil GPU UI experiment and are maintained in `src/` as Jim modules;
+see [source origins](PROVENANCE.md).

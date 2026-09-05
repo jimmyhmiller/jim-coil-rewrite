@@ -4,7 +4,7 @@
 (import "jim.ghostty" :as g)
 (import "jim.reload" :as theme)
 (import "jim.storage" :as storage)
-(import "experiments.coil_gpui.animation" :as animation)
+(import "jim.animation" :as animation)
 (import "jim.canvas-model" :as model)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
@@ -62,7 +62,7 @@
   (al/al-get [(ptr Pane)] (.panes c) index))
 
 (defn term-of [(v (ptr Pane))] (-> (ptr terminal/Terminal))
-  (load (field v terminal)))
+  (.terminal v))
 
 (defn edge [(c (ptr Canvas)) (index i64)] (-> (ptr i8))
   (load (p/index (field c edges) index)))
@@ -82,8 +82,8 @@
 
 (defn focus! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
   (do
-    (store! (field c focused) chosen)
-    (store! (field c dirty) true)
+    (set! (.focused c) chosen)
+    (set! (.dirty c) true)
     (for [i 0 (count c)]
       (let [v (pane c i)
             active (= (p/cast i64 v) (p/cast i64 chosen))
@@ -116,7 +116,7 @@
             (do
               (for [i (load found) (- (count c) 1)]
                 (al/al-set! [(ptr Pane)] (mut (field c panes)) i (pane c (+ i 1))))
-              (al/al-set! [(ptr Pane)] (mut (field c panes)) (- (count c) 1) chosen))
+              (al/al-set! [(ptr Pane)] (mut (.panes c)) (- (count c) 1) chosen))
             0)))
     (msg i64 (.view c) (sel c"addSubview:positioned:relativeTo:") [(ptr i8) i64 (ptr i8)] (.view chosen) 1 (nil))
     (focus! c chosen)))
@@ -153,10 +153,10 @@
         display (display-camera c)
         scale (* (.scale c) (.zoom display))]
     (do
-      (store! (field c dirty) true)
+      (set! (.dirty c) true)
       (if (and (>= (.gesture c) 2) (!= (p/cast i64 (.drag-pane c)) 0))
-          (store! (field (.drag-pane c) bounds)
-                  (model/dragged-bounds display (.start-world c) (.pointer c) (.start-bounds c) (= (.gesture c) 3)))
+          (set! (.bounds (.drag-pane c))
+                (model/dragged-bounds display (.start-world c) (.pointer c) (.start-bounds c) (= (.gesture c) 3)))
           0)
       (transaction! 0.0)
       (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
@@ -177,9 +177,12 @@
             (frame! (.grip v) (rect (- (.w world) 17.0) 1.0 16.0 17.0))
             (msg i64 (.view v) (sel c"setHidden:") [i8] (p/cast i8 (if (model/visible? screen w h) 0 1)))
             (g/ghostty_surface_set_occlusion (.surface (term-of v)) visible)
-            (if (or (or (< (.render-scale v) scale) (> (.render-scale v) scale))
-                    (or (or (< (.render-w v) (.w world)) (> (.render-w v) (.w world)))
-                        (or (< (.render-h v) (.h world)) (> (.render-h v) (.h world)))))
+            (if (or (< (.render-scale v) scale)
+                    (> (.render-scale v) scale)
+                    (< (.render-w v) (.w world))
+                    (> (.render-w v) (.w world))
+                    (< (.render-h v) (.h world))
+                    (> (.render-h v) (.h world)))
                 (do
                   (terminal/resize! (term-of v) (rect 1.0 12.0 (- (.w world) 2.0) (- (.h world) 48.0)) scale)
                   (store! (field v render-scale) scale)
@@ -191,7 +194,7 @@
 
 (defn apply-theme! [(c (ptr Canvas)) (cfg theme/Config)] (-> void)
   (do
-    (store! (field c theme) cfg)
+    (set! (.theme c) cfg)
     (background! (.view c) (.canvas-r cfg) (.canvas-g cfg) (.canvas-b cfg))
     (for [i 0 (count c)]
       (let [v (pane c i)]
@@ -208,14 +211,14 @@
 (defn create! [(parent (ptr i8)) (width f64) (height f64) (cfg theme/Config)] (-> (ptr Canvas))
   (let [c (alloc/box! (alloc/malloc-allocator) Canvas (p/zeroed Canvas))]
     (do
-      (store! (field c view) (view parent (rect 0.0 0.0 width height)))
-      (store! (field c panes) (al/al-new [(ptr Pane)] (alloc/malloc-allocator)))
-      (store! (field c camera) (model/camera))
-      (store! (field c width) width)
-      (store! (field c height) height)
-      (store! (field c scale) 1.0)
-      (store! (field c zoom-enabled) true)
-      (store! (field c theme) cfg)
+      (set! (.view c) (view parent (rect 0.0 0.0 width height)))
+      (set! (.panes c) (al/al-new [(ptr Pane)] (alloc/malloc-allocator)))
+      (set! (.camera c) (model/camera))
+      (set! (.width c) width)
+      (set! (.height c) height)
+      (set! (.scale c) 1.0)
+      (set! (.zoom-enabled c) true)
+      (set! (.theme c) cfg)
       (msg i64 (layer (.view c)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
       (for [i 0 4]
         (let [l (msg (ptr i8) (class c"CAGradientLayer") (sel c"layer") [])]
@@ -242,23 +245,22 @@
           (alloc/destroy [Pane] (alloc/malloc-allocator) v)
           false)
         (do
-          (store! (field c next-id) (+ (.next-id c) 1))
-          (store! (field v id) (.next-id c))
-          (store! (field v view) host)
-          (store! (field v terminal) t)
-          (store! (field v bounds) bounds)
-          (store! (field v title) (label host c"Terminal" (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0) 12.0 false))
+          (set! (.next-id c) (+ (.next-id c) 1))
+          (set! (.id v) (.next-id c))
+          (set! (.view v) host)
+          (set! (.terminal v) t)
+          (set! (.bounds v) bounds)
+          (set! (.title v) (label host c"Terminal" (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0) 12.0 false))
           (msg i64
                (.title v)
                (sel c"setStringValue:")
                [(ptr i8)]
                (indexed-string c"Terminal " (.id v) c""))
-          (store! (field v close)
-                  (label host c"×" (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0) 17.0 true))
-          (store! (field v grip) (label host c"◢" (rect (- (.w bounds) 17.0) 1.0 16.0 17.0) 10.0 true))
+          (set! (.close v) (label host c"×" (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0) 17.0 true))
+          (set! (.grip v) (label host c"◢" (rect (- (.w bounds) 17.0) 1.0 16.0 17.0) 10.0 true))
           (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
           (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-          (al/al-push! [(ptr Pane)] (mut (field c panes)) v)
+          (al/al-push! [(ptr Pane)] (mut (.panes c)) v)
           (apply-theme! c (.theme c))
           (focus! c v)
           true))))
@@ -271,7 +273,7 @@
 (defn close! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
   (do
     (if (= (p/cast i64 (.drag-pane c)) (p/cast i64 chosen))
-        (do (store! (field c gesture) 0) (store! (field c drag-pane) (no-pane)))
+        (do (set! (.gesture c) 0) (set! (.drag-pane c) (no-pane)))
         0)
     (let [(mut found) -1]
       (do
@@ -280,7 +282,7 @@
             (do
               (for [i (load found) (- (count c) 1)]
                 (al/al-set! [(ptr Pane)] (mut (field c panes)) i (pane c (+ i 1))))
-              (al/al-pop! [(ptr Pane)] (mut (field c panes)))
+              (al/al-pop! [(ptr Pane)] (mut (.panes c)))
               (terminal/free! (term-of chosen))
               (msg i64 (.view chosen) (sel c"removeFromSuperview") [])
               (alloc/destroy [Pane] (alloc/malloc-allocator) chosen)
@@ -296,7 +298,7 @@
       (load found))))
 
 (defn home! [(c (ptr Canvas))] (-> void)
-  (do (store! (field c camera) (model/camera)) (project! c)))
+  (do (set! (.camera c) (model/camera)) (project! c)))
 
 (defn fit! [(c (ptr Canvas))] (-> void)
   (if (= (count c) 0)
@@ -317,11 +319,11 @@
           (let [zx (/ (- (.width c) 64.0) (- (load right) (load x)))
                 zy (/ (- (.height c) 64.0) (- (load bottom) (load y)))
                 z (model/clamp (if (< zx zy) zx zy) 0.2 4.0)]
-            (store! (field c camera)
-                    (model/clamp-camera (model/Camera
-                                          :x (- (load x) (/ 32.0 z))
-                                          :y (- (load y) (/ 32.0 z))
-                                          :zoom z))))
+            (set! (.camera c)
+                  (model/clamp-camera (model/Camera
+                                        :x (- (load x) (/ 32.0 z))
+                                        :y (- (load y) (/ 32.0 z))
+                                        :zoom z))))
           (project! c)))))
 
 ;;; Gesture capture is independent of the pane under the current pointer.
@@ -330,14 +332,11 @@
 (defn handle! [(c (ptr Canvas)) (event (ptr i8))] (-> bool)
   (let [kind (msg i64 event (sel c"type") [])
         flags (msg u64 event (sel c"modifierFlags") [])
-        relevant
-          (or (= kind 1)
-              (or (= kind 2)
-                  (or (= kind 6) (or (= kind 25) (or (= kind 26) (or (= kind 27) (or (= kind 22) (= kind 30))))))))]
+        relevant (or (= kind 1) (= kind 2) (= kind 6) (= kind 25) (= kind 26) (= kind 27) (= kind 22) (= kind 30))]
     (if (or (= kind 10) (= kind 11))
         (do
           (if (= (msg u16 event (sel c"keyCode") []) (p/cast u16 49))
-              (store! (field c space-held) (= kind 10))
+              (set! (.space-held c) (= kind 10))
               0)
           false)
         (if (not relevant)
@@ -349,7 +348,7 @@
                   alt (!= (& flags 524288) (p/cast u64 0))
                   command (!= (& flags 1048576) (p/cast u64 0))]
               (do
-                (store! (field c pointer) screen)
+                (set! (.pointer c) screen)
                 (cond (and (or (= kind 6) (= kind 27)) (> (.gesture c) 0))
                         (do
                           (if (= (.gesture c) 1)
@@ -432,14 +431,14 @@
 
 (defn resize! [(c (ptr Canvas)) (width f64) (height f64) (scale f64)] (-> void)
   (do
-    (store! (field c width) width)
-    (store! (field c height) height)
-    (store! (field c scale) scale)
+    (set! (.width c) width)
+    (set! (.height c) height)
+    (set! (.scale c) scale)
     (frame! (.view c) (rect 0.0 0.0 width height))
     (project! c)))
 
 (defn visibility! [(c (ptr Canvas)) (visible bool)] (-> void)
-  (do (store! (field c visible) visible) (project! c)))
+  (do (set! (.visible c) visible) (project! c)))
 
 (defn free! [(c (ptr Canvas))] (-> void)
   (do
@@ -449,7 +448,7 @@
           (terminal/free! (term-of v))
           (msg i64 (.view v) (sel c"removeFromSuperview") [])
           (alloc/destroy [Pane] (alloc/malloc-allocator) v))))
-    (al/al-free! [(ptr Pane)] (mut (field c panes)))
+    (al/al-free! [(ptr Pane)] (mut (.panes c)))
     (msg i64 (.view c) (sel c"removeFromSuperview") [])
     (alloc/destroy [Canvas] (alloc/malloc-allocator) c)))
 
@@ -501,11 +500,11 @@
       (let [panes (storage/get dict c"panes")
             (mut ok) true]
         (do
-          (store! (field c camera)
-                  (model/Camera
-                    :x (storage/value dict c"x")
-                    :y (storage/value dict c"y")
-                    :zoom (storage/value dict c"zoom")))
+          (set! (.camera c)
+                (model/Camera
+                  :x (storage/value dict c"x")
+                  :y (storage/value dict c"y")
+                  :zoom (storage/value dict c"zoom")))
           (for [i 0 (storage/count panes)]
             (let [r (storage/at panes i)]
               (if (not (add! c
@@ -517,7 +516,7 @@
                   0)))
           (let [focused (storage/value dict c"focused")]
             (if (and (>= focused 0.0) (< focused (p/cast f64 (count c))))
-                (store! (field c focused) (pane c (p/cast i64 focused)))
+                (set! (.focused c) (pane c (p/cast i64 focused)))
                 0))
           (load ok)))))
 
@@ -534,10 +533,9 @@
                    (Point :x (* (.w bounds) 0.5) :y (* (.h bounds) 0.5))
                    root)]
         (do
-          (store! (field c camera)
-                  (model/zoom-at (.camera c) (Point :x (.x center) :y (- (.height c) (.y center))) factor))
+          (set! (.camera c) (model/zoom-at (.camera c) (Point :x (.x center) :y (- (.height c) (.y center))) factor))
           (project! c)))
       (do)))
 
 (defn reset-zoom! [(c (ptr Canvas))] (-> void)
-  (do (store! (field c camera) (model/reset-zoom (.camera c))) (project! c)))
+  (do (set! (.camera c) (model/reset-zoom (.camera c))) (project! c)))

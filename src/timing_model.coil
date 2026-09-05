@@ -19,9 +19,9 @@
 
 (defn push! [(h (ptr History)) (s Sample)] (-> void)
   (do
-    (store! (p/index (field h samples) (.next h)) s)
-    (store! (field h next) (% (+ (.next h) 1) 120))
-    (if (< (.count h) 120) (store! (field h count) (+ (.count h) 1)) 0)
+    (set! (p/index (field h samples) (.next h)) s)
+    (set! (.next h) (% (+ (.next h) 1) 120))
+    (if (< (.count h) 120) (set! (.count h) (+ (.count h) 1)) 0)
     (do)))
 
 (defn summarize [(h (ptr History))] (-> Summary)

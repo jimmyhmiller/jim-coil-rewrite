@@ -1,5 +1,5 @@
 (module jim.native)
-(import "experiments.coil_gpui.objc" :use * :reexport)
+(import "jim.objc" :use * :reexport)
 (import "coil.primitive" :as p)
 
 (defstruct Point [(x f64) (y f64)])

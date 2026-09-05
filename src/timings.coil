@@ -2,7 +2,7 @@
 (import "jim.native" :use *)
 (import "jim.timing-model" :as model)
 (import "jim.canvas-model" :use [clamp])
-(import "experiments.coil_gpui.animation" :as animation)
+(import "jim.animation" :as animation)
 (import "coil.primitive" :as p)
 
 (defstruct Timings
@@ -30,7 +30,7 @@
 
 (defn owns-event? [(event (ptr i8))] (-> bool)
   (let [kind (msg i64 event (sel c"type") [])]
-    (if (and (visible?) (or (and (>= kind 1) (<= kind 7)) (or (= kind 22) (and (>= kind 25) (<= kind 30)))))
+    (if (and (visible?) (or (and (>= kind 1) (<= kind 7)) (= kind 22) (and (>= kind 25) (<= kind 30))))
         (let [pt
                 (msg Point
                      (.view (state))
@@ -106,7 +106,7 @@
       (commit!)
       (if (>= time (.next-label s))
           (do
-            (store! (field s next-label) (+ time 0.25))
+            (set! (.next-label s) (+ time 0.25))
             (msg i64
                  (.headline s)
                  (sel c"setStringValue:")
@@ -146,23 +146,23 @@
         (do
           (if (> (.last s) 0.0)
               (do
-                (store! (field (field s pending) interval) (* 1000.0 (- time (.last s))))
-                (store! (field (field s pending) budget) budget)
+                (set! (.interval (.pending s)) (* 1000.0 (- time (.last s))))
+                (set! (.budget (.pending s)) budget)
                 (model/push! (field s history) (.pending s)))
               (do))
-          (store! (field s pending)
-                  (model/Sample
-                    :interval 0.0
-                    :budget 0.0
-                    :input 0.0
-                    :maintenance 0.0
-                    :windows 0.0
-                    :ghostty 0.0
-                    :overlay 0.0))
-          (store! (field s last) time)
+          (set! (.pending s)
+                (model/Sample
+                  :interval 0.0
+                  :budget 0.0
+                  :input 0.0
+                  :maintenance 0.0
+                  :windows 0.0
+                  :ghostty 0.0
+                  :overlay 0.0))
+          (set! (.last s) time)
           (paint! time)
           (record! 4 (* 1000.0 (- (now) time))))
-        (do (msg i64 link (sel c"setPaused:") [i8] (p/cast i8 1)) (store! (field s last) 0.0) (do)))))
+        (do (msg i64 link (sel c"setPaused:") [i8] (p/cast i8 1)) (set! (.last s) 0.0) (do)))))
 
 (defn toggle! [] (-> void)
   (let [s (state)]
@@ -172,16 +172,16 @@
           (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 1))
           (do))
         (do
-          (store! (field s last) 0.0)
-          (store! (field s pending)
-                  (model/Sample
-                    :interval 0.0
-                    :budget 0.0
-                    :input 0.0
-                    :maintenance 0.0
-                    :windows 0.0
-                    :ghostty 0.0
-                    :overlay 0.0))
+          (set! (.last s) 0.0)
+          (set! (.pending s)
+                (model/Sample
+                  :interval 0.0
+                  :budget 0.0
+                  :input 0.0
+                  :maintenance 0.0
+                  :windows 0.0
+                  :ghostty 0.0
+                  :overlay 0.0))
           (msg i64 (.view s) (sel c"setHidden:") [i8] (p/cast i8 0))
           (msg i64
                (msg (ptr i8) (.owner s) (sel c"contentView") [])
@@ -210,8 +210,8 @@
         bounds (msg Rect content (sel c"bounds") [])
         root (view content (rect (- (.w bounds) 656.0) (- (.h bounds) 466.0) 640.0 450.0))]
     (do
-      (store! (field s view) root)
-      (store! (field s owner) owner)
+      (set! (.view s) root)
+      (set! (.owner s) owner)
       (msg i64 root (sel c"setHidden:") [i8] (p/cast i8 1))
       (msg i64 root (sel c"setAutoresizingMask:") [u64] 9)
       (msg i64 (layer root) (sel c"setCornerRadius:") [f64] 10.0)
@@ -222,17 +222,16 @@
            [(ptr i8)]
            (msg (ptr i8) (color 0.3 0.4 0.5 1.0) (sel c"CGColor") []))
       (background! root 0.055 0.07 0.095)
-      (store! (field s headline)
-              (label root c"Waiting for display callbacks…" (rect 20.0 408.0 560.0 26.0) 19.0 false))
-      (store! (field s detail) (label root c"" (rect 20.0 376.0 600.0 24.0) 12.0 false))
+      (set! (.headline s) (label root c"Waiting for display callbacks…" (rect 20.0 408.0 560.0 26.0) 19.0 false))
+      (set! (.detail s) (label root c"" (rect 20.0 376.0 600.0 24.0) 12.0 false))
       (label root c"Display callback interval" (rect 20.0 337.0 600.0 22.0) 12.0 true)
       (label root
              c"Shell CPU: input · maintenance · AppKit · Ghostty tick · overlay"
              (rect 20.0 191.0 600.0 24.0)
              12.0
              true)
-      (store! (field s stages) (label root c"" (rect 20.0 52.0 610.0 24.0) 10.0 false))
-      (store! (field s scale-label) (label root c"" (rect 20.0 28.0 610.0 24.0) 10.0 true))
+      (set! (.stages s) (label root c"" (rect 20.0 52.0 610.0 24.0) 10.0 false))
+      (set! (.scale-label s) (label root c"" (rect 20.0 28.0 610.0 24.0) 10.0 true))
       (label root
              c"Display cadence ≠ rendered FPS. Ghostty render-thread / GPU timings are not exposed."
              (rect 20.0 6.0 615.0 20.0)
@@ -250,7 +249,7 @@
       (method! cls c"display:" (p/cast (ptr i8) (p/fnptr-of display)) c"v@:@")
       (method! cls c"close:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
-      (store! (field s target) (new c"JimFrameTimings"))
+      (set! (.target s) (new c"JimFrameTimings"))
       (let [close
               (msg (ptr i8)
                    (class c"NSButton")

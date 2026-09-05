@@ -9,7 +9,7 @@
 (import "jim.controls" :as controls)
 (import "jim.palette" :as palette)
 (import "jim.timings" :as timings)
-(import "experiments.coil_gpui.animation" :as animation)
+(import "jim.animation" :as animation)
 (import "jim.reload" :as reload)
 (import "coil.primitive" :as p)
 (import "coil.args" :as args)
@@ -94,9 +94,9 @@
   (let [s (shell)
         selected (workspace/wrap index 4)]
     (do
-      (store! (field s selected) selected)
-      (store! (field s angle) (- 0.0 (workspace/face-angle selected 4)))
-      (store! (field s overview) false)
+      (set! (.selected s) selected)
+      (set! (.angle s) (- 0.0 (workspace/face-angle selected 4)))
+      (set! (.overview s) false)
       ;; Project navigation is an immediate swap, including during an
       ;; unfinished cube transition. Suppress implicit visibility changes too.
       (transaction! 0.0)
@@ -108,8 +108,8 @@
 (defn toggle! [] (-> void)
   (let [s (shell)]
     (do
-      (if (not (.overview s)) (store! (field s origin) (.selected s)) 0)
-      (store! (field s overview) (not (.overview s)))
+      (if (not (.overview s)) (set! (.origin s) (.selected s)) 0)
+      (set! (.overview s) (not (.overview s)))
       (pose! (.duration (.config s))))))
 
 (defn clicked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
@@ -152,8 +152,8 @@
         fh (- height 124.0)
         scale (msg f64 (.window s) (sel c"backingScaleFactor") [])]
     (do
-      (store! (field s width) width)
-      (store! (field s height) height)
+      (set! (.width s) width)
+      (set! (.height s) height)
       (frame! (.sidebar s) (rect 0.0 0.0 rail height))
       (frame! (.stage s) (rect rail 40.0 (- width rail) (- height 40.0)))
       (transform! (layer (.cube s)) (CATransform3DMakeTranslation 0.0 0.0 0.0) 0.0)
@@ -194,8 +194,8 @@
               argv (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
               error (p/alloc-stack (ptr i8))]
           (do
-            (store! error (nil))
-            (store! (field s generation) (+ (.generation s) 1))
+            (set! error (nil))
+            (set! (.generation s) (+ (.generation s) 1))
             (msg i64
                  task
                  (sel c"setExecutableURL:")
@@ -210,7 +210,7 @@
             (msg i64 task (sel c"setArguments:") [(ptr i8)] argv)
             (if (!= (msg i8 task (sel c"launchAndReturnError:") [(ptr (ptr i8))] error) (p/cast i8 0))
                 (do
-                  (store! (field s task) task)
+                  (set! (.task s) task)
                   (store! (field s output) (msg (ptr i8) output (sel c"retain") []))
                   (status! c"Compiling Coil configuration…"))
                 (do (release task) (status! c"Could not launch Coil compiler; see launch environment.")))))
@@ -220,8 +220,10 @@
   (let [s (shell)
         bounds (msg Rect (.root s) (sel c"bounds") [])]
     (do
-      (if (or (or (< (.width s) (.w bounds)) (> (.width s) (.w bounds)))
-              (or (< (.height s) (.h bounds)) (> (.height s) (.h bounds))))
+      (if (or (< (.width s) (.w bounds))
+              (> (.width s) (.w bounds))
+              (< (.height s) (.h bounds))
+              (> (.height s) (.h bounds)))
           (layout!)
           (do))
       (if (and (!= (p/cast i64 (.task s)) 0) (= (msg i8 (.task s) (sel c"isRunning") []) (p/cast i8 0)))
@@ -232,8 +234,8 @@
                 (status! c"Reload failed · keeping last good configuration · see compiler output"))
             (release (.task s))
             (release (.output s))
-            (store! (field s task) (nil))
-            (store! (field s output) (nil)))
+            (set! (.task s) (nil))
+            (set! (.output s) (nil)))
           0)
       (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
             attrs
@@ -246,7 +248,7 @@
             date (msg (ptr i8) attrs (sel c"objectForKey:") [(ptr i8)] (ns c"NSFileModificationDate"))
             stamp (msg f64 date (sel c"timeIntervalSince1970") [])]
         (if (and (> stamp (.stamp s)) (= (p/cast i64 (.task s)) 0))
-            (do (store! (field s stamp) stamp) (reload-start!))
+            (do (set! (.stamp s) stamp) (reload-start!))
             (do))))))
 
 (defn save-layout! [] (-> bool)
@@ -265,13 +267,15 @@
         bounds (msg Rect (.root s) (sel c"bounds") [])
         now (animation/animation-now)]
     (do
-      (if (or (or (< (.width s) (.w bounds)) (> (.width s) (.w bounds)))
-              (or (< (.height s) (.h bounds)) (> (.height s) (.h bounds))))
+      (if (or (< (.width s) (.w bounds))
+              (> (.width s) (.w bounds))
+              (< (.height s) (.h bounds))
+              (> (.height s) (.h bounds)))
           (layout!)
           (do))
       (if (> now (.maintenance-at s))
           (do
-            (store! (field s maintenance-at) (+ now 0.2))
+            (set! (.maintenance-at s) (+ now 0.2))
             (background-maintenance!)
             (let [(mut dirty) false
                   (mut dragging) false]
@@ -295,7 +299,7 @@
                          [(ptr i8) (ptr i8)]
                          (ns c"build/quit-request")
                          (nil))
-                    (store! (field s running) false))
+                    (set! (.running s) false))
                   0)))
           0)
       (do))))
@@ -369,7 +373,7 @@
                           true)
                       :else false))
             (and (.overview s) (= kind 11)) true
-            (and (.overview s) (or (= kind 1) (or (= kind 2) (or (= kind 6) (= kind 22)))))
+            (and (.overview s) (or (= kind 1) (= kind 2) (= kind 6) (= kind 22)))
               (let [pt (msg Point event (sel c"locationInWindow") [])]
                 (if (> (.x pt) (.sidebar (.config s)))
                     (do
@@ -424,11 +428,11 @@
         saved (storage/read)
         cls (objc_allocateClassPair (class c"NSObject") c"JimShellActions" 0)]
     (do
-      (store! (field s app) app)
-      (store! (field s window) window)
-      (store! (field s root) root)
-      (store! (field s config) (reload/defaults))
-      (store! (field s running) true)
+      (set! (.app s) app)
+      (set! (.window s) window)
+      (set! (.root s) root)
+      (set! (.config s) (reload/defaults))
+      (set! (.running s) true)
       (msg i8 app (sel c"setActivationPolicy:") [i64] 0)
       (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns c"Jim · Coil"))
       (msg i64 window (sel c"setReleasedWhenClosed:") [i8] (p/cast i8 0))
@@ -441,7 +445,7 @@
            (msg (ptr i8) (class c"NSAppearance") (sel c"appearanceNamed:") [(ptr i8)] (ns c"NSAppearanceNameDarkAqua")))
       (msg i64 root (sel c"setWantsLayer:") [i8] (p/cast i8 1))
       (background! root 0.045 0.057 0.078)
-      (store! (field s sidebar) (view root (rect 0.0 0.0 224.0 860.0)))
+      (set! (.sidebar s) (view root (rect 0.0 0.0 224.0 860.0)))
       (background! (.sidebar s) 0.075 0.09 0.12)
       (label (.sidebar s) c"J I M" (rect 26.0 798.0 150.0 30.0) 23.0 false)
       (label (.sidebar s) c"YOUR WORKSPACES" (rect 26.0 740.0 185.0 20.0) 10.0 true)
@@ -450,11 +454,11 @@
            (sel c"setAutoresizingMask:")
            [u64]
            0)
-      (store! (field s stage) (view root (rect 224.0 40.0 1096.0 820.0)))
-      (store! (field s cube) (layer-view (.stage s) (rect 32.0 32.0 1032.0 736.0) c"CATransformLayer"))
+      (set! (.stage s) (view root (rect 224.0 40.0 1096.0 820.0)))
+      (set! (.cube s) (layer-view (.stage s) (rect 32.0 32.0 1032.0 736.0) c"CATransformLayer"))
       (msg i64 (layer (.stage s)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-      (store! (field s status) (label root c"Starting Ghostty…" (rect 256.0 10.0 1000.0 20.0) 11.0 true))
-      (store! (field s heading) (label root c"Workspace" (rect 256.0 816.0 400.0 24.0) 17.0 false))
+      (set! (.status s) (label root c"Starting Ghostty…" (rect 256.0 10.0 1000.0 20.0) 11.0 true))
+      (set! (.heading s) (label root c"Workspace" (rect 256.0 816.0 400.0 24.0) 17.0 false))
       (method! cls c"clicked:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
       (let [target (msg (ptr i8) (new c"JimShellActions") (sel c"autorelease") [])]
@@ -507,8 +511,8 @@
               (let [selected (storage/value saved c"selected")]
                 (if (and (>= selected 0.0) (< selected 4.0))
                     (do
-                      (store! (field s selected) (p/cast i64 selected))
-                      (store! (field s angle) (- 0.0 (workspace/face-angle (.selected s) 4))))
+                      (set! (.selected s) (p/cast i64 selected))
+                      (set! (.angle s) (- 0.0 (workspace/face-angle (.selected s) 4))))
                     0))
               (if (load ok) (layout!) (do))
               (load ok)))))))

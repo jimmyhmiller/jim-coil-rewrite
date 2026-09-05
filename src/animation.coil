@@ -1,4 +1,4 @@
-(module experiments.coil_gpui.animation)
+(module jim.animation)
 (import "coil.primitive" :as primitive)
 
 (export Easing
@@ -24,6 +24,7 @@
         spring-active?)
 
 (extern CACurrentMediaTime :cc c [] (-> f64))
+
 (extern fabs :cc c [f64] (-> f64))
 
 (defstruct Easing [(x1 f64) (y1 f64) (x2 f64) (y2 f64)])
@@ -80,42 +81,47 @@
         (mut use-bisection) false]
     (do
       (for [i 0 8]
-        (let [error (- (bezier-coordinate (load t)
-                                          (load (field easing x1))
-                                          (load (field easing x2)))
-                       x)
-              derivative (bezier-derivative (load t)
-                                             (load (field easing x1))
-                                             (load (field easing x2)))]
+        (let [error
+                (- (bezier-coordinate (load t)
+                                      (.x1 easing)
+                                      (.x2 easing))
+                   x)
+              derivative
+                (bezier-derivative (load t)
+                                   (.x1 easing)
+                                   (.x2 easing))]
           (if (< (fabs derivative) 0.000001)
-              (store! use-bisection true)
+              (set! use-bisection true)
               (let [next (- (load t) (/ error derivative))]
                 (if (or (< next 0.0) (> next 1.0))
-                    (store! use-bisection true)
-                    (store! t next))))))
+                    (set! use-bisection true)
+                    (set! t next))))))
       (if (load use-bisection)
-          (let [(mut low) 0.0 (mut high) 1.0]
+          (let [(mut low) 0.0
+                (mut high) 1.0]
             (do
               (for [i 0 24]
                 (let [middle (* (+ (load low) (load high)) 0.5)
-                      estimate (bezier-coordinate middle
-                                                  (load (field easing x1))
-                                                  (load (field easing x2)))]
+                      estimate
+                        (bezier-coordinate middle
+                                           (.x1 easing)
+                                           (.x2 easing))]
                   (do
-                    (store! t middle)
-                    (if (< estimate x) (store! low middle) (store! high middle)))))
+                    (set! t middle)
+                    (if (< estimate x) (set! low middle) (set! high middle)))))
               0))
           0)
-      (bezier-coordinate (load t) (load (field easing y1)) (load (field easing y2))))))
+      (bezier-coordinate (load t) (.y1 easing) (.y2 easing)))))
 
 (defn animation-now [] (-> f64)
   (CACurrentMediaTime))
 
 (defn animation-new [(start f64)
-                      (delay f64)
-                      (duration f64)
-                      (easing Easing)] (-> Animation)
-  (Animation :start start
+                     (delay f64)
+                     (duration f64)
+                     (easing Easing)] (-> Animation)
+  (Animation
+    :start start
     :delay (if (> delay 0.0) delay 0.0)
     :duration (if (> duration 0.000001) duration 0.000001)
     :iterations 1
@@ -126,20 +132,24 @@
 (defn animation-repeat [(animation Animation)
                         (iterations i64)
                         (autoreverse bool)] (-> Animation)
-  (Animation :start (load (field animation start))
-    :delay (load (field animation delay))
-    :duration (load (field animation duration))
+  (Animation
+    :start (.start animation)
+    :delay (.delay animation)
+    :duration (.duration animation)
     :iterations iterations
     :autoreverse autoreverse
-    :easing (load (field animation easing))))
+    :easing (.easing animation)))
 
 (defn animation-sample [(animation Animation) (now f64)] (-> AnimationSample)
-  (let [elapsed (- (- now (load (field animation start))) (load (field animation delay)))]
+  (let [elapsed (- (- now (.start animation)) (.delay animation))]
     (if (<= elapsed 0.0)
-        (AnimationSample :value 0.0 :cycle 0 :finished false)
-        (let [duration (load (field animation duration))
+        (AnimationSample
+          :value 0.0
+          :cycle 0
+          :finished false)
+        (let [duration (.duration animation)
               raw-cycle (primitive/cast i64 (/ elapsed duration))
-              iterations (load (field animation iterations))
+              iterations (.iterations animation)
               finite (> iterations 0)
               finished (and finite (>= raw-cycle iterations))
               cycle (if finished (- iterations 1) raw-cycle)
@@ -148,12 +158,13 @@
                     1.0
                     (/ (- elapsed (* (primitive/cast f64 raw-cycle) duration)) duration))
               directed
-                (if (and (load (field animation autoreverse)) (= (% cycle 2) 1))
+                (if (and (.autoreverse animation) (= (% cycle 2) 1))
                     (- 1.0 local)
                     local)]
           (AnimationSample
-            :value (primitive/cast f32
-                                   (easing-sample (load (field animation easing)) directed))
+            :value
+              (primitive/cast f32
+                              (easing-sample (.easing animation) directed))
             :cycle cycle
             :finished finished)))))
 
@@ -168,8 +179,12 @@
     :epsilon (if (> epsilon 0.0) epsilon 0.001)))
 
 (defn spring-new [(value f64) (target f64) (config SpringConfig)] (-> Spring)
-  (Spring :value value :velocity 0.0 :target target :config config
-    :active (> (fabs (- value target)) (load (field config epsilon)))))
+  (Spring
+    :value value
+    :velocity 0.0
+    :target target
+    :config config
+    :active (> (fabs (- value target)) (.epsilon config))))
 
 ;;; Retargeting deliberately preserves velocity, allowing rapid input changes
 ;;; without discontinuities or restarting a canned easing curve.
@@ -180,40 +195,41 @@
     0))
 
 (defn spring-value [(spring Spring)] (-> f64)
-  (load (field spring value)))
+  (.value spring))
 
 (defn spring-active? [(spring Spring)] (-> bool)
-  (load (field spring active)))
+  (.active spring))
 
 ;;; Semi-implicit Euler integration with 120 Hz substeps remains stable across
 ;;; irregular display ticks. Long pauses are bounded instead of injecting a
 ;;; destructive frame-sized impulse when a window becomes visible again.
 (defn spring-step! [(spring (mut Spring)) (delta-seconds f64)] (-> f64)
-  (if (not (load (field spring active)))
-      (load (field spring value))
-      (let [(mut remaining)
-              (cond (< delta-seconds 0.0) 0.0 (> delta-seconds 0.1) 0.1 :else delta-seconds)
-            config (load (field spring config))]
+  (if (not (.active spring))
+      (.value spring)
+      (let [(mut remaining) (cond (< delta-seconds 0.0) 0.0 (> delta-seconds 0.1) 0.1 :else delta-seconds)
+            config (.config spring)]
         (do
           (while (> (load remaining) 0.0000001)
-            (let [step (if (> (load remaining) (/ 1.0 120.0))
-                           (/ 1.0 120.0)
-                           (load remaining))
-                  displacement (- (load (field spring value)) (load (field spring target)))
-                  force (- (- 0.0 (* (load (field config stiffness)) displacement))
-                           (* (load (field config damping)) (load (field spring velocity))))
-                  acceleration (/ force (load (field config mass)))]
+            (let [step
+                    (if (> (load remaining) (/ 1.0 120.0))
+                        (/ 1.0 120.0)
+                        (load remaining))
+                  displacement (- (.value spring) (.target spring))
+                  force
+                    (- (- 0.0 (* (.stiffness config) displacement))
+                       (* (.damping config) (.velocity spring)))
+                  acceleration (/ force (.mass config))]
               (do
-                (set! (.velocity spring) (+ (load (field spring velocity)) (* acceleration step)))
+                (set! (.velocity spring) (+ (.velocity spring) (* acceleration step)))
                 (set! (.value spring)
-                      (+ (load (field spring value)) (* (load (field spring velocity)) step)))
-                (store! remaining (- (load remaining) step)))))
-          (if (and (<= (fabs (- (load (field spring value)) (load (field spring target))))
-                       (load (field config epsilon)))
-                   (<= (fabs (load (field spring velocity))) (load (field config epsilon))))
+                      (+ (.value spring) (* (.velocity spring) step)))
+                (set! remaining (- (load remaining) step)))))
+          (if (and (<= (fabs (- (.value spring) (.target spring)))
+                       (.epsilon config))
+                   (<= (fabs (.velocity spring)) (.epsilon config)))
               (do
-                (set! (.value spring) (load (field spring target)))
+                (set! (.value spring) (.target spring))
                 (set! (.velocity spring) 0.0)
                 (set! (.active spring) false))
               0)
-          (load (field spring value))))))
+          (.value spring)))))

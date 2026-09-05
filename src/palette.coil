@@ -46,18 +46,18 @@
       (msg i8 (.owner s) (sel c"makeFirstResponder:") [(ptr i8)] (.previous-responder s))
       (msg i64 (.overlay s) (sel c"setHidden:") [i8] (p/cast i8 1))
       (release (.previous-responder s))
-      (store! (field s previous-responder) (nil))
+      (set! (.previous-responder s) (nil))
       (do))))
 
 (defn take-action! [] (-> i64)
   (let [s (state)
         id (.pending s)]
-    (do (store! (field s pending) -1) id)))
+    (do (set! (.pending s) -1) id)))
 
 (defn choose! [] (-> void)
   (let [s (state)]
     (if (> (.count s) 0)
-        (do (store! (field s pending) (load (p/index (field s matches) (.selected s)))) (dismiss!))
+        (do (set! (.pending s) (load (p/index (field s matches) (.selected s)))) (dismiss!))
         (do))))
 
 (defn render! [] (-> void)
@@ -92,9 +92,9 @@
   (let [s (state)
         query (msg (ptr i8) (.search s) (sel c"stringValue") [])]
     (do
-      (store! (field s count) 0)
-      (store! (field s selected) 0)
-      (store! (field s offset) 0)
+      (set! (.count s) 0)
+      (set! (.selected s) 0)
+      (set! (.offset s) 0)
       (for [id 0 (actions/count)]
         (let [score (actions/match-score query id)]
           (if (>= score 0)
@@ -122,7 +122,7 @@
   (let [s (state)
         at (+ (.offset s) (msg i64 sender (sel c"tag") []))]
     (if (and (< at (.count s)) (!= at (.selected s)))
-        (do (store! (field s selected) at) (render!))
+        (do (set! (.selected s) at) (render!))
         (do))))
 
 ;;; Let native editing commands run; silently consume selectors the editor
@@ -133,12 +133,12 @@
         length (msg u64 text (sel c"length") [])
         backward
           (or (= (p/cast i64 selector) (p/cast i64 (sel c"deleteBackward:")))
-              (or (= (p/cast i64 selector) (p/cast i64 (sel c"moveLeft:")))
-                  (= (p/cast i64 selector) (p/cast i64 (sel c"moveBackward:")))))
+              (= (p/cast i64 selector) (p/cast i64 (sel c"moveLeft:")))
+              (= (p/cast i64 selector) (p/cast i64 (sel c"moveBackward:"))))
         forward
           (or (= (p/cast i64 selector) (p/cast i64 (sel c"deleteForward:")))
-              (or (= (p/cast i64 selector) (p/cast i64 (sel c"moveRight:")))
-                  (= (p/cast i64 selector) (p/cast i64 (sel c"moveForward:")))))
+              (= (p/cast i64 selector) (p/cast i64 (sel c"moveRight:")))
+              (= (p/cast i64 selector) (p/cast i64 (sel c"moveForward:"))))
         boundary
           (and (= (.length selection) (p/cast u64 0))
                (or (and backward (= (.location selection) (p/cast u64 0)))
@@ -150,9 +150,9 @@
   (let [s (state)
         next (+ (.selected s) delta)]
     (do
-      (if (and (>= next 0) (< next (.count s))) (store! (field s selected) next) 0)
-      (if (< (.selected s) (.offset s)) (store! (field s offset) (.selected s)) 0)
-      (if (>= (.selected s) (+ (.offset s) 10)) (store! (field s offset) (- (.selected s) 9)) 0)
+      (if (and (>= next 0) (< next (.count s))) (set! (.selected s) next) 0)
+      (if (< (.selected s) (.offset s)) (set! (.offset s) (.selected s)) 0)
+      (if (>= (.selected s) (+ (.offset s) 10)) (set! (.offset s) (- (.selected s) 9)) 0)
       (render!))))
 
 (defn show! [] (-> void)
@@ -161,7 +161,7 @@
     (do
       (store! (field s previous-responder)
               (msg (ptr i8) (msg (ptr i8) (.owner s) (sel c"firstResponder") []) (sel c"retain") []))
-      (store! (field s pending) -1)
+      (set! (.pending s) -1)
       (msg i64 (.search s) (sel c"setStringValue:") [(ptr i8)] (ns c""))
       (filter!)
       (layout!)
@@ -185,8 +185,7 @@
         editor (msg (ptr i8) (.search (state)) (sel c"currentEditor") [])]
     (cond (and (= kind 1) (not inside)) (do (dismiss!) true)
           (and (not inside)
-               (or (and (>= kind 1) (<= kind 9))
-                   (or (= kind 22) (and (>= kind 25) (<= kind 30)))))
+               (or (and (>= kind 1) (<= kind 9)) (= kind 22) (and (>= kind 25) (<= kind 30))))
             true
           (!= (msg i8 editor (sel c"hasMarkedText") []) (p/cast i8 0)) false
           (= kind 10)
@@ -203,8 +202,10 @@
                       (let [flags (msg u64 event (sel c"modifierFlags") [])]
                         (and (!= (& flags 1048576) (p/cast u64 0))
                              (not (or (= key (p/cast u16 0))
-                                      (or (= key (p/cast u16 8))
-                                          (or (= key (p/cast u16 9)) (or (= key (p/cast u16 7)) (= key (p/cast u16 6)))))))))))
+                                      (= key (p/cast u16 8))
+                                      (= key (p/cast u16 9))
+                                      (= key (p/cast u16 7))
+                                      (= key (p/cast u16 6))))))))
           :else false)))
 
 (defn setup! [(owner (ptr i8))] (-> void)
@@ -215,10 +216,10 @@
         overlay (view content bounds)
         root (view overlay (rect 0.0 0.0 620.0 460.0))]
     (do
-      (store! (field s owner) owner)
-      (store! (field s overlay) overlay)
-      (store! (field s card) root)
-      (store! (field s pending) -1)
+      (set! (.owner s) owner)
+      (set! (.overlay s) overlay)
+      (set! (.card s) root)
+      (set! (.pending s) -1)
       (msg i64 overlay (sel c"setHidden:") [i8] (p/cast i8 1))
       (msg i64 overlay (sel c"setAutoresizingMask:") [u64] 18)
       (msg i64
@@ -240,7 +241,7 @@
       (method! cls c"control:textView:doCommandBySelector:" (p/cast (ptr i8) (p/fnptr-of edit-command)) c"c@:@@:")
       (method! cls c"choose:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
-      (store! (field s target) (new c"JimPaletteActions"))
+      (set! (.target s) (new c"JimPaletteActions"))
       (store! (field s search)
               (msg (ptr i8)
                    (msg (ptr i8) (class c"NSSearchField") (sel c"alloc") [])
@@ -260,7 +261,7 @@
             (msg i64 b (sel c"setAlignment:") [i64] 0)
             (msg i64 b (sel c"setWantsLayer:") [i8] (p/cast i8 1))
             (msg i64 root (sel c"addSubview:") [(ptr i8)] b))))
-      (store! (field s hint) (label root c"" (rect 18.0 12.0 584.0 24.0) 12.0 true))
+      (set! (.hint s) (label root c"" (rect 18.0 12.0 584.0 24.0) 12.0 true))
       (do))))
 
 (defn free! [] (-> void)
