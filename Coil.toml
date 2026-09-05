@@ -6,7 +6,7 @@ source-roots = ["src", "tests"]
 [link]
 frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers"]
 libs = ["objc", "c++"]
-flags = ["build/ghostty/lib/libghostty-internal.a"]
+flags = ["build/callbacks.o", "build/session-transport.o", "build/ghostty/lib/libghostty-internal.a"]
 
 [test]
 roots = ["tests"]

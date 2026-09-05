@@ -3,6 +3,10 @@
 (import "jim.actions" :as actions)
 (import "jim.controls" :as controls)
 (import "coil.primitive" :as p)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(defstruct Match [(id i64) (score i64)])
 
 (defstruct Palette
   [(overlay (ptr i8))
@@ -13,8 +17,9 @@
    (hint (ptr i8))
    (target (ptr i8))
    (buttons (array (ptr i8) 10))
-   (matches (array i64 15))
-   (scores (array i64 15))
+   (matches (al/ArrayList Match))
+   (prompt i64)
+   (submission i64)
    (count i64)
    (selected i64)
    (offset i64)
@@ -54,11 +59,23 @@
         id (.pending s)]
     (do (set! (.pending s) -1) id)))
 
+(defn text [] (-> (ptr i8))
+  (msg (ptr i8) (.search (state)) (sel c"stringValue") []))
+
+(defn take-submission! [] (-> i64)
+  (let [id (.submission (state))] (do (set! (.submission (state)) -1) id)))
+
+(defn match-at [(i i64)] (-> Match)
+  (al/al-get [Match] (.matches (state)) i))
+
 (defn choose! [] (-> void)
   (let [s (state)]
-    (if (> (.count s) 0)
-        (do (set! (.pending s) (load (p/index (field s matches) (.selected s)))) (dismiss!))
-        (do))))
+    (cond (>= (.prompt s) 0)
+            (if (> (msg u64 (text) (sel c"length") []) (p/cast u64 0))
+                (do (set! (.submission s) (.prompt s)) (dismiss!))
+                (do))
+          (> (.count s) 0) (let [entry (match-at (.selected s))] (do (set! (.pending s) (.id entry)) (dismiss!)))
+          :else (do))))
 
 (defn render! [] (-> void)
   (let [s (state)]
@@ -69,7 +86,8 @@
           (do
             (msg i64 b (sel c"setHidden:") [i8] (p/cast i8 (if (< at (.count s)) 0 1)))
             (if (< at (.count s))
-                (let [id (load (p/index (field s matches) at))
+                (let [entry (match-at at)
+                      id (.id entry)
                       text
                         (msg (ptr i8) (ns (actions/title id)) (sel c"stringByAppendingString:") [(ptr i8)] (ns c"    "))]
                   (do
@@ -90,27 +108,31 @@
 
 (defn filter! [] (-> void)
   (let [s (state)
-        query (msg (ptr i8) (.search s) (sel c"stringValue") [])]
-    (do
-      (set! (.count s) 0)
-      (set! (.selected s) 0)
-      (set! (.offset s) 0)
-      (for [id 0 (actions/count)]
-        (let [score (actions/match-score query id)]
-          (if (>= score 0)
-              (let [(mut at) (.count s)]
-                (do
-                  (while (and (> (load at) 0) (> score (load (p/index (field s scores) (- (load at) 1)))))
+        query (text)]
+    (if (< (.prompt s) 0)
+        (do
+          (al/al-free! [Match] (mut (.matches s)))
+          (set! (.matches s) (al/al-new [Match] (alloc/malloc-allocator)))
+          (set! (.count s) 0)
+          (set! (.selected s) 0)
+          (set! (.offset s) 0)
+          (for [id 0 (actions/count)]
+            (let [score (actions/match-score query id)]
+              (if (>= score 0)
+                  (let [(mut at) (.count s)]
                     (do
-                      (store! (p/index (field s matches) (load at)) (load (p/index (field s matches) (- (load at) 1))))
-                      (store! (p/index (field s scores) (load at)) (load (p/index (field s scores) (- (load at) 1))))
-                      (store! at (- (load at) 1))))
-                  (store! (p/index (field s matches) (load at)) id)
-                  (store! (p/index (field s scores) (load at)) score)
-                  (store! (field s count) (+ (.count s) 1))
-                  (do)))
-              (do))))
-      (render!))))
+                      (al/al-push! [Match] (mut (.matches s)) (Match :id id :score score))
+                      (while (and (> (load at) 0)
+                                  (let [previous (match-at (- (load at) 1))] (> score (.score previous))))
+                        (do
+                          (al/al-set! [Match] (mut (.matches s)) (load at) (match-at (- (load at) 1)))
+                          (store! at (- (load at) 1))))
+                      (al/al-set! [Match] (mut (.matches s)) (load at) (Match :id id :score score))
+                      (set! (.count s) (+ (.count s) 1))
+                      (do)))
+                  (do))))
+          (render!))
+        (do))))
 
 (defn changed [(self (ptr i8)) (cmd (ptr i8)) (notification (ptr i8))] (-> void)
   (filter!))
@@ -162,12 +184,34 @@
       (store! (field s previous-responder)
               (msg (ptr i8) (msg (ptr i8) (.owner s) (sel c"firstResponder") []) (sel c"retain") []))
       (set! (.pending s) -1)
+      (set! (.prompt s) -1)
+      (msg i64 (.search s) (sel c"setPlaceholderString:") [(ptr i8)] (ns c"Type an action…"))
       (msg i64 (.search s) (sel c"setStringValue:") [(ptr i8)] (ns c""))
       (filter!)
       (layout!)
       (msg i64 content (sel c"addSubview:positioned:relativeTo:") [(ptr i8) i64 (ptr i8)] (.overlay s) 1 (nil))
       (msg i64 (.overlay s) (sel c"setHidden:") [i8] (p/cast i8 0))
       (focus!))))
+
+(defn prompt! [(id i64) (label (ptr i8)) (initial (ptr i8))] (-> void)
+  (do
+    (show!)
+    (set! (.prompt (state)) id)
+    (set! (.count (state)) 0)
+    (for [i 0 10] (msg i64 (load (p/index (field (state) buttons) i)) (sel c"setHidden:") [i8] (p/cast i8 1)))
+    (msg i64 (.search (state)) (sel c"setPlaceholderString:") [(ptr i8)] (ns label))
+    (msg i64 (.search (state)) (sel c"setStringValue:") [(ptr i8)] (ns initial))
+    (msg i64
+         (.hint (state))
+         (sel c"setStringValue:")
+         [(ptr i8)]
+         (msg (ptr i8)
+              (ns label)
+              (sel c"stringByAppendingString:")
+              [(ptr i8)]
+              (ns c"  ·  Return save  ·  Esc cancel")))
+    (msg i64 (.search (state)) (sel c"selectText:") [(ptr i8)] (nil))
+    (do)))
 
 ;;; Native field editor owns text/IME; only navigation keys are intercepted.
 (defn handle! [(event (ptr i8))] (-> bool)
@@ -216,6 +260,9 @@
         overlay (view content bounds)
         root (view overlay (rect 0.0 0.0 620.0 460.0))]
     (do
+      (set! (.matches s) (al/al-new [Match] (alloc/malloc-allocator)))
+      (set! (.prompt s) -1)
+      (set! (.submission s) -1)
       (set! (.owner s) owner)
       (set! (.overlay s) overlay)
       (set! (.card s) root)
@@ -269,5 +316,6 @@
     (if (open?) (dismiss!) (do))
     (release (.search (state)))
     (msg i64 (.overlay (state)) (sel c"removeFromSuperview") [])
+    (al/al-free! [Match] (mut (.matches (state))))
     (release (.target (state)))
     (do)))

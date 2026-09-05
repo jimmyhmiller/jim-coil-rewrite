@@ -1,0 +1,268 @@
+--- a/src/termio/backend.zig
++++ b/src/termio/backend.zig
+@@ -11,28 +11,32 @@
+ const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+ 
+ /// The kinds of backends.
+-pub const Kind = enum { exec };
++pub const Kind = enum { exec, session };
+ 
+ /// Configuration for the various backend types.
+ pub const Config = union(Kind) {
+     /// Exec uses posix exec to run a command with a pty.
+     exec: termio.Exec.Config,
++    session: c_int,
+ };
+ 
+ /// Backend implementations. A backend is responsible for owning the pty
+ /// behavior and providing read/write capabilities.
+ pub const Backend = union(Kind) {
+     exec: termio.Exec,
++    session: @import("Session.zig"),
+ 
+     pub fn deinit(self: *Backend) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(),
++            .session => |*session| session.deinit(),
+         }
+     }
+ 
+     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
+         switch (self.*) {
+             .exec => |*exec| exec.initTerminal(t),
++            .session => |*session| session.initTerminal(t),
+         }
+     }
+ 
+@@ -44,12 +48,14 @@
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.threadEnter(alloc, io, td),
++            .session => |*session| try session.threadEnter(alloc, io, td),
+         }
+     }
+ 
+     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
+         switch (self.*) {
+             .exec => |*exec| exec.threadExit(td),
++            .session => |*session| session.threadExit(td),
+         }
+     }
+ 
+@@ -60,6 +66,7 @@
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.focusGained(td, focused),
++            .session => |*session| try session.focusGained(td, focused),
+         }
+     }
+ 
+@@ -70,6 +77,7 @@
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.resize(grid_size, screen_size),
++            .session => |*session| try session.resize(grid_size, screen_size),
+         }
+     }
+ 
+@@ -82,6 +90,7 @@
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
++            .session => |*session| try session.queueWrite(alloc, td, data, linefeed),
+         }
+     }
+ 
+@@ -99,6 +108,12 @@
+                 exit_code,
+                 runtime_ms,
+             ),
++            .session => |*session| try session.childExitedAbnormally(
++                gpa,
++                t,
++                exit_code,
++                runtime_ms,
++            ),
+         }
+     }
+ 
+@@ -108,6 +123,7 @@
+     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+         return switch (self.*) {
+             .exec => |*exec| exec.getProcessInfo(info),
++            .session => |*session| session.getProcessInfo(info),
+         };
+     }
+ };
+@@ -115,10 +131,12 @@
+ /// Termio thread data. See termio.ThreadData for docs.
+ pub const ThreadData = union(Kind) {
+     exec: termio.Exec.ThreadData,
++    session: @import("Session.zig").ThreadData,
+ 
+     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(alloc),
++            .session => |*session| session.deinit(alloc),
+         }
+     }
+ 
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -76,6 +76,8 @@
+     /// This is set to true when we've seen a title escape sequence. We use
+     /// this to determine if we need to default the window title.
+     seen_title: bool = false,
++    session_render_only: bool = false,
++    session_replaying: bool = false,
+ 
+     pub const Stream = terminal.Stream(StreamHandler);
+ 
+@@ -97,6 +99,7 @@
+     /// isn't guaranteed to happen immediately but it will happen as soon as
+     /// practical.
+     pub inline fn queueRender(self: *StreamHandler) !void {
++        if (self.session_replaying) return;
+         try self.renderer_wakeup.notify();
+     }
+ 
+@@ -126,6 +129,13 @@
+     }
+ 
+     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
++        // The service's Ghostty core owns terminal responses. The renderer
++        // must not answer them a second time, especially during recovery.
++        if (self.session_render_only) switch (msg) {
++            .write_small, .write_stable => return,
++            .write_alloc => |value| { value.alloc.free(value.data); return; },
++            else => {},
++        };
+         self.termio_mailbox.send(msg, self.renderer_state.mutex);
+         self.termio_messaged = true;
+     }
+@@ -200,7 +210,7 @@
+                 try self.terminal.printSlice(value.cps);
+             },
+             .print_repeat => try self.terminal.printRepeat(value),
+-            .bell => self.bell(),
++            .bell => if (!self.session_replaying) self.bell(),
+             .backspace => self.terminal.backspace(),
+             .horizontal_tab => self.horizontalTab(value),
+             .horizontal_tab_back => self.horizontalTabBack(value),
+@@ -320,7 +330,7 @@
+             .decaln => try self.decaln(),
+             .window_title => try self.windowTitle(value.title),
+             .report_pwd => try self.reportPwd(value.url),
+-            .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
++            .show_desktop_notification => if (!self.session_replaying) try self.showDesktopNotification(value.title, value.body),
+             .progress_report => self.progressReport(value),
+             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
+             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
+@@ -1006,6 +1016,7 @@
+     }
+ 
+     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
++        if (self.session_replaying) return;
+         // Note: we ignore the "kind" field and always use the standard clipboard.
+         // iTerm also appears to do this but other terminals seem to only allow
+         // certain. Let's investigate more.
+@@ -1071,7 +1082,7 @@
+         try self.terminal.semanticPrompt(cmd);
+     }
+ 
+-    fn reportPwd(self: *StreamHandler, url: []const u8) !void {
++    pub fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+         // Special handling for the empty URL. We treat the empty URL
+         // as resetting the pwd as if we never saw a pwd. I can't find any
+         // other terminal that does this but it seems like a reasonable
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -417,6 +417,7 @@
+     size: apprt.SurfaceSize,
+     cursor_pos: apprt.CursorPos,
+     inspector: ?*Inspector = null,
++    session_fd: c_int = -1,
+ 
+     /// The current title of the surface. The embedded apprt saves this so
+     /// that getTitle works without the implementer needing to save it.
+@@ -466,10 +467,14 @@
+     };
+ 
+     pub fn init(self: *Surface, app: *App, opts: Options) !void {
++        return self.initSession(app, opts, -1);
++    }
++    pub fn initSession(self: *Surface, app: *App, opts: Options, fd: c_int) !void {
+         self.* = .{
+             .app = app,
+             .platform = try .init(opts.platform_tag, opts.platform),
+             .userdata = opts.userdata,
++            .session_fd = fd,
+             .core_surface = undefined,
+             .content_scale = .{
+                 .x = @floatCast(opts.scale_factor),
+@@ -1550,6 +1555,21 @@
+         return try app.newSurface(opts.*);
+     }
+ 
++    extern "c" fn jim_session_close(fd: c_int) void;
++    export fn ghostty_surface_new_session(app: *App, opts: *const Surface.Options, fd: c_int) ?*Surface {
++        const surface = app.core_app.alloc.create(Surface) catch {
++            jim_session_close(fd);
++            return null;
++        };
++        surface.session_fd = fd;
++        surface.initSession(app, opts.*, fd) catch |err| {
++            if (surface.session_fd >= 0) jim_session_close(surface.session_fd);
++            log.err("error initializing session surface: {}", .{err});
++            app.core_app.alloc.destroy(surface);
++            return null;
++        };
++        return surface;
++    }
+     export fn ghostty_surface_free(ptr: *Surface) void {
+         ptr.app.closeSurface(ptr);
+     }
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -649,7 +649,9 @@
+         );
+ 
+         // Initialize our IO backend
+-        var io_exec = try termio.Exec.init(alloc, .{
++        var io_backend: termio.Backend = if (@hasField(apprt.Surface, "session_fd") and rt_surface.session_fd >= 0)
++            .{ .session = .{ .fd = rt_surface.session_fd } }
++        else .{ .exec = try termio.Exec.init(alloc, .{
+             .command = command,
+             .env = env,
+             .env_override = config.env,
+@@ -661,8 +663,11 @@
+             .term = config.term,
+             .rt_pre_exec_info = .init(config),
+             .rt_post_fork_info = .init(config),
+-        });
+-        errdefer io_exec.deinit();
++        }) };
++        // Ownership has moved to the backend; the embedding error path must
++        // no longer close this descriptor itself.
++        if (@hasField(apprt.Surface, "session_fd")) rt_surface.session_fd = -1;
++        errdefer io_backend.deinit();
+ 
+         // Initialize our IO mailbox
+         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+@@ -672,7 +677,7 @@
+             .size = size,
+             .full_config = config,
+             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+-            .backend = .{ .exec = io_exec },
++            .backend = io_backend,
+             .mailbox = io_mailbox,
+             .renderer_state = &self.renderer_state,
+             .renderer_wakeup = render_thread.wakeup,
+@@ -1323,6 +1328,7 @@
+     // Build up our command for the error message
+     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
+         .exec => |*exec| exec.subprocess.args,
++        .session => &.{},
+     });
+     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
+ 

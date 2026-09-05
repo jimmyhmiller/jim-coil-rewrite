@@ -1,0 +1,92 @@
+(module jim.projects-test)
+(import "jim.projects" :as projects)
+(import "jim.storage" :as s)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+(deftest profiles-share-projects-but-own-visibility
+         (let [root (projects/fresh)
+               first-profile (projects/id (projects/profile root))
+               one (projects/id (projects/new-project! root (ns c"One")))
+               two (projects/id (projects/new-project! root (ns c"Two")))]
+           (projects/hide! root one true)
+           (projects/new-profile! root (ns c"Work"))
+           (assert (projects/hidden? (projects/profile root) one))
+           (projects/hide! root one false)
+           (projects/select! root one)
+           (projects/switch-profile! root first-profile)
+           (assert (= (projects/active root) two))
+           (assert (projects/hidden? (projects/profile root) one))
+           (assert (= (s/count (projects/list root)) 2))))
+
+(deftest new-project-is-hidden-in-other-profiles
+         (let [root (projects/fresh)
+               first-profile (projects/id (projects/profile root))]
+           (projects/new-profile! root (ns c"Work"))
+           (let [one (projects/id (projects/new-project! root (ns c"One")))]
+             (projects/switch-profile! root first-profile)
+             (assert (projects/hidden? (projects/profile root) one))
+             (assert (= (projects/active root) 0))
+             (projects/hide! root one false)
+             (assert (= (projects/active root) one)))))
+
+(deftest removing-project-repairs-every-profile-selection
+         (let [root (projects/fresh)
+               one (projects/id (projects/new-project! root (ns c"One")))
+               two (projects/id (projects/new-project! root (ns c"Two")))]
+           (projects/new-profile! root (ns c"Work"))
+           (projects/delete-project! root two)
+           (assert (= (projects/active root) one))
+           (projects/delete-profile! root)
+           (assert (= (projects/active root) one))
+           (assert (not (projects/delete-profile! root)))
+           (projects/hide! root one true)
+           (assert (= (projects/active root) 0))))
+
+(deftest reorder-keeps-project-identity-and-layout
+         (let [root (projects/fresh)
+               first (projects/new-project! root (ns c"One"))
+               second (projects/new-project! root (ns c"Two"))]
+           (s/put! first c"layout" (ns c"retained"))
+           (projects/reorder! root (projects/id second) (projects/id first))
+           (assert (= (projects/id (s/at (projects/list root) 0)) (projects/id second)))
+           (assert (!= (msg i8
+                            (s/get (s/at (projects/list root) 1) c"layout")
+                            (sel c"isEqualToString:")
+                            [(ptr i8)]
+                            (ns c"retained"))
+                       (p/cast i8 0)))))
+
+(deftest old-layout-migration-preserves-cameras-and-selection
+         (let [old (s/dictionary)
+               items (s/array)
+               layout (s/dictionary)]
+           (s/put! layout c"zoom" (s/number 0.5))
+           (s/add! items layout)
+           (s/put! old c"projects" items)
+           (s/put! old c"selected" (s/number 0.0))
+           (let [root (projects/restore old)
+                 record (s/at (projects/list root) 0)]
+             (assert (= (projects/active root) (projects/id record)))
+             (assert (p/fcmp-eq (s/value (s/get record c"layout") c"zoom") 0.5)))))
+
+(deftest visible-shortcuts-follow-drag-order
+         (let [root (projects/fresh)
+               one (projects/id (projects/new-project! root (ns c"One")))
+               two (projects/id (projects/new-project! root (ns c"Two")))
+               three (projects/id (projects/new-project! root (ns c"Three")))]
+           (projects/hide! root two true)
+           (projects/reorder-at! root one three true)
+           (assert (= (projects/visible-id root 0) three))
+           (assert (= (projects/visible-id root 1) one))
+           (assert (= (projects/visible-id root 2) 0))))
+
+(deftest malformed-project-identities-are-rejected
+         (let [root (projects/fresh)
+               one (projects/new-project! root (ns c"One"))
+               two (projects/new-project! root (ns c"Two"))]
+           (assert (projects/valid? root))
+           (s/put! two c"id" (s/get one c"id"))
+           (assert (not (projects/valid? root)))
+           (s/put! two c"id" (s/number 88.0))
+           (assert (not (projects/valid? root)))))

@@ -1,10 +1,15 @@
 (module jim.actions)
 (import "jim.native" :use *)
 (import "coil.primitive" :as p)
+(import "jim.projects" :as projects)
+(import "jim.storage" :as storage)
+
+(defn model [] (-> (ptr (ptr i8)))
+  (p/alloc-static (ptr i8)))
 
 ;;; Stable action IDs are shared by shortcuts and the searchable registry.
 (defn count [] (-> i64)
-  15)
+  (+ 28 (storage/count (projects/list (load (model))))))
 
 (defn title [(id i64)] (-> (ptr i8))
   (cond (= id 0) c"Terminal: New terminal"
@@ -18,10 +23,29 @@
         (= id 8) c"Workspace: Show or hide cube"
         (= id 9) c"Theme: Reload Coil configuration"
         (= id 10) c"Developer: Toggle frame timings"
-        (= id 11) c"Project: Workspace"
-        (= id 12) c"Project: Development"
-        (= id 13) c"Project: Build & run"
-        :else c"Project: Scratch"))
+        (= id 11) c"Project: First visible project"
+        (= id 12) c"Project: Second visible project"
+        (= id 13) c"Project: Third visible project"
+        (= id 14) c"Project: Fourth visible project"
+        (= id 15) c"Project: New project"
+        (= id 16) c"Project: Rename current project"
+        (= id 17) c"Project: Hide current project"
+        (= id 18) c"Project: Set directory"
+        (= id 19) c"Project: Use focused terminal’s current directory"
+        (= id 20) c"Profile: New profile"
+        (= id 21) c"Profile: Rename current profile"
+        (= id 22) c"Profile: Delete current profile"
+        (= id 23) c"Project: Show or hide hidden projects"
+        (= id 24) c"Profile: Previous profile"
+        (= id 25) c"Profile: Next profile"
+        (= id 26) c"Project: Delete current project"
+        (= id 27) c"Terminal: Reconnect focused terminal"
+        :else
+          (utf8 (msg (ptr i8)
+                     (ns c"Project: ")
+                     (sel c"stringByAppendingString:")
+                     [(ptr i8)]
+                     (storage/get (storage/at (projects/list (load (model))) (- id 28)) c"name")))))
 
 (defn shortcut [(id i64)] (-> (ptr i8))
   (cond (= id 0) c"⌘T"
@@ -90,7 +114,12 @@
 
 (defn match-score [(query (ptr i8)) (id i64)] (-> i64)
   (let [hay (msg (ptr i8) (ns (title id)) (sel c"stringByAppendingString:") [(ptr i8)] (ns (keywords id)))
-        base (score query hay)
+        base
+          (if (and (>= id 28)
+                   (projects/hidden? (projects/profile (load (model)))
+                                     (projects/id (storage/at (projects/list (load (model))) (- id 28)))))
+              -1
+              (score query hay))
         exact (msg Range hay (sel c"rangeOfString:options:") [(ptr i8) u64] query 1)]
     (if (and (>= base 0)
              (and (> (msg u64 query (sel c"length") []) (p/cast u64 0))

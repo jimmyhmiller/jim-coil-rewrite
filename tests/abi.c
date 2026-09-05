@@ -16,4 +16,6 @@ _Static_assert(offsetof(ghostty_runtime_config_s, wakeup_cb) == 16, "wakeup");
 _Static_assert(sizeof(ghostty_target_s) == 16, "target ABI");
 _Static_assert(sizeof(ghostty_action_s) == 32, "action ABI");
 _Static_assert(_Alignof(ghostty_action_s) == 8, "action alignment");
+_Static_assert(GHOSTTY_ACTION_PWD == 35, "pwd action");
+_Static_assert(GHOSTTY_TARGET_SURFACE == 1, "surface target");
 int main(void) { return 0; }

@@ -5,6 +5,10 @@
 (import "jim.workspace" :as workspace)
 (import "jim.canvas" :as canvas)
 (import "jim.storage" :as storage)
+(import "jim.projects" :as projects)
+(import "jim.sidebar" :as sidebar)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
 (import "jim.actions" :as actions)
 (import "jim.controls" :as controls)
 (import "jim.palette" :as palette)
@@ -13,6 +17,8 @@
 (import "jim.reload" :as reload)
 (import "coil.primitive" :as p)
 (import "coil.args" :as args)
+
+(defstruct ProjectView [(id i64) (face (ptr i8)) (canvas (ptr canvas/Canvas))])
 
 (defstruct Shell
   [(app (ptr i8))
@@ -23,9 +29,8 @@
    (cube (ptr i8))
    (status (ptr i8))
    (heading (ptr i8))
-   (faces (array (ptr i8) 4))
-   (canvases (array (ptr canvas/Canvas) 4))
-   (buttons (array (ptr i8) 4))
+   (projects (al/ArrayList ProjectView))
+   (model (ptr i8))
    (notes (ptr i8))
    (config reload/Config)
    (width f64)
@@ -47,34 +52,59 @@
 (defn shell [] (-> (ptr Shell))
   (p/alloc-static Shell))
 
+(defn count [] (-> i64)
+  (al/al-len (.projects (shell))))
+
+(defn runtime [(i i64)] (-> ProjectView)
+  (al/al-get [ProjectView] (.projects (shell)) i))
+
 (defn face [(i i64)] (-> (ptr i8))
-  (load (p/index (field (shell) faces) i)))
+  (let [r (runtime i)] (.face r)))
 
 (defn project [(i i64)] (-> (ptr canvas/Canvas))
-  (load (p/index (field (shell) canvases) i)))
+  (let [r (runtime i)] (.canvas r)))
 
 (defn current [] (-> (ptr canvas/Canvas))
-  (project (.selected (shell))))
+  (if (>= (.selected (shell)) 0) (project (.selected (shell))) (p/cast (ptr canvas/Canvas) 0)))
 
-(defn button [(i i64)] (-> (ptr i8))
-  (load (p/index (field (shell) buttons) i)))
+(defn record [(i i64)] (-> (ptr i8))
+  (let [r (runtime i)] (projects/find (projects/list (.model (shell))) (.id r))))
 
 (defn name [(i i64)] (-> (ptr i8))
-  (cond (= i 0) c"Workspace" (= i 1) c"Development" (= i 2) c"Build & run" :else c"Scratch"))
+  (if (>= i 0) (utf8 (storage/get (record i) c"name")) c"No visible project"))
 
 (defn status! [(text (ptr i8))] (-> i64)
   (msg i64 (.status (shell)) (sel c"setStringValue:") [(ptr i8)] (ns text)))
 
 (defn pose! [(duration f64)] (-> void)
   (let [s (shell)
-        width (- (.width s) (+ (.sidebar (.config s)) 64.0))]
+        width (- (.width s) (+ (sidebar/width) 64.0))]
     (do
-      (transform! (layer (.cube s)) (workspace/root-transform (.angle s) (.overview s) width) duration)
-      (for [i 0 4]
+      (transform! (layer (.cube s))
+                  (if (.overview s)
+                      (workspace/root-transform (.angle s) true width)
+                      (CATransform3DMakeTranslation 0.0 0.0 0.0))
+                  duration)
+      (for [i 0 (count)]
         (do
-          (canvas/visibility! (project i) (or (.overview s) (= i (.selected s))))
-          (msg i64 (face i) (sel c"setHidden:") [i8] (p/cast i8 (if (or (.overview s) (= i (.selected s))) 0 1)))
-          (controls/select! (button i) (= i (.selected s)))))
+          (transform! (layer (face i))
+                      (if (.overview s)
+                          (CATransform3DTranslate (workspace/face-transform i (count) width) 0.0 0.0 (* width 0.5))
+                          (CATransform3DMakeTranslation 0.0 0.0 0.0))
+                      duration)
+          (canvas/visibility! (project i)
+                              (and (not (projects/hidden? (projects/profile (.model s)) (projects/id (record i))))
+                                   (or (.overview s) (= i (.selected s)))))
+          (msg i64
+               (face i)
+               (sel c"setHidden:")
+               [i8]
+               (p/cast i8
+                       (if (and (not (projects/hidden? (projects/profile (.model s)) (projects/id (record i))))
+                                (or (.overview s) (= i (.selected s))))
+                           0
+                           1)))
+          (do)))
       (msg i64
            (.heading s)
            (sel c"setStringValue:")
@@ -87,15 +117,29 @@
                 (do (msg i8 (.window s) (sel c"makeFirstResponder:") [(ptr i8)] (nil)) (do)))
             (status! c"Drag to rotate   ·   ← → choose   ·   Return to enter   ·   Esc to return"))
           (do
-            (if (palette/open?) (palette/focus!) (canvas/focus! (current) (load (field (current) focused))))
+            (if (palette/open?)
+                (palette/focus!)
+                (if (>= (.selected s) 0) (canvas/focus! (current) (load (field (current) focused))) (do)))
             (status! c"⌘ scroll  Pan   ·   ⌘⌥ scroll / pinch  Zoom   ·   Space / middle drag  Pan   ·   ⌘⇧0  Origin"))))))
+
+(defn visible-index [(index i64) (direction i64)] (-> i64)
+  (let [(mut candidate) (workspace/wrap index (count))]
+    (do
+      (for [i 0 (count)]
+        (let [r (runtime (load candidate))]
+          (if (projects/hidden? (projects/profile (.model (shell))) (.id r))
+              (store! candidate (workspace/wrap (+ (load candidate) direction) (count)))
+              0)))
+      (load candidate))))
 
 (defn select! [(index i64)] (-> void)
   (let [s (shell)
-        selected (workspace/wrap index 4)]
+        selected (visible-index index 1)]
     (do
       (set! (.selected s) selected)
-      (set! (.angle s) (- 0.0 (workspace/face-angle selected 4)))
+      (let [r (runtime selected)] (do) (projects/select! (.model s) (.id r)))
+      (sidebar/refresh!)
+      (set! (.angle s) (- 0.0 (workspace/face-angle selected (count))))
       (set! (.overview s) false)
       ;; Project navigation is an immediate swap, including during an
       ;; unfinished cube transition. Suppress implicit visibility changes too.
@@ -112,52 +156,22 @@
       (set! (.overview s) (not (.overview s)))
       (pose! (.duration (.config s))))))
 
-(defn clicked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
-  (let [tag (msg i64 sender (sel c"tag") [])]
-    (cond (= tag 10) (toggle!)
-          (= tag 11)
-            (do
-              (if (.overview (shell)) (select! (.selected (shell))) (do))
-              (if (not (canvas/add-visible! (current))) (status! c"Could not start terminal") 0)
-              (do))
-          (= tag 12) (canvas/home! (current))
-          (= tag 13) (canvas/fit! (current))
-          :else (select! tag))))
-
-(defn make-button [(parent (ptr i8)) (title (ptr i8)) (r Rect) (tag i64) (target (ptr i8))] (-> (ptr i8))
-  (let [v (controls/button title target (sel c"clicked:"))]
-    (do
-      (frame! v r)
-      (msg i64 v (sel c"setBordered:") [i8] (p/cast i8 0))
-      (msg i64 v (sel c"setAlignment:") [i64] 0)
-      (msg i64 v (sel c"setTag:") [i64] tag)
-      (msg i64
-           v
-           (sel c"setFont:")
-           [(ptr i8)]
-           (msg (ptr i8) (class c"NSFont") (sel c"systemFontOfSize:weight:") [f64 f64] 14.0 0.2))
-      (msg i64 v (sel c"setContentTintColor:") [(ptr i8)] (color 0.83 0.89 0.95 1.0))
-      (msg i64 v (sel c"setWantsLayer:") [i8] (p/cast i8 1))
-      (msg i64 (layer v) (sel c"setCornerRadius:") [f64] 7.0)
-      (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
-      v)))
-
 (defn layout! [] (-> void)
   (let [s (shell)
         bounds (msg Rect (.root s) (sel c"bounds") [])
         width (.w bounds)
         height (.h bounds)
-        rail (.sidebar (.config s))
+        rail (sidebar/width)
         fw (- width (+ rail 64.0))
         fh (- height 124.0)
         scale (msg f64 (.window s) (sel c"backingScaleFactor") [])]
     (do
       (set! (.width s) width)
       (set! (.height s) height)
-      (frame! (.sidebar s) (rect 0.0 0.0 rail height))
+      (sidebar/layout! height)
       (frame! (.stage s) (rect rail 40.0 (- width rail) (- height 40.0)))
       (transform! (layer (.cube s)) (CATransform3DMakeTranslation 0.0 0.0 0.0) 0.0)
-      (for [i 0 4] (transform! (layer (face i)) (CATransform3DMakeTranslation 0.0 0.0 0.0) 0.0))
+      (for [i 0 (count)] (transform! (layer (face i)) (CATransform3DMakeTranslation 0.0 0.0 0.0) 0.0))
       (frame! (.cube s) (rect 32.0 32.0 fw fh))
       (msg i64 (layer (.stage s)) (sel c"setAnchorPoint:") [Point] (Point :x 0.5 :y 0.5))
       (msg i64
@@ -170,19 +184,18 @@
       (frame! (.heading s) (rect (+ rail 32.0) (- height 44.0) 450.0 24.0))
       (frame! (.status s) (rect (+ rail 32.0) 10.0 (- width (+ rail 45.0)) 20.0))
       (msg i64 (layer (.stage s)) (sel c"setSublayerTransform:") [Transform] (workspace/perspective (* width 2.0)))
-      (for [i 0 4]
+      (for [i 0 (count)]
         (do
-          (frame! (button i) (rect 18.0 (- height (+ 164.0 (* (p/cast f64 i) 48.0))) (- rail 36.0) 38.0))
           (frame! (face i) (rect 0.0 0.0 fw fh))
           (msg i64 (layer (face i)) (sel c"setAnchorPoint:") [Point] (Point :x 0.5 :y 0.5))
           (msg i64 (layer (face i)) (sel c"setPosition:") [Point] (Point :x (* fw 0.5) :y (* fh 0.5)))
           (transform! (layer (face i))
-                      (CATransform3DTranslate (workspace/face-transform i 4 fw) 0.0 0.0 (* fw 0.5))
+                      (CATransform3DTranslate (workspace/face-transform i (count) fw) 0.0 0.0 (* fw 0.5))
                       0.0)
           (canvas/resize! (project i) fw fh scale)))
       (background! (.root s) (.canvas-r (.config s)) (.canvas-g (.config s)) (.canvas-b (.config s)))
-      (background! (.sidebar s) (.rail-r (.config s)) (.rail-g (.config s)) (.rail-b (.config s)))
-      (for [i 0 4] (canvas/apply-theme! (project i) (.config s)))
+      (background! (.view (sidebar/state)) (.rail-r (.config s)) (.rail-g (.config s)) (.rail-b (.config s)))
+      (for [i 0 (count)] (canvas/apply-theme! (project i) (.config s)))
       (palette/layout!)
       (pose! 0.0))))
 
@@ -190,7 +203,7 @@
   (let [s (shell)]
     (if (= (p/cast i64 (.task s)) 0)
         (let [task (new c"NSTask")
-              output (indexed-string c"build/config-" (+ (.generation s) 1) c".dylib")
+              output (indexed-string c"../build/config-" (+ (.generation s) 1) c".dylib")
               argv (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
               error (p/alloc-stack (ptr i8))]
           (do
@@ -203,11 +216,12 @@
                  (msg (ptr i8) (class c"NSURL") (sel c"fileURLWithPath:") [(ptr i8)] (ns c"/usr/bin/env")))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"coil"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"build"))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"config/shell.coil"))
+            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"shell.coil"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"--shared"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"-o"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] output)
             (msg i64 task (sel c"setArguments:") [(ptr i8)] argv)
+            (msg i64 task (sel c"setCurrentDirectoryPath:") [(ptr i8)] (ns c"config"))
             (if (!= (msg i8 task (sel c"launchAndReturnError:") [(ptr (ptr i8))] error) (p/cast i8 0))
                 (do
                   (set! (.task s) task)
@@ -229,7 +243,12 @@
       (if (and (!= (p/cast i64 (.task s)) 0) (= (msg i8 (.task s) (sel c"isRunning") []) (p/cast i8 0)))
           (do
             (if (and (= (msg i32 (.task s) (sel c"terminationStatus") []) (p/cast i32 0))
-                     (reload/load-config! (utf8 (.output s)) (field s config)))
+                     (reload/load-config! (utf8 (msg (ptr i8)
+                                                     (ns c"config")
+                                                     (sel c"stringByAppendingPathComponent:")
+                                                     [(ptr i8)]
+                                                     (.output s)))
+                                          (field s config)))
                 (do (layout!) (status! c"Coil configuration reloaded · terminals preserved"))
                 (status! c"Reload failed · keeping last good configuration · see compiler output"))
             (release (.task s))
@@ -252,15 +271,41 @@
             (do))))))
 
 (defn save-layout! [] (-> bool)
-  (let [root (storage/dictionary)
-        projects (storage/array)]
+  (do
+    (for [i 0 (count)] (storage/put! (record i) c"layout" (canvas/snapshot (project i))))
+    (let [ok (storage/write! (.model (shell)))]
+      (do (if ok (for [i 0 (count)] (store! (field (project i) dirty) false)) 0) ok))))
+
+(defn sync-selection! [] (-> void)
+  (let [s (shell)]
     (do
-      (for [i 0 4] (storage/add! projects (canvas/snapshot (project i))))
-      (storage/put! root c"version" (storage/number 1.0))
-      (storage/put! root c"projects" projects)
-      (storage/put! root c"selected" (storage/number (p/cast f64 (.selected (shell)))))
-      (let [ok (storage/write! root)]
-        (do (if ok (for [i 0 4] (store! (field (project i) dirty) false)) 0) ok)))))
+      (set! (.selected s) -1)
+      (for [i 0 (count)]
+        (let [r (runtime i)]
+          (if (= (.id r) (projects/active (.model s))) (set! (.selected s) i) 0)))
+      (set! (.angle s) (if (>= (.selected s) 0) (- 0.0 (workspace/face-angle (.selected s) (count))) 0.0))
+      (set! (.overview s) false)
+      (layout!)
+      (if (save-layout!) (do) (do (status! c"Could not save project layout") (do))))))
+
+(defn add-project-view! [(record (ptr i8))] (-> bool)
+  (let [s (shell)
+        f (view (.cube s) (rect 0.0 0.0 1032.0 736.0))
+        c (canvas/create! f 1032.0 736.0 (.config s))
+        saved (storage/get record c"layout")]
+    (do
+      (msg i64 (layer f) (sel c"setDoubleSided:") [i8] (p/cast i8 0))
+      (msg i64 (layer f) (sel c"setCornerRadius:") [f64] 10.0)
+      (msg i64 (layer f) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+      (release (.directory c))
+      (set! (.directory c) (msg (ptr i8) (storage/get record c"directory") (sel c"retain") []))
+      (al/al-push! [ProjectView]
+                   (mut (.projects s))
+                   (ProjectView
+                     :id (projects/id record)
+                     :face f
+                     :canvas c))
+      (if (canvas/restorable? saved) (canvas/restore! c saved) true))))
 
 (defn maintenance! [] (-> void)
   (let [s (shell)
@@ -280,7 +325,7 @@
             (let [(mut dirty) false
                   (mut dragging) false]
               (do
-                (for [i 0 4]
+                (for [i 0 (count)]
                   (do
                     (if (.dirty (project i)) (store! dirty true) 0)
                     (if (> (.gesture (project i)) 0) (store! dragging true) 0)))
@@ -288,7 +333,8 @@
                     (if (not (save-layout!)) (status! c"Could not save canvas layout") 0)
                     0)))
             (if (= (msg i8 (.app s) (sel c"isActive") []) (p/cast i8 0))
-                (for [i 0 4] (do (store! (field (project i) space-held) false) (store! (field (project i) gesture) 0)))
+                (for [i 0 (count)]
+                  (do (store! (field (project i) space-held) false) (store! (field (project i) gesture) 0)))
                 0)
             (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])]
               (if (!= (msg i8 manager (sel c"fileExistsAtPath:") [(ptr i8)] (ns c"build/quit-request")) (p/cast i8 0))
@@ -304,7 +350,7 @@
           0)
       (do))))
 
-(defn invoke! [(id i64)] (-> void)
+(defn canvas-action! [(id i64)] (-> void)
   (cond (= id 0)
           (do
             (if (.overview (shell)) (select! (.selected (shell))) (do))
@@ -320,12 +366,125 @@
         (= id 6) (canvas/zoom-key! (current) (/ 1.0 1.1))
         (= id 7)
           (let [enabled (not (.zoom-enabled (current)))]
-            (do (for [i 0 4] (do (store! (field (project i) zoom-enabled) enabled) (canvas/project! (project i)))) (do)))
-        (= id 8) (toggle!)
+            (do
+              (for [i 0 (count)] (do (store! (field (project i) zoom-enabled) enabled) (canvas/project! (project i))))
+              (do)))
+        (= id 8) (if (>= (.selected (shell)) 0) (toggle!) (do))
         (= id 9) (reload-start!)
         (= id 10) (timings/toggle!)
-        (and (>= id 11) (< id 15)) (select! (- id 11))
+        (and (>= id 11) (< id 15))
+          (do (projects/select! (.model (shell)) (projects/visible-id (.model (shell)) (- id 11))) (sync-selection!))
         :else (do)))
+
+(defn invoke! [(id i64)] (-> void)
+  (let [s (shell)
+        model (.model s)]
+    (cond (= id -2) (sync-selection!)
+          (>= id 28)
+            (do (projects/select! model (projects/id (storage/at (projects/list model) (- id 28)))) (sync-selection!))
+          (= id 15) (palette/prompt! 15 c"New project name" c"")
+          (= id 16) (if (>= (.selected s) 0) (palette/prompt! 16 c"Rename project" (name (.selected s))) (do))
+          (= id 17)
+            (if (>= (.selected s) 0) (do (projects/hide! model (projects/active model) true) (sync-selection!)) (do))
+          (= id 18)
+            (if (>= (.selected s) 0)
+                (palette/prompt! 18 c"Project directory" (utf8 (storage/get (record (.selected s)) c"directory")))
+                (do))
+          (= id 19)
+            (if (and (>= (.selected s) 0) (!= (p/cast i64 (.focused (current))) 0))
+                (let [pane (.focused (current))
+                      term (.terminal pane)]
+                  (do
+                    (storage/put! (record (.selected s)) c"directory" (.directory term))
+                    (release (.directory (current)))
+                    (store! (field (current) directory) (msg (ptr i8) (.directory term) (sel c"retain") []))
+                    (sync-selection!)
+                    (status! c"Project directory updated from focused terminal")))
+                (do))
+          (= id 20) (palette/prompt! 20 c"New profile name" c"")
+          (= id 21) (palette/prompt! 21 c"Rename profile" (utf8 (storage/get (projects/profile model) c"name")))
+          (= id 22)
+            (do
+              (if (projects/delete-profile! model) (sync-selection!) (do (status! c"Keep at least one profile") (do)))
+              (do))
+          (= id 23)
+            (do (store! (field (sidebar/state) show-hidden) (not (.show-hidden (sidebar/state)))) (sidebar/refresh!))
+          (or (= id 24) (= id 25))
+            (let [profiles (projects/profiles model)
+                  index (msg i64 profiles (sel c"indexOfObject:") [(ptr i8)] (projects/profile model))
+                  next (workspace/wrap (+ index (if (= id 24) -1 1)) (storage/count profiles))]
+              (do (projects/switch-profile! model (projects/id (storage/at profiles next))) (sync-selection!)))
+          (= id 27)
+            (when (and (>= (.selected s) 0) (!= (p/cast i64 (.focused (current))) 0))
+              (if (canvas/reconnect! (current) (.focused (current)))
+                  (do (status! c"Terminal reconnected") (do))
+                  (do (status! c"Cannot reconnect terminal; saved session retained") (do))))
+          (= id 26)
+            (if (>= (.selected s) 0)
+                (palette/prompt! 26 c"Delete project and close its terminals? Type its name" c"")
+                (do))
+          (or (= id 9) (= id 10) (and (>= id 11) (< id 15))) (canvas-action! id)
+          (>= (.selected s) 0) (canvas-action! id)
+          :else (do (status! c"Create or show a project first") (do)))))
+
+(defn submit! [(id i64) (input (ptr i8))] (-> void)
+  (let [s (shell)
+        model (.model s)
+        text
+          (msg (ptr i8)
+               input
+               (sel c"stringByTrimmingCharactersInSet:")
+               [(ptr i8)]
+               (msg (ptr i8) (class c"NSCharacterSet") (sel c"whitespaceAndNewlineCharacterSet") []))
+        (mut invalid-directory) false]
+    (if (= (msg u64 text (sel c"length") []) 0)
+        (palette/prompt! id c"Please enter a nonempty value" c"")
+        (do
+          (cond (= id 15) (do (add-project-view! (projects/new-project! model text)) (do))
+                (= id 16) (do (storage/put! (record (.selected s)) c"name" text) (do))
+                (= id 18)
+                  (let [path (msg (ptr i8) text (sel c"stringByExpandingTildeInPath") [])
+                        manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+                        directory (p/alloc-stack i8)]
+                    (if (and (!= (msg i8
+                                      manager
+                                      (sel c"fileExistsAtPath:isDirectory:")
+                                      [(ptr i8) (ptr i8)]
+                                      path
+                                      directory)
+                                 (p/cast i8 0))
+                             (!= (load directory) (p/cast i8 0)))
+                        (do
+                          (storage/put! (record (.selected s)) c"directory" path)
+                          (release (.directory (current)))
+                          (store! (field (current) directory) (msg (ptr i8) path (sel c"retain") []))
+                          (do))
+                        (do (store! invalid-directory true) (do))))
+                (= id 20) (projects/new-profile! model text)
+                (= id 21) (do (storage/put! (projects/profile model) c"name" text) (do))
+                (= id 26)
+                  (if (!= (msg i8
+                               text
+                               (sel c"isEqualToString:")
+                               [(ptr i8)]
+                               (storage/get (record (.selected s)) c"name"))
+                          (p/cast i8 0))
+                      (let [index (.selected s)
+                            r (runtime index)]
+                        (do
+                          (projects/delete-project! model (.id r))
+                          (let [c (.canvas r)] (while (> (canvas/count c) 0) (canvas/close! c (canvas/pane c 0))))
+                          (canvas/free! (.canvas r))
+                          (msg i64 (.face r) (sel c"removeFromSuperview") [])
+                          (for [i index (- (count) 1)]
+                            (al/al-set! [ProjectView] (mut (.projects s)) i (runtime (+ i 1))))
+                          (al/al-pop! [ProjectView] (mut (.projects s)))
+                          (do)))
+                      (do))
+                :else (do))
+          (sync-selection!)
+          (when (load invalid-directory)
+            (palette/prompt! 18 c"Directory does not exist; enter a directory" (utf8 text)))))))
 
 (defn handle! [(event (ptr i8))] (-> bool)
   (let [s (shell)
@@ -337,7 +496,7 @@
       ;; Space belongs to the keyboard, so releases must reach every project,
       ;; including when the user switches projects or enters the cube.
       (if (and (or (= kind 10) (= kind 11)) (= key (p/cast u16 49)))
-          (for [i 0 4] (store! (field (project i) space-held) (= kind 10)))
+          (for [i 0 (count)] (store! (field (project i) space-held) (= kind 10)))
           0)
       (cond (and (= kind 10)
                  (and command
@@ -346,15 +505,16 @@
                 (if (palette/open?)
                     (palette/dismiss!)
                     (do
-                      (for [i 0 4]
+                      (for [i 0 (count)]
                         (do
                           (store! (field (project i) space-held) false)
                           (store! (field (project i) gesture) 0)))
                       (palette/show!)))
                 true)
             (palette/open?) (palette/handle! event)
+            (sidebar/handle! event) true
             (timings/owns-event? event) false
-            (and (not (.overview s)) (canvas/handle! (current) event)) true
+            (and (>= (.selected s) 0) (not (.overview s)) (canvas/handle! (current) event)) true
             (= kind 10)
               (let [action (actions/key-action key flags)]
                 (cond (and command (= key (p/cast u16 12))) (do (store! (field s running) false) true)
@@ -366,8 +526,9 @@
                                 (or (= key (p/cast u16 123)) (= key (p/cast u16 124)))
                                   (do
                                     (store! (field s selected)
-                                            (workspace/wrap (+ (.selected s) (if (= key (p/cast u16 124)) 1 -1)) 4))
-                                    (store! (field s angle) (- 0.0 (workspace/face-angle (.selected s) 4)))
+                                            (visible-index (+ (.selected s) (if (= key (p/cast u16 124)) 1 -1))
+                                                           (if (= key (p/cast u16 124)) 1 -1)))
+                                    (store! (field s angle) (- 0.0 (workspace/face-angle (.selected s) (count))))
                                     (pose! (.duration (.config s))))
                                 :else (do))
                           true)
@@ -375,7 +536,7 @@
             (and (.overview s) (= kind 11)) true
             (and (.overview s) (or (= kind 1) (= kind 2) (= kind 6) (= kind 22)))
               (let [pt (msg Point event (sel c"locationInWindow") [])]
-                (if (> (.x pt) (.sidebar (.config s)))
+                (if (> (.x pt) (sidebar/width))
                     (do
                       (cond (= kind 1)
                               (do
@@ -400,7 +561,7 @@
                                                           (/ (- 0.0 (.angle s)) 1.5707963267948966))
                                                      (sel c"doubleValue")
                                                      []))]
-                                  (store! (field s selected) (workspace/wrap nearest 4)))
+                                  (store! (field s selected) (workspace/wrap nearest (count))))
                                 (pose! 0.0))
                             (= kind 22)
                               (do
@@ -411,6 +572,19 @@
                       true)
                     false))
             :else false))))
+
+(defn saved-valid? [(saved (ptr i8))] (-> bool)
+  (let [version (storage/value saved c"version")
+        (mut ok)
+          (or (= (p/cast i64 saved) 0)
+              (and (p/fcmp-eq version 1.0) (storage/kind? (projects/list saved) c"NSArray"))
+              (and (p/fcmp-eq version 2.0) (projects/valid? saved)))]
+    (do
+      (for [i 0 (storage/count (projects/list saved))]
+        (let [entry (storage/at (projects/list saved) i)
+              layout (if (p/fcmp-eq version 1.0) entry (storage/get entry c"layout"))]
+          (if (and (!= (p/cast i64 layout) 0) (not (canvas/restorable? layout))) (store! ok false) 0)))
+      (load ok))))
 
 (defn setup! [] (-> bool)
   (let [s (shell)
@@ -427,95 +601,62 @@
         root (msg (ptr i8) window (sel c"contentView") [])
         saved (storage/read)
         cls (objc_allocateClassPair (class c"NSObject") c"JimShellActions" 0)]
-    (do
-      (set! (.app s) app)
-      (set! (.window s) window)
-      (set! (.root s) root)
-      (set! (.config s) (reload/defaults))
-      (set! (.running s) true)
-      (msg i8 app (sel c"setActivationPolicy:") [i64] 0)
-      (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns c"Jim · Coil"))
-      (msg i64 window (sel c"setReleasedWhenClosed:") [i8] (p/cast i8 0))
-      (msg i64 window (sel c"setMinSize:") [Size] (Size :w 900.0 :h 580.0))
-      (msg i64 window (sel c"setAcceptsMouseMovedEvents:") [i8] (p/cast i8 1))
-      (msg i64
-           window
-           (sel c"setAppearance:")
-           [(ptr i8)]
-           (msg (ptr i8) (class c"NSAppearance") (sel c"appearanceNamed:") [(ptr i8)] (ns c"NSAppearanceNameDarkAqua")))
-      (msg i64 root (sel c"setWantsLayer:") [i8] (p/cast i8 1))
-      (background! root 0.045 0.057 0.078)
-      (set! (.sidebar s) (view root (rect 0.0 0.0 224.0 860.0)))
-      (background! (.sidebar s) 0.075 0.09 0.12)
-      (label (.sidebar s) c"J I M" (rect 26.0 798.0 150.0 30.0) 23.0 false)
-      (label (.sidebar s) c"YOUR WORKSPACES" (rect 26.0 740.0 185.0 20.0) 10.0 true)
-      (msg i64
-           (label (.sidebar s) c"Coil shell" (rect 26.0 25.0 180.0 20.0) 12.0 true)
-           (sel c"setAutoresizingMask:")
-           [u64]
-           0)
-      (set! (.stage s) (view root (rect 224.0 40.0 1096.0 820.0)))
-      (set! (.cube s) (layer-view (.stage s) (rect 32.0 32.0 1032.0 736.0) c"CATransformLayer"))
-      (msg i64 (layer (.stage s)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-      (set! (.status s) (label root c"Starting Ghostty…" (rect 256.0 10.0 1000.0 20.0) 11.0 true))
-      (set! (.heading s) (label root c"Workspace" (rect 256.0 816.0 400.0 24.0) 17.0 false))
-      (method! cls c"clicked:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
-      (objc_registerClassPair cls)
-      (let [target (msg (ptr i8) (new c"JimShellActions") (sel c"autorelease") [])]
+    (if (not (saved-valid? saved))
+        (let [alert (new c"NSAlert")]
+          (do
+            (msg i64 alert (sel c"setMessageText:") [(ptr i8)] (ns c"Saved projects could not be loaded"))
+            (msg i64
+                 alert
+                 (sel c"setInformativeText:")
+                 [(ptr i8)]
+                 (ns c"The layout file is invalid. It has been left unchanged at ~/Library/Application Support/JimCoil/layout.json."))
+            (msg i64 alert (sel c"runModal") [])
+            (release alert)
+            false))
         (do
-          ; Buttons do not retain targets; the main autorelease pool spans the window.
-          (make-button (.sidebar s) c"+   New terminal" (rect 18.0 230.0 188.0 38.0) 11 target)
-          (make-button (.sidebar s) c"⌂   Canvas origin" (rect 18.0 185.0 188.0 38.0) 12 target)
-          (make-button (.sidebar s) c"⊞   Fit all panes" (rect 18.0 140.0 188.0 38.0) 13 target)
-          (make-button (.sidebar s) c"▧   All workspaces" (rect 18.0 90.0 188.0 38.0) 10 target)
-          (for [i 0 4]
-            (store! (p/index (field s buttons) i)
-                    (make-button (.sidebar s)
-                                 (name i)
-                                 (rect 18.0 (- 696.0 (* (p/cast f64 i) 48.0)) 188.0 38.0)
-                                 i
-                                 target)))))
-      (palette/setup! window)
-      (timings/setup! window)
-      (msg i64 app (sel c"finishLaunching") [])
-      (msg i64 window (sel c"makeKeyAndOrderFront:") [(ptr i8)] (nil))
-      (msg i64 app (sel c"activateIgnoringOtherApps:") [i8] (p/cast i8 1))
-      (if (= (p/cast i64 (terminal/start!)) 0)
-          false
-          (let [(mut ok) true
-                cwd
-                  (utf8 (msg (ptr i8)
-                             (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
-                             (sel c"currentDirectoryPath")
-                             []))]
-            (do
-              (for [i 0 4]
-                (let [f (view (.cube s) (rect 0.0 0.0 1032.0 736.0))]
-                  (do
-                    (store! (p/index (field s faces) i) f)
-                    (background! f 0.09 0.12 0.16)
-                    (msg i64 (layer f) (sel c"setDoubleSided:") [i8] (p/cast i8 0))
-                    (msg i64 (layer f) (sel c"setCornerRadius:") [f64] 10.0)
-                    (msg i64 (layer f) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-                    (let [c (canvas/create! f 1032.0 736.0 (.config s))]
-                      (do
-                        (store! (p/index (field s canvases) i) c)
-                        (let [record (storage/at (storage/get saved c"projects") i)]
-                          (if (canvas/restorable? record)
-                              (if (not (canvas/restore! c record)) (store! ok false) 0)
-                              (do
-                                (if (not (canvas/add! c (rect 32.0 40.0 640.0 430.0))) (store! ok false) 0)
-                                (if (= i 0)
-                                    (if (not (canvas/add! c (rect 720.0 100.0 600.0 430.0))) (store! ok false) 0)
-                                    0)))))))))
-              (let [selected (storage/value saved c"selected")]
-                (if (and (>= selected 0.0) (< selected 4.0))
-                    (do
-                      (set! (.selected s) (p/cast i64 selected))
-                      (set! (.angle s) (- 0.0 (workspace/face-angle (.selected s) 4))))
-                    0))
-              (if (load ok) (layout!) (do))
-              (load ok)))))))
+          (set! (.app s) app)
+          (set! (.window s) window)
+          (set! (.root s) root)
+          (set! (.config s) (reload/defaults))
+          (set! (.running s) true)
+          (msg i8 app (sel c"setActivationPolicy:") [i64] 0)
+          (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns c"Jim · Coil"))
+          (msg i64 window (sel c"setReleasedWhenClosed:") [i8] (p/cast i8 0))
+          (msg i64 window (sel c"setMinSize:") [Size] (Size :w 900.0 :h 580.0))
+          (msg i64 window (sel c"setAcceptsMouseMovedEvents:") [i8] (p/cast i8 1))
+          (msg i64
+               window
+               (sel c"setAppearance:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (class c"NSAppearance")
+                    (sel c"appearanceNamed:")
+                    [(ptr i8)]
+                    (ns c"NSAppearanceNameDarkAqua")))
+          (msg i64 root (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+          (background! root 0.045 0.057 0.078)
+          (set! (.model s) (msg (ptr i8) (projects/restore saved) (sel c"retain") []))
+          (set! (.projects s) (al/al-new [ProjectView] (alloc/malloc-allocator)))
+          (set! (actions/model) (.model s))
+          (sidebar/setup! root (.model s))
+          (set! (.stage s) (view root (rect 224.0 40.0 1096.0 820.0)))
+          (set! (.cube s) (layer-view (.stage s) (rect 32.0 32.0 1032.0 736.0) c"CATransformLayer"))
+          (msg i64 (layer (.stage s)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+          (set! (.status s) (label root c"Starting Ghostty…" (rect 256.0 10.0 1000.0 20.0) 11.0 true))
+          (set! (.heading s) (label root c"Workspace" (rect 256.0 816.0 400.0 24.0) 17.0 false))
+          (palette/setup! window)
+          (timings/setup! window)
+          (msg i64 app (sel c"finishLaunching") [])
+          (msg i64 window (sel c"makeKeyAndOrderFront:") [(ptr i8)] (nil))
+          (msg i64 app (sel c"activateIgnoringOtherApps:") [i8] (p/cast i8 1))
+          (if (= (p/cast i64 (terminal/start!)) 0)
+              false
+              (let [(mut ok) true]
+                (do
+                  (for [i 0 (storage/count (projects/list (.model s)))]
+                    (if (not (add-project-view! (storage/at (projects/list (.model s)) i))) (store! ok false) 0))
+                  (sync-selection!)
+                  (load ok))))))))
 
 (defn main [] (-> i64)
   (let [pool (new c"NSAutoreleasePool")]
@@ -553,6 +694,8 @@
                           (if (not (handle! event)) (msg i64 (.app s) (sel c"sendEvent:") [(ptr i8)] event) 0)
                           0)
                       (let [action (palette/take-action!)] (if (>= action 0) (invoke! action) (do)))
+                      (let [action (sidebar/take-action!)] (if (!= action -1) (invoke! action) (do)))
+                      (let [action (palette/take-submission!)] (if (>= action 0) (submit! action (palette/text)) (do)))
                       (timings/record! 0 (* 1000.0 (- (timings/now) input-start)))
                       (let [start (timings/now)]
                         (do
@@ -573,7 +716,10 @@
               (save-layout!)
               (palette/free!)
               (timings/free!)
-              (for [i 0 4] (canvas/free! (project i)))
+              (sidebar/free!)
+              (for [i 0 (count)] (canvas/free! (project i)))
+              (al/al-free! [ProjectView] (mut (.projects s)))
+              (release (.model s))
               (terminal/stop!)
               (msg i64 (.window s) (sel c"close") [])
               (release (.window s))

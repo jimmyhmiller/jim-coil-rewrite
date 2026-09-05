@@ -2,3 +2,5 @@
 .claude/settings.local.json
 .worktrees/
 build/
+__pycache__/
+*.pyc

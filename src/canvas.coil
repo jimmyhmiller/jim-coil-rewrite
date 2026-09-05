@@ -4,6 +4,7 @@
 (import "jim.ghostty" :as g)
 (import "jim.reload" :as theme)
 (import "jim.storage" :as storage)
+(import "jim.sessions" :as sessions)
 (import "jim.animation" :as animation)
 (import "jim.canvas-model" :as model)
 (import "coil.primitive" :as p)
@@ -14,6 +15,8 @@
   [(id i64)
    (view (ptr i8))
    (title (ptr i8))
+   (header (ptr i8))
+   (message (ptr i8))
    (close (ptr i8))
    (grip (ptr i8))
    (terminal (ptr terminal/Terminal))
@@ -24,6 +27,7 @@
 
 (defstruct Canvas
   [(view (ptr i8))
+   (directory (ptr i8))
    (panes (al/ArrayList (ptr Pane)))
    (camera model/Camera)
    (edges (array (ptr i8) 4))
@@ -89,17 +93,12 @@
             active (= (p/cast i64 v) (p/cast i64 chosen))
             cfg (.theme c)]
         (do
-          (msg i64 (layer (.view v)) (sel c"setBorderWidth:") [f64] (if active 1.5 1.0))
-          (msg i64
-               (layer (.view v))
-               (sel c"setBorderColor:")
-               [(ptr i8)]
-               (msg (ptr i8)
-                    (if active
-                        (color (.accent-r cfg) (.accent-g cfg) (.accent-b cfg) 0.8)
-                        (color (.pane-r cfg) (.pane-g cfg) (.pane-b cfg) 1.0))
-                    (sel c"CGColor")
-                    [])))))
+          (msg i64 (layer (.view v)) (sel c"setBorderWidth:") [f64] 0.0)
+          ;; Only the exposed header changes; the terminal has its own background.
+          (background! (.header v)
+                       (+ (.pane-r cfg) (if active 0.07 0.0))
+                       (+ (.pane-g cfg) (if active 0.07 0.0))
+                       (+ (.pane-b cfg) (if active 0.07 0.0))))))
     (msg i8
          (msg (ptr i8) (.view c) (sel c"window") [])
          (sel c"makeFirstResponder:")
@@ -155,7 +154,7 @@
     (do
       (set! (.dirty c) true)
       (if (and (>= (.gesture c) 2) (!= (p/cast i64 (.drag-pane c)) 0))
-          (set! (.bounds (.drag-pane c))
+          (set! (field (load (field c drag-pane)) bounds)
                 (model/dragged-bounds display (.start-world c) (.pointer c) (.start-bounds c) (= (.gesture c) 3)))
           0)
       (transaction! 0.0)
@@ -172,11 +171,14 @@
           (do
             (frame! (.view v) (rect (.x screen) (- h (+ (.y screen) (.h screen))) (.w screen) (.h screen)))
             (msg i64 (.view v) (sel c"setBoundsSize:") [Size] (Size :w (.w world) :h (.h world)))
+            (frame! (.header v) (rect 0.0 (- (.h world) 36.0) (.w world) 36.0))
             (frame! (.title v) (rect 16.0 (- (.h world) 29.0) (- (.w world) 80.0) 22.0))
             (frame! (.close v) (rect (- (.w world) 31.0) (- (.h world) 28.0) 24.0 24.0))
             (frame! (.grip v) (rect (- (.w world) 17.0) 1.0 16.0 17.0))
             (msg i64 (.view v) (sel c"setHidden:") [i8] (p/cast i8 (if (model/visible? screen w h) 0 1)))
-            (g/ghostty_surface_set_occlusion (.surface (term-of v)) visible)
+            (if (!= (p/cast i64 (.surface (term-of v))) 0)
+                (g/ghostty_surface_set_occlusion (.surface (term-of v)) visible)
+                (do))
             (if (or (< (.render-scale v) scale)
                     (> (.render-scale v) scale)
                     (< (.render-w v) (.w world))
@@ -219,6 +221,8 @@
       (set! (.scale c) 1.0)
       (set! (.zoom-enabled c) true)
       (set! (.theme c) cfg)
+      (set! (.directory c)
+            (msg (ptr i8) (msg (ptr i8) (ns c"~") (sel c"stringByExpandingTildeInPath") []) (sel c"retain") []))
       (msg i64 (layer (.view c)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
       (for [i 0 4]
         (let [l (msg (ptr i8) (class c"CAGradientLayer") (sel c"layer") [])]
@@ -229,41 +233,61 @@
       (apply-theme! c cfg)
       c)))
 
-(defn add! [(c (ptr Canvas)) (bounds Rect)] (-> bool)
+(defn add-session! [(c (ptr Canvas)) (bounds Rect) (session-id (ptr i8))] (-> bool)
   (let [v (alloc/box! (alloc/malloc-allocator) Pane (p/zeroed Pane))
         host (view (.view c) (rect 0.0 0.0 (.w bounds) (.h bounds)))
-        cwd
-          (utf8 (msg (ptr i8)
-                     (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
-                     (sel c"currentDirectoryPath")
-                     []))
-        t (terminal/create! host (rect 1.0 12.0 (- (.w bounds) 2.0) (- (.h bounds) 48.0)) cwd)]
+        cwd (utf8 (.directory c))
+        t (terminal/create! host (rect 1.0 12.0 (- (.w bounds) 2.0) (- (.h bounds) 48.0)) cwd session-id)]
+    (do
+      (set! (.next-id c) (+ (.next-id c) 1))
+      (set! (.id v) (.next-id c))
+      (set! (.view v) host)
+      (set! (.terminal v) t)
+      (set! (.bounds v) bounds)
+      (set! (.header v) (view host (rect 0.0 (- (.h bounds) 36.0) (.w bounds) 36.0)))
+      (set! (.title v) (label host c"Terminal" (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0) 12.0 false))
+      (msg i64
+           (.title v)
+           (sel c"setStringValue:")
+           [(ptr i8)]
+           (indexed-string c"Terminal " (.id v) c""))
+      (set! (.close v) (label host c"×" (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0) 17.0 true))
+      (set! (.grip v) (label host c"◢" (rect (- (.w bounds) 17.0) 1.0 16.0 17.0) 10.0 true))
+      (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
+      (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+      (al/al-push! [(ptr Pane)] (mut (.panes c)) v)
+      (apply-theme! c (.theme c))
+      (focus! c v)
+      (set! (.message v)
+            (label host
+                   c"Session unavailable. Use Terminal: Reconnect in the action palette."
+                   (rect 16.0 40.0 (- (.w bounds) 32.0) 48.0)
+                   12.0
+                   false))
+      (msg i64 (.message v) (sel c"setHidden:") [i8] (p/cast i8 (if (= (p/cast i64 (.surface t)) 0) 0 1)))
+      true)))
+
+(defn reconnect! [(c (ptr Canvas)) (v (ptr Pane))] (-> bool)
+  (let [old (term-of v)
+        bounds (.bounds v)
+        t
+          (terminal/create! (.view v)
+                            (rect 1.0 12.0 (- (.w bounds) 2.0) (- (.h bounds) 48.0))
+                            (utf8 (.directory old))
+                            (.session-id old))]
     (if (= (p/cast i64 (.surface t)) 0)
+        (do (terminal/free! t) false)
         (do
-          (terminal/free! t)
-          (msg i64 host (sel c"removeFromSuperview") [])
-          (alloc/destroy [Pane] (alloc/malloc-allocator) v)
-          false)
-        (do
-          (set! (.next-id c) (+ (.next-id c) 1))
-          (set! (.id v) (.next-id c))
-          (set! (.view v) host)
           (set! (.terminal v) t)
-          (set! (.bounds v) bounds)
-          (set! (.title v) (label host c"Terminal" (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0) 12.0 false))
-          (msg i64
-               (.title v)
-               (sel c"setStringValue:")
-               [(ptr i8)]
-               (indexed-string c"Terminal " (.id v) c""))
-          (set! (.close v) (label host c"×" (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0) 17.0 true))
-          (set! (.grip v) (label host c"◢" (rect (- (.w bounds) 17.0) 1.0 16.0 17.0) 10.0 true))
-          (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
-          (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-          (al/al-push! [(ptr Pane)] (mut (.panes c)) v)
-          (apply-theme! c (.theme c))
+          (terminal/free! old)
+          (msg i64 (.message v) (sel c"setHidden:") [i8] (p/cast i8 1))
+          (set! (.render-scale v) 0.0)
+          (project! c)
           (focus! c v)
           true))))
+
+(defn add! [(c (ptr Canvas)) (bounds Rect)] (-> bool)
+  (add-session! c bounds (sessions/identifier)))
 
 (defn add-visible! [(c (ptr Canvas))] (-> bool)
   (let [camera (.camera c)
@@ -283,6 +307,7 @@
               (for [i (load found) (- (count c) 1)]
                 (al/al-set! [(ptr Pane)] (mut (field c panes)) i (pane c (+ i 1))))
               (al/al-pop! [(ptr Pane)] (mut (.panes c)))
+              (sessions/kill! (.session-id (term-of chosen)))
               (terminal/free! (term-of chosen))
               (msg i64 (.view chosen) (sel c"removeFromSuperview") [])
               (alloc/destroy [Pane] (alloc/malloc-allocator) chosen)
@@ -449,6 +474,7 @@
           (msg i64 (.view v) (sel c"removeFromSuperview") [])
           (alloc/destroy [Pane] (alloc/malloc-allocator) v))))
     (al/al-free! [(ptr Pane)] (mut (.panes c)))
+    (release (.directory c))
     (msg i64 (.view c) (sel c"removeFromSuperview") [])
     (alloc/destroy [Canvas] (alloc/malloc-allocator) c)))
 
@@ -466,6 +492,7 @@
           (do
             (storage/put! item c"x" (storage/number (.x r)))
             (storage/put! item c"y" (storage/number (.y r)))
+            (storage/put! item c"session" (.session-id (term-of v)))
             (storage/put! item c"width" (storage/number (.w r)))
             (storage/put! item c"height" (storage/number (.h r)))
             (storage/add! panes item)
@@ -507,11 +534,15 @@
                   :zoom (storage/value dict c"zoom")))
           (for [i 0 (storage/count panes)]
             (let [r (storage/at panes i)]
-              (if (not (add! c
-                             (rect (storage/value r c"x")
-                                   (storage/value r c"y")
-                                   (storage/value r c"width")
-                                   (storage/value r c"height"))))
+              (if (not (add-session! c
+                                     (rect (storage/value r c"x")
+                                           (storage/value r c"y")
+                                           (storage/value r c"width")
+                                           (storage/value r c"height"))
+                                     (let [id (storage/get r c"session")]
+                                       (if (and (storage/kind? id c"NSString") (sessions/valid-id? id))
+                                           id
+                                           (sessions/identifier)))))
                   (store! ok false)
                   0)))
           (let [focused (storage/value dict c"focused")]

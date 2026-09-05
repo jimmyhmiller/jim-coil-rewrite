@@ -41,14 +41,24 @@
 (defn read [] (-> (ptr i8))
   (let [data (msg (ptr i8) (class c"NSData") (sel c"dataWithContentsOfFile:") [(ptr i8)] (path))]
     (if (= (p/cast i64 data) 0)
-        (nil)
-        (msg (ptr i8)
-             (class c"NSJSONSerialization")
-             (sel c"JSONObjectWithData:options:error:")
-             [(ptr i8) u64 (ptr i8)]
-             data
-             0
-             (nil)))))
+        (if (!= (msg i8
+                     (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+                     (sel c"fileExistsAtPath:")
+                     [(ptr i8)]
+                     (path))
+                (p/cast i8 0))
+            (dictionary)
+            (nil))
+        (let [result
+                (msg (ptr i8)
+                     (class c"NSJSONSerialization")
+                     (sel c"JSONObjectWithData:options:error:")
+                     [(ptr i8) u64 (ptr i8)]
+                     data
+                     1
+                     (nil))]
+          ;; An unreadable JSON document must not look like a first launch.
+          (if (= (p/cast i64 result) 0) (dictionary) result)))))
 
 (defn write! [(snapshot (ptr i8))] (-> bool)
   (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])

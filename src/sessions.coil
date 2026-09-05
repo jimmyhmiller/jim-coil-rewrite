@@ -1,0 +1,59 @@
+(module jim.sessions)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+(extern jim_session_open :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> i32))
+
+(extern jim_session_kill :cc c [(ptr i8)] (-> i32))
+
+(extern chmod :cc c [(ptr i8) u16] (-> i32))
+
+(defn identifier [] (-> (ptr i8))
+  (msg (ptr i8) (msg (ptr i8) (class c"NSUUID") (sel c"UUID") []) (sel c"UUIDString") []))
+
+(defn directory [] (-> (ptr i8))
+  (msg (ptr i8) (ns c"~/.jim-coil/sessions") (sel c"stringByExpandingTildeInPath") []))
+
+(defn valid-id? [(id (ptr i8))] (-> bool)
+  (let [uuid
+          (msg (ptr i8) (msg (ptr i8) (class c"NSUUID") (sel c"alloc") []) (sel c"initWithUUIDString:") [(ptr i8)] id)
+        valid (!= (p/cast i64 uuid) 0)]
+    (do (release uuid) valid)))
+
+(defn path [(id (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       (directory)
+       (sel c"stringByAppendingPathComponent:")
+       [(ptr i8)]
+       (msg (ptr i8) id (sel c"stringByAppendingString:") [(ptr i8)] (ns c".sock"))))
+
+(defn open! [(id (ptr i8)) (cwd (ptr i8))] (-> i32)
+  (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+        base (msg (ptr i8) manager (sel c"currentDirectoryPath") [])]
+    (do
+      (msg i8
+           manager
+           (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+           [(ptr i8) i8 (ptr i8) (ptr i8)]
+           (directory)
+           (p/cast i8 1)
+           (nil)
+           (nil))
+      (chmod (utf8 (directory)) (p/cast u16 448))
+      (if (valid-id? id)
+          (jim_session_open (utf8 (msg (ptr i8)
+                                       base
+                                       (sel c"stringByAppendingPathComponent:")
+                                       [(ptr i8)]
+                                       (ns c"build/jim-session")))
+                            (utf8 (path id))
+                            cwd
+                            (utf8 (msg (ptr i8)
+                                       base
+                                       (sel c"stringByAppendingPathComponent:")
+                                       [(ptr i8)]
+                                       (ns c"build/ghostty/share/ghostty"))))
+          (p/cast i32 -1)))))
+
+(defn kill! [(id (ptr i8))] (-> bool)
+  (and (valid-id? id) (= (jim_session_kill (utf8 (path id))) (p/cast i32 0))))

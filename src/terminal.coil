@@ -2,12 +2,15 @@
 (import "jim.timings" :as timings)
 (import "jim.native" :use *)
 (import "jim.ghostty" :as g)
+(import "jim.sessions" :as sessions)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 
 (defstruct Terminal
   [(view (ptr i8))
    (surface (ptr i8))
+   (directory (ptr i8))
+   (session-id (ptr i8))
    (marked (ptr i8))
    (accum (ptr i8))
    (selection Range)
@@ -209,6 +212,33 @@
 (defn select-all [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
   (g/ghostty_surface_binding_action (.surface (terminal self)) c"select_all" 10))
 
+(defn accessibility-role [(self (ptr i8)) (cmd (ptr i8))] (-> (ptr i8))
+  (ns c"AXTextArea"))
+
+(defn accessibility-value [(self (ptr i8)) (cmd (ptr i8))] (-> (ptr i8))
+  (let [t (terminal self)
+        text (p/alloc-stack g/Text)
+        selection
+          (g/TextSelection
+            :top
+              (g/TextPoint
+                :tag 1
+                :coord 1
+                :x 0
+                :y 0)
+            :bottom
+              (g/TextPoint
+                :tag 1
+                :coord 2
+                :x 0
+                :y 0)
+            :rectangle false)]
+    (if (and (!= (p/cast i64 t) 0)
+             (!= (p/cast i64 (.surface t)) 0)
+             (g/ghostty_surface_read_text (.surface t) selection text))
+        (let [value (ns (.text text))] (do (g/ghostty_surface_free_text (.surface t) text) value))
+        (ns c""))))
+
 (defn view-class [] (-> (ptr i8))
   (let [existing (class c"JimTerminalView")]
     (if (!= (p/cast i64 existing) 0)
@@ -216,27 +246,36 @@
         (let [cls (objc_allocateClassPair (class c"NSView") c"JimTerminalView" 0)]
           (do
             (class_addProtocol cls (objc_getProtocol c"NSTextInputClient"))
+            (method! cls c"isAccessibilityElement" (p/cast (ptr i8) (p/fnptr-of accepts)) c"c@:")
+            (method! cls c"accessibilityRole" (p/cast (ptr i8) (p/fnptr-of accessibility-role)) c"@@:")
+            (method! cls c"accessibilityValue" (p/cast (ptr i8) (p/fnptr-of accessibility-value)) c"@@:")
             (method! cls c"acceptsFirstResponder" (p/cast (ptr i8) (p/fnptr-of accepts)) c"c@:")
             (method! cls c"becomeFirstResponder" (p/cast (ptr i8) (p/fnptr-of focus-in)) c"c@:")
             (method! cls c"resignFirstResponder" (p/cast (ptr i8) (p/fnptr-of focus-out)) c"c@:")
             (method! cls c"hasMarkedText" (p/cast (ptr i8) (p/fnptr-of has-marked)) c"c@:")
-            (method! cls c"markedRange" (p/cast (ptr i8) (p/fnptr-of marked-range)) c"{_NSRange=QQ}@:")
-            (method! cls c"selectedRange" (p/cast (ptr i8) (p/fnptr-of selected-range)) c"{_NSRange=QQ}@:")
+            (method! cls c"markedRange" (p/cast (ptr i8) (p/fnptr-of jim_terminal_marked_range)) c"{_NSRange=QQ}@:")
+            (method! cls c"selectedRange" (p/cast (ptr i8) (p/fnptr-of jim_terminal_selected_range)) c"{_NSRange=QQ}@:")
             (method! cls c"unmarkText" (p/cast (ptr i8) (p/fnptr-of unmark)) c"v@:")
-            (method! cls c"insertText:replacementRange:" (p/cast (ptr i8) (p/fnptr-of insert)) c"v@:@{_NSRange=QQ}")
+            (method! cls
+                     c"insertText:replacementRange:"
+                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_insert))
+                     c"v@:@{_NSRange=QQ}")
             (method! cls
                      c"setMarkedText:selectedRange:replacementRange:"
-                     (p/cast (ptr i8) (p/fnptr-of set-marked))
+                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_set_marked))
                      c"v@:@{_NSRange=QQ}{_NSRange=QQ}")
             (method! cls c"validAttributesForMarkedText" (p/cast (ptr i8) (p/fnptr-of attributes)) c"@@:")
             (method! cls
                      c"attributedSubstringForProposedRange:actualRange:"
-                     (p/cast (ptr i8) (p/fnptr-of substring))
+                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_substring))
                      c"@@:{_NSRange=QQ}^{_NSRange=QQ}")
-            (method! cls c"characterIndexForPoint:" (p/cast (ptr i8) (p/fnptr-of character-index)) c"Q@:{CGPoint=dd}")
+            (method! cls
+                     c"characterIndexForPoint:"
+                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_character_index))
+                     c"Q@:{CGPoint=dd}")
             (method! cls
                      c"firstRectForCharacterRange:actualRange:"
-                     (p/cast (ptr i8) (p/fnptr-of first-rect))
+                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_first_rect))
                      c"{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}")
             (method! cls c"doCommandBySelector:" (p/cast (ptr i8) (p/fnptr-of command)) c"v@::")
             (method! cls c"keyDown:" (p/cast (ptr i8) (p/fnptr-of key-down)) c"v@:@")
@@ -277,7 +316,13 @@
       (release pool))))
 
 (defn action [(app (ptr i8)) (target g/Target) (value g/Action)] (-> bool)
-  false)
+  (if (and (= (.tag target) (p/cast i32 1)) (= (.tag value) (p/cast i32 35)))
+      (let [t (p/cast (ptr Terminal) (g/ghostty_surface_userdata (.surface target)))
+            path (p/cast (ptr i8) (load (p/index (field value data) 0)))]
+        (if (and (!= (p/cast i64 t) 0) (!= (p/cast i64 path) 0))
+            (do (release (.directory t)) (set! (.directory t) (msg (ptr i8) (ns path) (sel c"retain") [])) true)
+            false))
+      false))
 
 (defn read-clipboard [(userdata (ptr i8)) (kind i32) (request (ptr i8))] (-> bool)
   (let [t (p/cast (ptr Terminal) userdata)
@@ -292,7 +337,10 @@
 
 (defn confirm-clipboard [(userdata (ptr i8)) (text (ptr i8)) (request (ptr i8)) (kind i32)] (-> void)
   ; Explicit paste is permitted. Unsolicited terminal reads are disabled by config.
-  (g/ghostty_surface_complete_clipboard_request (.surface (p/cast (ptr Terminal) userdata)) c"" request true))
+  (g/ghostty_surface_complete_clipboard_request (.surface (p/cast (ptr Terminal) userdata))
+                                                (if (= kind (p/cast i32 0)) text c"")
+                                                request
+                                                true))
 
 (defn write-clipboard [(userdata (ptr i8)) (kind i32) (contents (ptr g/ClipboardContent)) (count u64) (confirm bool)] (-> void)
   (do
@@ -321,13 +369,21 @@
             config (g/ghostty_config_new)
             (mut runtime) (p/zeroed g/Runtime)]
         (do
+          (jim_callbacks_init (p/cast (ptr i8) (p/fnptr-of action))
+                              (p/cast (ptr i8) (p/fnptr-of insert))
+                              (p/cast (ptr i8) (p/fnptr-of set-marked))
+                              (p/cast (ptr i8) (p/fnptr-of substring))
+                              (p/cast (ptr i8) (p/fnptr-of character-index))
+                              (p/cast (ptr i8) (p/fnptr-of first-rect-into))
+                              (p/cast (ptr i8) (p/fnptr-of marked-range-into))
+                              (p/cast (ptr i8) (p/fnptr-of selected-range-into)))
           (method! cls c"tick:" (p/cast (ptr i8) (p/fnptr-of tick)) c"v@:@")
           (objc_registerClassPair cls)
           (set! (dispatcher-cell) (new c"JimGhosttyDispatcher"))
           (g/ghostty_config_load_file config c"config/ghostty")
           (g/ghostty_config_finalize config)
           (set! (.wakeup runtime) (p/cast (ptr i8) (p/fnptr-of wakeup)))
-          (set! (.action runtime) (p/cast (ptr i8) (p/fnptr-of action)))
+          (set! (.action runtime) (p/cast (ptr i8) (p/fnptr-of jim_terminal_action)))
           (set! (.read runtime) (p/cast (ptr i8) (p/fnptr-of read-clipboard)))
           (set! (.confirm runtime) (p/cast (ptr i8) (p/fnptr-of confirm-clipboard)))
           (set! (.write runtime) (p/cast (ptr i8) (p/fnptr-of write-clipboard)))
@@ -336,13 +392,15 @@
           (g/ghostty_config_free config)
           (load (app-cell))))))
 
-(defn create! [(parent (ptr i8)) (bounds Rect) (cwd (ptr i8))] (-> (ptr Terminal))
+(defn create! [(parent (ptr i8)) (bounds Rect) (cwd (ptr i8)) (session-id (ptr i8))] (-> (ptr Terminal))
   (let [v (msg (ptr i8) (msg (ptr i8) (view-class) (sel c"alloc") []) (sel c"initWithFrame:") [Rect] bounds)
         t (alloc/box! (alloc/malloc-allocator) Terminal (p/zeroed Terminal))
         (mut config) (g/ghostty_surface_config_new)
         scale (msg f64 (msg (ptr i8) parent (sel c"window") []) (sel c"backingScaleFactor") [])]
     (do
       (set! (.view t) v)
+      (set! (.session-id t) (msg (ptr i8) session-id (sel c"retain") []))
+      (set! (.directory t) (msg (ptr i8) (ns cwd) (sel c"retain") []))
       (set! (.marked t) (new c"NSMutableString"))
       (set! (.accum t) (new c"NSMutableString"))
       (objc_setAssociatedObject v (association-key) (p/cast (ptr i8) t) 0)
@@ -352,16 +410,24 @@
       (set! (.userdata config) (p/cast (ptr i8) t))
       (set! (.scale config) scale)
       (set! (.cwd config) cwd)
-      (set! (.surface t) (g/ghostty_surface_new (load (app-cell)) config))
+      (let [fd (sessions/open! session-id cwd)]
+        (if (>= fd (p/cast i32 0))
+            (set! (.surface t) (g/ghostty_surface_new_session (load (app-cell)) config fd))
+            0))
       (if (!= (p/cast i64 (.surface t)) 0)
           (g/ghostty_surface_set_size (.surface t)
                                       (p/cast u32 (* (.w bounds) scale))
                                       (p/cast u32 (* (.h bounds) scale)))
-          (do))
+          (do
+            (objc_setAssociatedObject v (association-key) (nil) 0)
+            (msg i64 v (sel c"removeFromSuperview") [])
+            (release v)
+            (set! (.view t) (nil))
+            (do)))
       t)))
 
 (defn resize! [(t (ptr Terminal)) (bounds Rect) (scale f64)] (-> void)
-  (do
+  (when (!= (p/cast i64 (.surface t)) 0)
     (frame! (.view t) bounds)
     (g/ghostty_surface_set_content_scale (.surface t) scale scale)
     (g/ghostty_surface_set_size (.surface t) (p/cast u32 (* (.w bounds) scale)) (p/cast u32 (* (.h bounds) scale)))))
@@ -372,6 +438,8 @@
     (objc_setAssociatedObject (.view t) (association-key) (nil) 0)
     (msg i64 (.view t) (sel c"removeFromSuperview") [])
     (release (.view t))
+    (release (.directory t))
+    (release (.session-id t))
     (release (.marked t))
     (release (.accum t))
     (alloc/destroy [Terminal] (alloc/malloc-allocator) t)))
@@ -381,3 +449,30 @@
     (g/ghostty_app_free (load (app-cell)))
     (set! (app-cell) (nil))
     (release (load (dispatcher-cell)))))
+
+(extern jim_terminal_action :cc c [(ptr i8) g/Target g/Action] (-> bool))
+
+(extern jim_terminal_insert :cc c [(ptr i8) (ptr i8) (ptr i8) Range] (-> void))
+
+(extern jim_terminal_set_marked :cc c [(ptr i8) (ptr i8) (ptr i8) Range Range] (-> void))
+
+(extern jim_terminal_substring :cc c [(ptr i8) (ptr i8) Range (ptr Range)] (-> (ptr i8)))
+
+(extern jim_terminal_character_index :cc c [(ptr i8) (ptr i8) Point] (-> u64))
+
+(extern jim_terminal_first_rect :cc c [(ptr i8) (ptr i8) Range (ptr Range)] (-> Rect))
+
+(extern jim_callbacks_init :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> void))
+
+(extern jim_terminal_marked_range :cc c [(ptr i8) (ptr i8)] (-> Range))
+
+(extern jim_terminal_selected_range :cc c [(ptr i8) (ptr i8)] (-> Range))
+
+(defn first-rect-into [(self (ptr i8)) (cmd (ptr i8)) (range Range) (actual (ptr Range)) (result (ptr Rect))] (-> void)
+  (do (set! result (first-rect self cmd range actual)) (do)))
+
+(defn marked-range-into [(self (ptr i8)) (cmd (ptr i8)) (result (ptr Range))] (-> void)
+  (do (set! result (marked-range self cmd)) (do)))
+
+(defn selected-range-into [(self (ptr i8)) (cmd (ptr i8)) (result (ptr Range))] (-> void)
+  (do (set! result (selected-range self cmd)) (do)))

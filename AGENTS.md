@@ -22,3 +22,17 @@ Before completing Coil changes:
 Use the `jim-coil-rewrite` pad as the project index and working record.
 Report dependency bugs in that dependency's bugs pad following its reporting rules.
 If creating worktrees, put them under the project's ignored `.worktrees/` directory.
+
+Terminal sessions belong to Jim's private service. Do not introduce tmux or
+another terminal multiplexer. App shutdown detaches; explicit pane/project
+closure terminates the corresponding sessions. Preserve stable session IDs.
+Run `python3 tests/session_test.py` after building the service for lifecycle or
+protocol changes. Verify real app quit/reopen for renderer integration changes.
+Format native boundary code with `clang-format` and the Ghostty extension with
+`zig fmt`. Compile C with warnings treated as errors. Keep native callbacks'
+by-value C ABI separate from Coil's internal struct-reference convention.
+
+Only patch the project-local pinned Ghostty dependency under build/deps; never
+modify original Jim's checkout or installed Ghostty. Reproduce patches through
+scripts/ghostty/session-backend.py. Compile config/ from its own package directory
+so hot configuration libraries cannot link a second copy of Ghostty into the app.

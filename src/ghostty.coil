@@ -91,3 +91,17 @@
 (extern ghostty_surface_complete_clipboard_request :cc c [(ptr i8) (ptr i8) (ptr i8) bool] (-> void))
 
 (extern ghostty_surface_process_exited :cc c [(ptr i8)] (-> bool))
+
+(extern ghostty_surface_userdata :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern ghostty_surface_new_session :cc c [(ptr i8) (ptr SurfaceConfig) i32] (-> (ptr i8)))
+
+(defstruct TextPoint [(tag i32) (coord i32) (x u32) (y u32)])
+
+(defstruct TextSelection [(top TextPoint) (bottom TextPoint) (rectangle bool)])
+
+(defstruct Text [(x f64) (y f64) (offset u32) (length u32) (text (ptr i8)) (size u64)])
+
+(extern ghostty_surface_read_text :cc c [(ptr i8) TextSelection (ptr Text)] (-> bool))
+
+(extern ghostty_surface_free_text :cc c [(ptr i8) (ptr Text)] (-> void))

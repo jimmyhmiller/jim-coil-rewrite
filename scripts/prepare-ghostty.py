@@ -20,6 +20,12 @@ if not SOURCE.exists():
     with tarfile.open(archive) as tar:
         tar.extractall(SOURCE.parent, filter='data')
     archive.unlink()
+# Keep the transport extension local even when reusing another checkout.
+if source_override and not SOURCE.is_relative_to(ROOT / 'build'):
+    local = ROOT / 'build/deps' / ('ghostty-' + REV)
+    if not local.exists():
+        shutil.copytree(SOURCE, local, ignore=shutil.ignore_patterns('.git', '.zig-cache', 'zig-out'))
+    SOURCE = local
 expected = hashlib.sha256((ROOT / 'vendor/ghostty.h').read_bytes()).digest()
 actual = hashlib.sha256((SOURCE / 'include/ghostty.h').read_bytes()).digest()
 if actual != expected:
@@ -27,6 +33,7 @@ if actual != expected:
 if subprocess.check_output(['zig', 'version'], text=True).strip() != '0.16.0':
     raise SystemExit('This Ghostty revision requires Zig 0.16.0.')
 subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '--version'], check=True)
+subprocess.run(['python3', str(ROOT / 'scripts/ghostty/session-backend.py'), str(SOURCE)], check=True)
 subprocess.run(['zig', 'build', '-Dapp-runtime=none', '-Demit-xcframework=true',
     '-Dxcframework-target=native', '-Doptimize=ReleaseFast', '-Demit-docs=false',
     '-Demit-webdata=false', '-Demit-macos-app=false', '--prefix', str(DEST)], cwd=SOURCE, check=True)
@@ -35,5 +42,7 @@ if len(artifacts) != 1:
     raise SystemExit('Expected exactly one native GhosttyKit library.')
 (DEST / 'lib').mkdir(parents=True, exist_ok=True)
 shutil.copy2(artifacts[0], DEST / 'lib/libghostty-internal.a')
+subprocess.run(['zig', 'build', '-Demit-lib-vt=true', '-Doptimize=ReleaseFast',
+    '-Demit-docs=false', '--prefix', str(DEST)], cwd=SOURCE, check=True)
 (DEST / 'revision').write_text(REV + '\n')
 print('Ghostty embedding library is ready:', DEST)

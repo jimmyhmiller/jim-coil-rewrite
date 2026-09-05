@@ -1,0 +1,218 @@
+(module jim.projects)
+(import "jim.native" :use *)
+(import "jim.storage" :as s)
+(import "coil.primitive" :as p)
+
+;;; Projects are global; profiles store visibility and selection, never panes.
+(defn id [(record (ptr i8))] (-> i64)
+  (p/cast i64 (s/value record c"id")))
+
+(defn list [(root (ptr i8))] (-> (ptr i8))
+  (s/get root c"projects"))
+
+(defn profiles [(root (ptr i8))] (-> (ptr i8))
+  (s/get root c"profiles"))
+
+(defn find [(records (ptr i8)) (wanted i64)] (-> (ptr i8))
+  (let [(mut result) (nil)]
+    (do
+      (for [i 0 (s/count records)] (if (= (id (s/at records i)) wanted) (store! result (s/at records i)) 0))
+      (load result))))
+
+(defn profile [(root (ptr i8))] (-> (ptr i8))
+  (find (profiles root) (p/cast i64 (s/value root c"profile"))))
+
+(defn active [(root (ptr i8))] (-> i64)
+  (p/cast i64 (s/value (profile root) c"active")))
+
+(defn hidden? [(profile (ptr i8)) (project i64)] (-> bool)
+  (!= (msg i8 (s/get profile c"hidden") (sel c"containsObject:") [(ptr i8)] (s/number (p/cast f64 project)))
+      (p/cast i8 0)))
+
+(defn select! [(root (ptr i8)) (project i64)] (-> void)
+  (if (and (> project 0) (!= (p/cast i64 (find (list root) project)) 0) (not (hidden? (profile root) project)))
+      (do (s/put! (profile root) c"active" (s/number (p/cast f64 project))) (do))
+      (do)))
+
+(defn repair-selection! [(root (ptr i8))] (-> void)
+  (let [pr (profile root)
+        selected (active root)]
+    (if (or (= (p/cast i64 (find (list root) selected)) 0) (hidden? pr selected))
+        (do
+          (s/put! pr c"active" (s/number 0.0))
+          (for [i 0 (s/count (list root))]
+            (let [candidate (id (s/at (list root) i))]
+              (if (and (= (active root) 0) (not (hidden? pr candidate))) (select! root candidate) (do))))
+          (do))
+        (do))))
+
+(defn hide! [(root (ptr i8)) (project i64) (hidden bool)] (-> void)
+  (let [items (s/get (profile root) c"hidden")
+        value (s/number (p/cast f64 project))]
+    (do
+      (if hidden
+          (if (not (hidden? (profile root) project)) (s/add! items value) 0)
+          (msg i64 items (sel c"removeObject:") [(ptr i8)] value))
+      (repair-selection! root))))
+
+(defn switch-profile! [(root (ptr i8)) (wanted i64)] (-> void)
+  (if (!= (p/cast i64 (find (profiles root) wanted)) 0)
+      (do (s/put! root c"profile" (s/number (p/cast f64 wanted))) (repair-selection! root))
+      (do)))
+
+(defn next-id! [(root (ptr i8))] (-> i64)
+  (let [next (p/cast i64 (s/value root c"next_id"))]
+    (do (s/put! root c"next_id" (s/number (p/cast f64 (+ next 1)))) next)))
+
+(defn new-project! [(root (ptr i8)) (name (ptr i8))] (-> (ptr i8))
+  (let [record (s/dictionary)
+        next (next-id! root)]
+    (do
+      (s/put! record c"id" (s/number (p/cast f64 next)))
+      (s/put! record c"name" name)
+      (s/put! record c"directory" (msg (ptr i8) (ns c"~") (sel c"stringByExpandingTildeInPath") []))
+      (s/add! (list root) record)
+      (for [i 0 (s/count (profiles root))]
+        (let [pr (s/at (profiles root) i)]
+          (if (!= (id pr) (id (profile root))) (s/add! (s/get pr c"hidden") (s/number (p/cast f64 next))) 0)))
+      (select! root next)
+      record)))
+
+(defn new-profile! [(root (ptr i8)) (name (ptr i8))] (-> void)
+  (let [record (s/dictionary)
+        next (next-id! root)
+        old (profile root)
+        hidden (s/array)]
+    (do
+      (for [i 0 (s/count (s/get old c"hidden"))] (s/add! hidden (s/at (s/get old c"hidden") i)))
+      (s/put! record c"id" (s/number (p/cast f64 next)))
+      (s/put! record c"name" name)
+      (s/put! record c"hidden" hidden)
+      (s/put! record c"active" (s/number (p/cast f64 (active root))))
+      (s/add! (profiles root) record)
+      (switch-profile! root next))))
+
+(defn delete-profile! [(root (ptr i8))] (-> bool)
+  (if (> (s/count (profiles root)) 1)
+      (do
+        (msg i64 (profiles root) (sel c"removeObject:") [(ptr i8)] (profile root))
+        (switch-profile! root (id (s/at (profiles root) 0)))
+        true)
+      false))
+
+(defn delete-project! [(root (ptr i8)) (wanted i64)] (-> void)
+  (let [previous (id (profile root))]
+    (do
+      (msg i64 (list root) (sel c"removeObject:") [(ptr i8)] (find (list root) wanted))
+      (for [i 0 (s/count (profiles root))]
+        (let [pr (s/at (profiles root) i)]
+          (do
+            (msg i64 (s/get pr c"hidden") (sel c"removeObject:") [(ptr i8)] (s/number (p/cast f64 wanted)))
+            (switch-profile! root (id pr)))))
+      (switch-profile! root previous))))
+
+(defn reorder! [(root (ptr i8)) (moving i64) (before i64)] (-> void)
+  (let [items (list root)
+        item (find items moving)
+        target (find items before)]
+    (if (and (!= moving before) (!= (p/cast i64 item) 0) (!= (p/cast i64 target) 0))
+        (do
+          (msg (ptr i8) item (sel c"retain") [])
+          (msg i64 items (sel c"removeObject:") [(ptr i8)] item)
+          (msg i64
+               items
+               (sel c"insertObject:atIndex:")
+               [(ptr i8) u64]
+               item
+               (msg u64 items (sel c"indexOfObject:") [(ptr i8)] target))
+          (release item))
+        (do))))
+
+(defn fresh [] (-> (ptr i8))
+  (let [root (s/dictionary)]
+    (do
+      (s/put! root c"version" (s/number 2.0))
+      (s/put! root c"next_id" (s/number 1.0))
+      (s/put! root c"projects" (s/array))
+      (s/put! root c"profiles" (s/array))
+      (s/put! root c"sidebar_width" (s/number 220.0))
+      (new-profile! root (ns c"Default"))
+      root)))
+
+(defn valid? [(root (ptr i8))] (-> bool)
+  (let [(mut ok)
+          (and (s/kind? (list root) c"NSArray")
+               (> (s/count (profiles root)) 0)
+               (!= (p/cast i64 (profile root)) 0)
+               (s/numeric? root c"next_id"))
+        seen (s/array)]
+    (do
+      (for [group 0 2]
+        (let [records (if (= group 0) (list root) (profiles root))]
+          (for [i 0 (s/count records)]
+            (let [r (s/at records i)
+                  number (s/get r c"id")]
+              (do
+                (if (not (and (s/kind? number c"NSNumber")
+                              (> (s/value r c"id") 0.0)
+                              (< (s/value r c"id") (s/value root c"next_id"))
+                              (< (s/value r c"id") 1000000000.0)
+                              (p/fcmp-eq (s/value r c"id") (p/cast f64 (id r)))
+                              (s/kind? (s/get r c"name") c"NSString")
+                              (= (msg i8 seen (sel c"containsObject:") [(ptr i8)] number) (p/cast i8 0))
+                              (if (= group 0)
+                                  (s/kind? (s/get r c"directory") c"NSString")
+                                  (and (s/kind? (s/get r c"hidden") c"NSArray") (s/numeric? r c"active")))))
+                    (store! ok false)
+                    0)
+                (if (!= (p/cast i64 number) 0) (s/add! seen number) 0))))))
+      (load ok))))
+
+;;; Upgrade the original rewrite's anonymous four-canvas file without losing layout.
+(defn restore [(saved (ptr i8))] (-> (ptr i8))
+  (if (and (p/fcmp-eq (s/value saved c"version") 2.0) (> (s/count (profiles saved)) 0))
+      (do (repair-selection! saved) saved)
+      (let [root (fresh)
+            old (s/get saved c"projects")]
+        (do
+          (if (> (s/count old) 0)
+              (do
+                (for [i 0 (s/count old)]
+                  (let [record
+                          (new-project! root
+                                        (ns (cond (= i 0) c"Workspace"
+                                                  (= i 1) c"Development"
+                                                  (= i 2) c"Build & run"
+                                                  :else c"Scratch")))]
+                    (s/put! record c"layout" (s/at old i))))
+                (select! root (id (s/at (list root) (p/cast i64 (s/value saved c"selected"))))))
+              (do (new-project! root (ns c"Workspace")) (do)))
+          root))))
+
+(defn visible-id [(root (ptr i8)) (rank i64)] (-> i64)
+  (let [(mut at) 0
+        (mut found) 0]
+    (do
+      (for [i 0 (s/count (list root))]
+        (let [record (s/at (list root) i)]
+          (if (not (hidden? (profile root) (id record)))
+              (do (if (= (load at) rank) (store! found (id record)) 0) (store! at (+ (load at) 1)))
+              0)))
+      (load found))))
+
+(defn reorder-at! [(root (ptr i8)) (moving i64) (target-id i64) (after bool)] (-> void)
+  (let [items (list root)
+        item (find items moving)
+        target (find items target-id)]
+    (if (and (!= moving target-id) (!= (p/cast i64 item) 0) (!= (p/cast i64 target) 0))
+        (do
+          (msg (ptr i8) item (sel c"retain") [])
+          (msg i64 items (sel c"removeObject:") [(ptr i8)] item)
+          (msg i64
+               items
+               (sel c"insertObject:atIndex:")
+               [(ptr i8) u64]
+               item
+               (+ (msg u64 items (sel c"indexOfObject:") [(ptr i8)] target) (p/cast u64 (if after 1 0))))
+          (release item))
+        (do))))
