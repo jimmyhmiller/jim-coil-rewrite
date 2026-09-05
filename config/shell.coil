@@ -1,0 +1,37 @@
+(module jim.config)
+
+;;; Trusted Coil theme/configuration module. Host state survives each load.
+;;; Change values and save; an invalid build or value keeps the last good theme.
+(defn jim-config-version [] (-> i64)
+  2)
+
+(defn jim-config-value [(key i64)] (-> f64)
+  (cond (= key 0) 0.42  ; duration
+        (= key 1) 224.0  ; sidebar
+        (= key 2) 0.4  ; accent-r
+        (= key 3) 0.78  ; accent-g
+        (= key 4) 0.96  ; accent-b
+        (= key 5) 0.055  ; canvas-r
+        (= key 6) 0.07  ; canvas-g
+        (= key 7) 0.095  ; canvas-b
+        (= key 8) 0.075  ; rail-r
+        (= key 9) 0.09  ; rail-g
+        (= key 10) 0.12  ; rail-b
+        (= key 11) 0.105  ; pane-r
+        (= key 12) 0.135  ; pane-g
+        (= key 13) 0.18  ; pane-b
+        (= key 14) 0.88  ; ink-r
+        (= key 15) 0.91  ; ink-g
+        (= key 16) 0.96  ; ink-b
+        (= key 17) 0.51  ; muted-r
+        (= key 18) 0.57  ; muted-g
+        (= key 19) 0.65  ; muted-b
+        (= key 20) 0.005  ; shadow-r
+        (= key 21) 0.009  ; shadow-g
+        (= key 22) 0.018  ; shadow-b
+        (= key 23) 140.0  ; edge-width
+        (= key 24) 600.0  ; edge-distance
+        (= key 25) 0.95  ; edge-strength
+        :else 0.0))
+
+(export-c jim-config-version jim-config-value)

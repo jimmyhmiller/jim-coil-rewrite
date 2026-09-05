@@ -1,0 +1,108 @@
+(module jim.controls)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+;;; Application-local responder policy. Unknown keys end silently, without
+;;; changing the system sound settings or suppressing recognized commands.
+(defn unhandled [(self (ptr i8)) (cmd (ptr i8)) (selector (ptr i8))] (-> void)
+  (do))
+
+(defn quiet-class [(parent (ptr i8)) (name (ptr i8))] (-> (ptr i8))
+  (let [existing (class name)]
+    (if (!= (p/cast i64 existing) 0)
+        existing
+        (let [cls (objc_allocateClassPair (class parent) name 0)]
+          (do
+            (method! cls c"noResponderFor:" (p/cast (ptr i8) (p/fnptr-of unhandled)) c"v@::")
+            (objc_registerClassPair cls)
+            cls)))))
+
+(defn hover-key [] (-> (ptr i8))
+  (p/cast (ptr i8) (p/alloc-static i8)))
+
+(defn selected-key [] (-> (ptr i8))
+  (p/cast (ptr i8) (p/alloc-static i8)))
+
+(defn flag [(view (ptr i8)) (key (ptr i8))] (-> bool)
+  (!= (msg i8 (objc_getAssociatedObject view key) (sel c"boolValue") []) (p/cast i8 0)))
+
+(defn flag! [(view (ptr i8)) (key (ptr i8)) (value bool)] (-> void)
+  (do
+    (objc_setAssociatedObject view
+                              key
+                              (msg (ptr i8)
+                                   (class c"NSNumber")
+                                   (sel c"numberWithBool:")
+                                   [i8]
+                                   (p/cast i8 (if value 1 0)))
+                              1)
+    (do)))
+
+(defn paint! [(view (ptr i8))] (-> void)
+  (let [hover (flag view (hover-key))
+        selected (flag view (selected-key))]
+    (do
+      (transaction! 0.0)
+      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (background! view
+                   (if selected (if hover 0.20 0.15) (if hover 0.13 0.075))
+                   (if selected (if hover 0.30 0.22) (if hover 0.18 0.09))
+                   (if selected (if hover 0.40 0.29) (if hover 0.24 0.12)))
+      (commit!)
+      (do))))
+
+(defn select! [(view (ptr i8)) (selected bool)] (-> void)
+  (do (flag! view (selected-key) selected) (paint! view)))
+
+(defn hover [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [target (msg (ptr i8) self (sel c"target") [])]
+    (do
+      (if (not (flag self (hover-key))) (do (flag! self (hover-key) true) (paint! self)) (do))
+      (if (!= (msg i8 target (sel c"respondsToSelector:") [(ptr i8)] (sel c"hovered:")) (p/cast i8 0))
+          (msg i64 target (sel c"hovered:") [(ptr i8)] self)
+          0)
+      (do))))
+
+(defn exit [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (do (flag! self (hover-key) false) (paint! self)))
+
+(defn button-class [] (-> (ptr i8))
+  (let [existing (class c"JimHoverButton")]
+    (if (!= (p/cast i64 existing) 0)
+        existing
+        (let [cls (objc_allocateClassPair (class c"NSButton") c"JimHoverButton" 0)]
+          (do
+            (method! cls c"mouseEntered:" (p/cast (ptr i8) (p/fnptr-of hover)) c"v@:@")
+            (method! cls c"mouseMoved:" (p/cast (ptr i8) (p/fnptr-of hover)) c"v@:@")
+            (method! cls c"mouseExited:" (p/cast (ptr i8) (p/fnptr-of exit)) c"v@:@")
+            (objc_registerClassPair cls)
+            cls)))))
+
+(defn button [(title (ptr i8)) (target (ptr i8)) (action (ptr i8))] (-> (ptr i8))
+  (let [b
+          (msg (ptr i8)
+               (msg (ptr i8) (button-class) (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               (rect 0.0 0.0 0.0 0.0))
+        tracking
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSTrackingArea") (sel c"alloc") [])
+               (sel c"initWithRect:options:owner:userInfo:")
+               [Rect u64 (ptr i8) (ptr i8)]
+               (rect 0.0 0.0 0.0 0.0)
+               643
+               b
+               (nil))]
+    (do
+      (msg i64 b (sel c"setTitle:") [(ptr i8)] (ns title))
+      (msg i64 b (sel c"setTarget:") [(ptr i8)] target)
+      (msg i64 b (sel c"setAction:") [(ptr i8)] action)
+      (msg i64 b (sel c"setButtonType:") [u64] 7)
+      (msg (ptr i8) b (sel c"autorelease") [])
+      (msg i64 b (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+      (msg i64 (layer b) (sel c"setCornerRadius:") [f64] 6.0)
+      (msg i64 b (sel c"addTrackingArea:") [(ptr i8)] tracking)
+      (release tracking)
+      (paint! b)
+      b)))

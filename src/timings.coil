@@ -1,0 +1,298 @@
+(module jim.timings)
+(import "jim.native" :use *)
+(import "jim.timing-model" :as model)
+(import "jim.canvas-model" :use [clamp])
+(import "experiments.coil_gpui.animation" :as animation)
+(import "coil.primitive" :as p)
+
+(defstruct Timings
+  [(view (ptr i8))
+   (owner (ptr i8))
+   (link (ptr i8))
+   (target (ptr i8))
+   (headline (ptr i8))
+   (detail (ptr i8))
+   (stages (ptr i8))
+   (scale-label (ptr i8))
+   (bars (array (ptr i8) 120))
+   (segments (array (ptr i8) 600))
+   (history model/History)
+   (pending model/Sample)
+   (last f64)
+   (next-label f64)])
+
+(defn state [] (-> (ptr Timings))
+  (p/alloc-static Timings))
+
+(defn visible? [] (-> bool)
+  (and (!= (p/cast i64 (.view (state))) 0)
+       (= (msg i8 (.view (state)) (sel c"isHidden") []) (p/cast i8 0))))
+
+(defn owns-event? [(event (ptr i8))] (-> bool)
+  (let [kind (msg i64 event (sel c"type") [])]
+    (if (and (visible?) (or (and (>= kind 1) (<= kind 7)) (or (= kind 22) (and (>= kind 25) (<= kind 30)))))
+        (let [pt
+                (msg Point
+                     (.view (state))
+                     (sel c"convertPoint:fromView:")
+                     [Point (ptr i8)]
+                     (msg Point event (sel c"locationInWindow") [])
+                     (nil))]
+          (and (and (>= (.x pt) 0.0) (< (.x pt) 640.0)) (and (>= (.y pt) 0.0) (< (.y pt) 450.0))))
+        false)))
+
+(defn now [] (-> f64)
+  (animation/animation-now))
+
+;;; CPU scopes are exclusive. Time blocked in nextEvent is not CPU work.
+(defn record! [(stage i64) (milliseconds f64)] (-> void)
+  (let [s (state)
+        v (field s pending)]
+    (if (visible?)
+        (cond (= stage 0) (store! (field v input) (+ (.input v) milliseconds))
+              (= stage 1) (store! (field v maintenance) (+ (.maintenance v) milliseconds))
+              (= stage 2) (store! (field v windows) (+ (.windows v) milliseconds))
+              (= stage 3) (store! (field v ghostty) (+ (.ghostty v) milliseconds))
+              :else (store! (field v overlay) (+ (.overlay v) milliseconds)))
+        (do))))
+
+(defn number [(value f64)] (-> (ptr i8))
+  (let [formatter (new c"NSNumberFormatter")]
+    (do
+      (msg i64 formatter (sel c"setMaximumFractionDigits:") [u64] 2)
+      (msg i64 formatter (sel c"setMinimumFractionDigits:") [u64] 2)
+      (msg (ptr i8) formatter (sel c"autorelease") [])
+      (msg (ptr i8)
+           formatter
+           (sel c"stringFromNumber:")
+           [(ptr i8)]
+           (msg (ptr i8) (class c"NSNumber") (sel c"numberWithDouble:") [f64] value)))))
+
+(defn append [(a (ptr i8)) (b (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) a (sel c"stringByAppendingString:") [(ptr i8)] b))
+
+(defn pair [(prefix (ptr i8)) (value f64) (suffix (ptr i8))] (-> (ptr i8))
+  (append (append (ns prefix) (number value)) (ns suffix)))
+
+(defn stage-value [(sample model/Sample) (i i64)] (-> f64)
+  (cond (= i 0) (.input sample)
+        (= i 1) (.maintenance sample)
+        (= i 2) (.windows sample)
+        (= i 3) (.ghostty sample)
+        :else (.overlay sample)))
+
+(defn paint! [(time f64)] (-> void)
+  (let [s (state)
+        h (field s history)
+        summary (model/summarize h)
+        ceiling (if (> (.maximum summary) 33.34) (.maximum summary) 33.34)]
+    (do
+      (transaction! 0.0)
+      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (for [i 0 120]
+        (let [at (% (+ (.next h) i) 120)
+              sample (load (p/index (field h samples) at))
+              bar (load (p/index (field s bars) i))
+              x (+ 20.0 (* (p/cast f64 i) 5.0))
+              (mut y) 80.0]
+          (do
+            (msg i64 bar (sel c"setFrame:") [Rect] (rect x 230.0 4.0 (* 95.0 (/ (.interval sample) ceiling))))
+            (for [j 0 5]
+              (let [segment (load (p/index (field s segments) (+ (* i 5) j)))
+                    height (* 95.0 (clamp (/ (stage-value sample j) ceiling) 0.0 1.0))]
+                (do
+                  (msg i64 segment (sel c"setFrame:") [Rect] (rect x (load y) 4.0 height))
+                  (store! y (+ (load y) height))))))))
+      (commit!)
+      (if (>= time (.next-label s))
+          (do
+            (store! (field s next-label) (+ time 0.25))
+            (msg i64
+                 (.headline s)
+                 (sel c"setStringValue:")
+                 [(ptr i8)]
+                 (pair c"UI refresh callbacks: " (.hz summary) c" / sec"))
+            (msg i64
+                 (.detail s)
+                 (sel c"setStringValue:")
+                 [(ptr i8)]
+                 (append (append (pair c"Interval  avg " (.mean summary) c" ms    p95 ")
+                                 (pair c"" (.p95 summary) c" ms    max "))
+                         (append (pair c"" (.maximum summary) c" ms    late ")
+                                 (number (p/cast f64 (.late summary))))))
+            (msg i64
+                 (.stages s)
+                 (sel c"setStringValue:")
+                 [(ptr i8)]
+                 (append (append (pair c"CPU ms / callback: input " (.input summary) c"   maintenance ")
+                                 (pair c"" (.maintenance summary) c"   AppKit "))
+                         (append (pair c"" (.windows summary) c"   Ghostty tick ")
+                                 (append (pair c"" (.ghostty summary) c"   overlay ") (number (.overlay summary))))))
+            (msg i64
+                 (.scale-label s)
+                 (sel c"setStringValue:")
+                 [(ptr i8)]
+                 (pair c"Last 120 callbacks • both graphs: 0–"
+                       ceiling
+                       c" ms • late = interval > 1.5× display budget")))
+          0)
+      (do))))
+
+(defn display [(self (ptr i8)) (cmd (ptr i8)) (link (ptr i8))] (-> void)
+  (let [s (state)
+        time (now)
+        budget (* 1000.0 (- (msg f64 link (sel c"targetTimestamp") []) (msg f64 link (sel c"timestamp") [])))]
+    (if (visible?)
+        (do
+          (if (> (.last s) 0.0)
+              (do
+                (store! (field (field s pending) interval) (* 1000.0 (- time (.last s))))
+                (store! (field (field s pending) budget) budget)
+                (model/push! (field s history) (.pending s)))
+              (do))
+          (store! (field s pending)
+                  (model/Sample
+                    :interval 0.0
+                    :budget 0.0
+                    :input 0.0
+                    :maintenance 0.0
+                    :windows 0.0
+                    :ghostty 0.0
+                    :overlay 0.0))
+          (store! (field s last) time)
+          (paint! time)
+          (record! 4 (* 1000.0 (- (now) time))))
+        (do (msg i64 link (sel c"setPaused:") [i8] (p/cast i8 1)) (store! (field s last) 0.0) (do)))))
+
+(defn toggle! [] (-> void)
+  (let [s (state)]
+    (if (visible?)
+        (do
+          (msg i64 (.view s) (sel c"setHidden:") [i8] (p/cast i8 1))
+          (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 1))
+          (do))
+        (do
+          (store! (field s last) 0.0)
+          (store! (field s pending)
+                  (model/Sample
+                    :interval 0.0
+                    :budget 0.0
+                    :input 0.0
+                    :maintenance 0.0
+                    :windows 0.0
+                    :ghostty 0.0
+                    :overlay 0.0))
+          (msg i64 (.view s) (sel c"setHidden:") [i8] (p/cast i8 0))
+          (msg i64
+               (msg (ptr i8) (.owner s) (sel c"contentView") [])
+               (sel c"addSubview:positioned:relativeTo:")
+               [(ptr i8) i64 (ptr i8)]
+               (.view s)
+               1
+               (nil))
+          (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 0))
+          (do)))))
+
+(defn new-layer [(parent (ptr i8)) (r f64) (g f64) (b f64)] (-> (ptr i8))
+  (let [l (msg (ptr i8) (class c"CALayer") (sel c"layer") [])]
+    (do
+      (msg i64 l (sel c"setBackgroundColor:") [(ptr i8)] (msg (ptr i8) (color r g b 1.0) (sel c"CGColor") []))
+      (msg i64 (layer parent) (sel c"addSublayer:") [(ptr i8)] l)
+      l)))
+
+(defn clicked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (toggle!))
+
+(defn setup! [(owner (ptr i8))] (-> void)
+  (let [s (state)
+        cls (objc_allocateClassPair (class c"NSObject") c"JimFrameTimings" 0)
+        content (msg (ptr i8) owner (sel c"contentView") [])
+        bounds (msg Rect content (sel c"bounds") [])
+        root (view content (rect (- (.w bounds) 656.0) (- (.h bounds) 466.0) 640.0 450.0))]
+    (do
+      (store! (field s view) root)
+      (store! (field s owner) owner)
+      (msg i64 root (sel c"setHidden:") [i8] (p/cast i8 1))
+      (msg i64 root (sel c"setAutoresizingMask:") [u64] 9)
+      (msg i64 (layer root) (sel c"setCornerRadius:") [f64] 10.0)
+      (msg i64 (layer root) (sel c"setBorderWidth:") [f64] 1.0)
+      (msg i64
+           (layer root)
+           (sel c"setBorderColor:")
+           [(ptr i8)]
+           (msg (ptr i8) (color 0.3 0.4 0.5 1.0) (sel c"CGColor") []))
+      (background! root 0.055 0.07 0.095)
+      (store! (field s headline)
+              (label root c"Waiting for display callbacks…" (rect 20.0 408.0 560.0 26.0) 19.0 false))
+      (store! (field s detail) (label root c"" (rect 20.0 376.0 600.0 24.0) 12.0 false))
+      (label root c"Display callback interval" (rect 20.0 337.0 600.0 22.0) 12.0 true)
+      (label root
+             c"Shell CPU: input · maintenance · AppKit · Ghostty tick · overlay"
+             (rect 20.0 191.0 600.0 24.0)
+             12.0
+             true)
+      (store! (field s stages) (label root c"" (rect 20.0 52.0 610.0 24.0) 10.0 false))
+      (store! (field s scale-label) (label root c"" (rect 20.0 28.0 610.0 24.0) 10.0 true))
+      (label root
+             c"Display cadence ≠ rendered FPS. Ghostty render-thread / GPU timings are not exposed."
+             (rect 20.0 6.0 615.0 20.0)
+             10.0
+             true)
+      (for [i 0 120]
+        (do
+          (store! (p/index (field s bars) i) (new-layer root 0.4 0.78 0.96))
+          (for [j 0 5]
+            (store! (p/index (field s segments) (+ (* i 5) j))
+                    (new-layer root
+                               (cond (= j 0) 0.4 (= j 1) 0.98 (= j 2) 0.6 (= j 3) 0.72 :else 0.5)
+                               (cond (= j 0) 0.78 (= j 1) 0.7 (= j 2) 0.85 (= j 3) 0.5 :else 0.55)
+                               (cond (= j 0) 0.96 (= j 1) 0.35 (= j 2) 0.5 (= j 3) 0.95 :else 0.6))))))
+      (method! cls c"display:" (p/cast (ptr i8) (p/fnptr-of display)) c"v@:@")
+      (method! cls c"close:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
+      (objc_registerClassPair cls)
+      (store! (field s target) (new c"JimFrameTimings"))
+      (let [close
+              (msg (ptr i8)
+                   (class c"NSButton")
+                   (sel c"buttonWithTitle:target:action:")
+                   [(ptr i8) (ptr i8) (ptr i8)]
+                   (ns c"×")
+                   (.target s)
+                   (sel c"close:"))]
+        (do
+          (frame! close (rect 596.0 407.0 28.0 28.0))
+          (msg i64 close (sel c"setBordered:") [i8] (p/cast i8 0))
+          (msg i64 close (sel c"setAccessibilityLabel:") [(ptr i8)] (ns c"Close frame timings"))
+          (msg i64 root (sel c"addSubview:") [(ptr i8)] close)))
+      (store! (field s link)
+              (msg (ptr i8)
+                   owner
+                   (sel c"displayLinkWithTarget:selector:")
+                   [(ptr i8) (ptr i8)]
+                   (.target s)
+                   (sel c"display:")))
+      (msg (ptr i8) (.link s) (sel c"retain") [])
+      (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 1))
+      (msg i64
+           (.link s)
+           (sel c"addToRunLoop:forMode:")
+           [(ptr i8) (ptr i8)]
+           (msg (ptr i8) (class c"NSRunLoop") (sel c"mainRunLoop") [])
+           (ns c"kCFRunLoopDefaultMode"))
+      ;; Register concrete modes, matching the shell pump and AppKit tracking.
+      ;; The common-modes API requires the exported sentinel, not a same-text NSString.
+      (msg i64
+           (.link s)
+           (sel c"addToRunLoop:forMode:")
+           [(ptr i8) (ptr i8)]
+           (msg (ptr i8) (class c"NSRunLoop") (sel c"mainRunLoop") [])
+           (ns c"NSEventTrackingRunLoopMode"))
+      (do))))
+
+(defn free! [] (-> void)
+  (do
+    (msg i64 (.link (state)) (sel c"invalidate") [])
+    (release (.link (state)))
+    (msg i64 (.view (state)) (sel c"removeFromSuperview") [])
+    (release (.target (state)))
+    (do)))

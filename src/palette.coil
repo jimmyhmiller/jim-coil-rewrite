@@ -1,0 +1,272 @@
+(module jim.palette)
+(import "jim.native" :use *)
+(import "jim.actions" :as actions)
+(import "jim.controls" :as controls)
+(import "coil.primitive" :as p)
+
+(defstruct Palette
+  [(overlay (ptr i8))
+   (card (ptr i8))
+   (previous-responder (ptr i8))
+   (owner (ptr i8))
+   (search (ptr i8))
+   (hint (ptr i8))
+   (target (ptr i8))
+   (buttons (array (ptr i8) 10))
+   (matches (array i64 15))
+   (scores (array i64 15))
+   (count i64)
+   (selected i64)
+   (offset i64)
+   (pending i64)])
+
+(defn state [] (-> (ptr Palette))
+  (p/alloc-static Palette))
+
+(defn open? [] (-> bool)
+  (and (!= (p/cast i64 (.overlay (state))) 0)
+       (= (msg i8 (.overlay (state)) (sel c"isHidden") []) (p/cast i8 0))))
+
+(defn focus! [] (-> void)
+  (do (msg i8 (.owner (state)) (sel c"makeFirstResponder:") [(ptr i8)] (.search (state))) (do)))
+
+(defn layout! [] (-> void)
+  (let [s (state)
+        content (msg (ptr i8) (.owner s) (sel c"contentView") [])
+        bounds (msg Rect content (sel c"bounds") [])
+        y (- (.h bounds) 556.0)]
+    (do
+      (frame! (.overlay s) (rect 0.0 0.0 (.w bounds) (.h bounds)))
+      (frame! (.card s) (rect (/ (- (.w bounds) 620.0) 2.0) (if (< y 16.0) 16.0 y) 620.0 460.0))
+      (do))))
+
+(defn dismiss! [] (-> void)
+  (let [s (state)]
+    (do
+      (msg i8 (.owner s) (sel c"makeFirstResponder:") [(ptr i8)] (.previous-responder s))
+      (msg i64 (.overlay s) (sel c"setHidden:") [i8] (p/cast i8 1))
+      (release (.previous-responder s))
+      (store! (field s previous-responder) (nil))
+      (do))))
+
+(defn take-action! [] (-> i64)
+  (let [s (state)
+        id (.pending s)]
+    (do (store! (field s pending) -1) id)))
+
+(defn choose! [] (-> void)
+  (let [s (state)]
+    (if (> (.count s) 0)
+        (do (store! (field s pending) (load (p/index (field s matches) (.selected s)))) (dismiss!))
+        (do))))
+
+(defn render! [] (-> void)
+  (let [s (state)]
+    (do
+      (for [i 0 10]
+        (let [b (load (p/index (field s buttons) i))
+              at (+ i (.offset s))]
+          (do
+            (msg i64 b (sel c"setHidden:") [i8] (p/cast i8 (if (< at (.count s)) 0 1)))
+            (if (< at (.count s))
+                (let [id (load (p/index (field s matches) at))
+                      text
+                        (msg (ptr i8) (ns (actions/title id)) (sel c"stringByAppendingString:") [(ptr i8)] (ns c"    "))]
+                  (do
+                    (msg i64
+                         b
+                         (sel c"setTitle:")
+                         [(ptr i8)]
+                         (msg (ptr i8) text (sel c"stringByAppendingString:") [(ptr i8)] (ns (actions/shortcut id))))
+                    (controls/select! b (= at (.selected s)))
+                    (do)))
+                (do)))))
+      (msg i64
+           (.hint s)
+           (sel c"setStringValue:")
+           [(ptr i8)]
+           (ns (if (= (.count s) 0) c"No matching actions" c"↑ ↓ select    Return run    Esc dismiss")))
+      (do))))
+
+(defn filter! [] (-> void)
+  (let [s (state)
+        query (msg (ptr i8) (.search s) (sel c"stringValue") [])]
+    (do
+      (store! (field s count) 0)
+      (store! (field s selected) 0)
+      (store! (field s offset) 0)
+      (for [id 0 (actions/count)]
+        (let [score (actions/match-score query id)]
+          (if (>= score 0)
+              (let [(mut at) (.count s)]
+                (do
+                  (while (and (> (load at) 0) (> score (load (p/index (field s scores) (- (load at) 1)))))
+                    (do
+                      (store! (p/index (field s matches) (load at)) (load (p/index (field s matches) (- (load at) 1))))
+                      (store! (p/index (field s scores) (load at)) (load (p/index (field s scores) (- (load at) 1))))
+                      (store! at (- (load at) 1))))
+                  (store! (p/index (field s matches) (load at)) id)
+                  (store! (p/index (field s scores) (load at)) score)
+                  (store! (field s count) (+ (.count s) 1))
+                  (do)))
+              (do))))
+      (render!))))
+
+(defn changed [(self (ptr i8)) (cmd (ptr i8)) (notification (ptr i8))] (-> void)
+  (filter!))
+
+(defn clicked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (do (store! (field (state) selected) (+ (.offset (state)) (msg i64 sender (sel c"tag") []))) (choose!)))
+
+(defn hovered [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (let [s (state)
+        at (+ (.offset s) (msg i64 sender (sel c"tag") []))]
+    (if (and (< at (.count s)) (!= at (.selected s)))
+        (do (store! (field s selected) at) (render!))
+        (do))))
+
+;;; Let native editing commands run; silently consume selectors the editor
+;;; cannot handle, rather than forwarding them to AppKit's error bell.
+(defn edit-command [(self (ptr i8)) (cmd (ptr i8)) (control (ptr i8)) (editor (ptr i8)) (selector (ptr i8))] (-> i8)
+  (let [selection (msg Range editor (sel c"selectedRange") [])
+        text (msg (ptr i8) editor (sel c"string") [])
+        length (msg u64 text (sel c"length") [])
+        backward
+          (or (= (p/cast i64 selector) (p/cast i64 (sel c"deleteBackward:")))
+              (or (= (p/cast i64 selector) (p/cast i64 (sel c"moveLeft:")))
+                  (= (p/cast i64 selector) (p/cast i64 (sel c"moveBackward:")))))
+        forward
+          (or (= (p/cast i64 selector) (p/cast i64 (sel c"deleteForward:")))
+              (or (= (p/cast i64 selector) (p/cast i64 (sel c"moveRight:")))
+                  (= (p/cast i64 selector) (p/cast i64 (sel c"moveForward:")))))
+        boundary
+          (and (= (.length selection) (p/cast u64 0))
+               (or (and backward (= (.location selection) (p/cast u64 0)))
+                   (and forward (>= (.location selection) length))))]
+    (p/cast i8
+            (if (or boundary (= (msg i8 editor (sel c"respondsToSelector:") [(ptr i8)] selector) (p/cast i8 0))) 1 0))))
+
+(defn move! [(delta i64)] (-> void)
+  (let [s (state)
+        next (+ (.selected s) delta)]
+    (do
+      (if (and (>= next 0) (< next (.count s))) (store! (field s selected) next) 0)
+      (if (< (.selected s) (.offset s)) (store! (field s offset) (.selected s)) 0)
+      (if (>= (.selected s) (+ (.offset s) 10)) (store! (field s offset) (- (.selected s) 9)) 0)
+      (render!))))
+
+(defn show! [] (-> void)
+  (let [s (state)
+        content (msg (ptr i8) (.owner s) (sel c"contentView") [])]
+    (do
+      (store! (field s previous-responder)
+              (msg (ptr i8) (msg (ptr i8) (.owner s) (sel c"firstResponder") []) (sel c"retain") []))
+      (store! (field s pending) -1)
+      (msg i64 (.search s) (sel c"setStringValue:") [(ptr i8)] (ns c""))
+      (filter!)
+      (layout!)
+      (msg i64 content (sel c"addSubview:positioned:relativeTo:") [(ptr i8) i64 (ptr i8)] (.overlay s) 1 (nil))
+      (msg i64 (.overlay s) (sel c"setHidden:") [i8] (p/cast i8 0))
+      (focus!))))
+
+;;; Native field editor owns text/IME; only navigation keys are intercepted.
+(defn handle! [(event (ptr i8))] (-> bool)
+  (let [kind (msg i64 event (sel c"type") [])
+        pointer
+          (msg Point
+               (.card (state))
+               (sel c"convertPoint:fromView:")
+               [Point (ptr i8)]
+               (msg Point event (sel c"locationInWindow") [])
+               (nil))
+        inside
+          (and (and (>= (.x pointer) 0.0) (< (.x pointer) 620.0))
+               (and (>= (.y pointer) 0.0) (< (.y pointer) 460.0)))
+        editor (msg (ptr i8) (.search (state)) (sel c"currentEditor") [])]
+    (cond (and (= kind 1) (not inside)) (do (dismiss!) true)
+          (and (not inside)
+               (or (and (>= kind 1) (<= kind 9))
+                   (or (= kind 22) (and (>= kind 25) (<= kind 30)))))
+            true
+          (!= (msg i8 editor (sel c"hasMarkedText") []) (p/cast i8 0)) false
+          (= kind 10)
+            (let [key (msg u16 event (sel c"keyCode") [])]
+              (cond (= key (p/cast u16 53)) (do (dismiss!) true)
+                    (= key (p/cast u16 125)) (do (move! 1) true)
+                    (= key (p/cast u16 126)) (do (move! -1) true)
+                    (= key (p/cast u16 36)) (do (choose!) true)
+                    (= key (p/cast u16 48))
+                      (do
+                        (move! (if (!= (& (msg u64 event (sel c"modifierFlags") []) 131072) (p/cast u64 0)) -1 1))
+                        true)
+                    :else
+                      (let [flags (msg u64 event (sel c"modifierFlags") [])]
+                        (and (!= (& flags 1048576) (p/cast u64 0))
+                             (not (or (= key (p/cast u16 0))
+                                      (or (= key (p/cast u16 8))
+                                          (or (= key (p/cast u16 9)) (or (= key (p/cast u16 7)) (= key (p/cast u16 6)))))))))))
+          :else false)))
+
+(defn setup! [(owner (ptr i8))] (-> void)
+  (let [s (state)
+        cls (objc_allocateClassPair (class c"NSObject") c"JimPaletteActions" 0)
+        content (msg (ptr i8) owner (sel c"contentView") [])
+        bounds (msg Rect content (sel c"bounds") [])
+        overlay (view content bounds)
+        root (view overlay (rect 0.0 0.0 620.0 460.0))]
+    (do
+      (store! (field s owner) owner)
+      (store! (field s overlay) overlay)
+      (store! (field s card) root)
+      (store! (field s pending) -1)
+      (msg i64 overlay (sel c"setHidden:") [i8] (p/cast i8 1))
+      (msg i64 overlay (sel c"setAutoresizingMask:") [u64] 18)
+      (msg i64
+           (layer overlay)
+           (sel c"setBackgroundColor:")
+           [(ptr i8)]
+           (msg (ptr i8) (color 0.0 0.0 0.0 0.35) (sel c"CGColor") []))
+      (msg i64 (layer root) (sel c"setCornerRadius:") [f64] 10.0)
+      (msg i64 (layer root) (sel c"setBorderWidth:") [f64] 1.0)
+      (msg i64
+           (layer root)
+           (sel c"setBorderColor:")
+           [(ptr i8)]
+           (msg (ptr i8) (color 0.25 0.33 0.42 1.0) (sel c"CGColor") []))
+      (msg i64 root (sel c"setAccessibilityLabel:") [(ptr i8)] (ns c"Actions"))
+      (background! root 0.075 0.09 0.12)
+      (method! cls c"controlTextDidChange:" (p/cast (ptr i8) (p/fnptr-of changed)) c"v@:@")
+      (method! cls c"hovered:" (p/cast (ptr i8) (p/fnptr-of hovered)) c"v@:@")
+      (method! cls c"control:textView:doCommandBySelector:" (p/cast (ptr i8) (p/fnptr-of edit-command)) c"c@:@@:")
+      (method! cls c"choose:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
+      (objc_registerClassPair cls)
+      (store! (field s target) (new c"JimPaletteActions"))
+      (store! (field s search)
+              (msg (ptr i8)
+                   (msg (ptr i8) (class c"NSSearchField") (sel c"alloc") [])
+                   (sel c"initWithFrame:")
+                   [Rect]
+                   (rect 18.0 408.0 584.0 32.0)))
+      (msg i64 (.search s) (sel c"setPlaceholderString:") [(ptr i8)] (ns c"Type an action…"))
+      (msg i64 (.search s) (sel c"setDelegate:") [(ptr i8)] (.target s))
+      (msg i64 root (sel c"addSubview:") [(ptr i8)] (.search s))
+      (for [i 0 10]
+        (let [b (controls/button c"" (.target s) (sel c"choose:"))]
+          (do
+            (store! (p/index (field s buttons) i) b)
+            (frame! b (rect 18.0 (- 365.0 (* (p/cast f64 i) 34.0)) 584.0 32.0))
+            (msg i64 b (sel c"setTag:") [i64] i)
+            (msg i64 b (sel c"setBordered:") [i8] (p/cast i8 0))
+            (msg i64 b (sel c"setAlignment:") [i64] 0)
+            (msg i64 b (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+            (msg i64 root (sel c"addSubview:") [(ptr i8)] b))))
+      (store! (field s hint) (label root c"" (rect 18.0 12.0 584.0 24.0) 12.0 true))
+      (do))))
+
+(defn free! [] (-> void)
+  (do
+    (if (open?) (dismiss!) (do))
+    (release (.search (state)))
+    (msg i64 (.overlay (state)) (sel c"removeFromSuperview") [])
+    (release (.target (state)))
+    (do)))

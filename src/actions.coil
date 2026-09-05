@@ -1,0 +1,114 @@
+(module jim.actions)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+;;; Stable action IDs are shared by shortcuts and the searchable registry.
+(defn count [] (-> i64)
+  15)
+
+(defn title [(id i64)] (-> (ptr i8))
+  (cond (= id 0) c"Terminal: New terminal"
+        (= id 1) c"Terminal: Close focused terminal"
+        (= id 2) c"Canvas: Reset pan and zoom"
+        (= id 3) c"Canvas: Reset zoom"
+        (= id 4) c"Canvas: Fit all panes"
+        (= id 5) c"Canvas: Zoom in"
+        (= id 6) c"Canvas: Zoom out"
+        (= id 7) c"Canvas: Toggle zoom"
+        (= id 8) c"Workspace: Show or hide cube"
+        (= id 9) c"Theme: Reload Coil configuration"
+        (= id 10) c"Developer: Toggle frame timings"
+        (= id 11) c"Project: Workspace"
+        (= id 12) c"Project: Development"
+        (= id 13) c"Project: Build & run"
+        :else c"Project: Scratch"))
+
+(defn shortcut [(id i64)] (-> (ptr i8))
+  (cond (= id 0) c"⌘T"
+        (= id 1) c"⌘W"
+        (= id 2) c"⌘⇧0"
+        (= id 3) c"⌘0"
+        (= id 5) c"⌘="
+        (= id 6) c"⌘−"
+        (= id 7) c"⌘⇧Z"
+        (= id 8) c"⌘⇧\\"
+        (= id 9) c"⌘R"
+        (= id 11) c"⌘1"
+        (= id 12) c"⌘2"
+        (= id 13) c"⌘3"
+        (= id 14) c"⌘4"
+        :else c""))
+
+(defn keywords [(id i64)] (-> (ptr i8))
+  (cond (= id 0) c" shell ghostty pane"
+        (= id 2) c" home origin"
+        (= id 8) c" compiz overview workspaces"
+        (= id 10) c" fps performance profiler latency frame time"
+        :else c""))
+
+;;; Original Jim's subsequence score: consecutive and word-start bonuses.
+;;; NSString lowercasing keeps native search input, including Unicode, intact.
+(defn score [(query (ptr i8)) (text (ptr i8))] (-> i64)
+  (let [q (msg (ptr i8) query (sel c"lowercaseString") [])
+        h (msg (ptr i8) text (sel c"lowercaseString") [])
+        qn (msg u64 q (sel c"length") [])
+        hn (msg u64 h (sel c"length") [])
+        (mut hi) (p/cast u64 0)
+        (mut result) 0
+        (mut consecutive) 0
+        (mut valid) true]
+    (do
+      (for [qi 0 (p/cast i64 qn)]
+        (let [ch (msg u16 q (sel c"characterAtIndex:") [u64] (p/cast u64 qi))
+              (mut found) false]
+          (do
+            (while (and (< (load hi) hn) (not (load found)))
+              (let [at (load hi)
+                    hc (msg u16 h (sel c"characterAtIndex:") [u64] at)
+                    prev
+                      (if (> at (p/cast u64 0))
+                          (msg u16 h (sel c"characterAtIndex:") [u64] (- at (p/cast u64 1)))
+                          (p/cast u16 32))]
+                (do
+                  (store! hi (+ at (p/cast u64 1)))
+                  (if (= ch hc)
+                      (do
+                        (store! result (+ (load result) (+ 1 (load consecutive))))
+                        (if (or (= at (p/cast u64 0))
+                                (or (= prev (p/cast u16 32))
+                                    (or (= prev (p/cast u16 95))
+                                        (or (= prev (p/cast u16 46))
+                                            (or (= prev (p/cast u16 47)) (= prev (p/cast u16 45)))))))
+                            (store! result (+ (load result) 4))
+                            0)
+                        (store! consecutive (+ (load consecutive) 1))
+                        (store! found true))
+                      (store! consecutive 0)))))
+            (if (not (load found)) (store! valid false) 0))))
+      (if (load valid) (load result) -1))))
+
+(defn match-score [(query (ptr i8)) (id i64)] (-> i64)
+  (let [hay (msg (ptr i8) (ns (title id)) (sel c"stringByAppendingString:") [(ptr i8)] (ns (keywords id)))
+        base (score query hay)
+        exact (msg Range hay (sel c"rangeOfString:options:") [(ptr i8) u64] query 1)]
+    (if (and (>= base 0)
+             (and (> (msg u64 query (sel c"length") []) (p/cast u64 0))
+                  (> (.length exact) (p/cast u64 0))))
+        (+ base 32)
+        base)))
+
+(defn key-action [(key u16) (flags u64)] (-> i64)
+  (let [command (!= (& flags 1048576) (p/cast u64 0))
+        shift (!= (& flags 131072) (p/cast u64 0))]
+    (if command
+        (cond (or (= key (p/cast u16 17)) (= key (p/cast u16 45))) 0
+              (= key (p/cast u16 13)) 1
+              (= key (p/cast u16 29)) (if shift 2 3)
+              (= key (p/cast u16 24)) 5
+              (= key (p/cast u16 27)) 6
+              (and shift (= key (p/cast u16 6))) 7
+              (and shift (= key (p/cast u16 42))) 8
+              (= key (p/cast u16 15)) 9
+              (and (>= key (p/cast u16 18)) (<= key (p/cast u16 21))) (+ 11 (- (p/cast i64 key) 18))
+              :else -1)
+        -1)))

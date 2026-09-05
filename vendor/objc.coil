@@ -1,0 +1,26 @@
+(module experiments.coil_gpui.objc)
+(import "coil.primitive" :as primitive)
+
+(export class sel msg objc_getClass sel_registerName objc_msgSend)
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(defn class [(name (ptr i8))] (-> (ptr i8))
+  (objc_getClass name))
+
+(defn sel [(name (ptr i8))] (-> (ptr i8))
+  (sel_registerName name))
+
+;;; Send an Objective-C message with an exact C ABI signature. This is the only
+;;; bridge used by the framework: AppKit, QuartzCore, and Metal are called
+;;; directly from Coil, with no wrapper C or Objective-C source.
+(defn msg [(ret Code) (recv Code) (selector Code) (argtypes Code) & (args Code)] (-> Code)
+  `(primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) ~@argtypes] ~ret)
+                                       (primitive/fnptr-of objc_msgSend))
+                       ~recv
+                       ~selector
+                       ~@args))

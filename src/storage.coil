@@ -1,0 +1,73 @@
+(module jim.storage)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+(defn dictionary [] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSMutableDictionary") (sel c"dictionary") []))
+
+(defn array [] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSMutableArray") (sel c"array") []))
+
+(defn put! [(dict (ptr i8)) (key (ptr i8)) (value (ptr i8))] (-> i64)
+  (msg i64 dict (sel c"setObject:forKey:") [(ptr i8) (ptr i8)] value (ns key)))
+
+(defn add! [(arr (ptr i8)) (value (ptr i8))] (-> i64)
+  (msg i64 arr (sel c"addObject:") [(ptr i8)] value))
+
+(defn number [(value f64)] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSNumber") (sel c"numberWithDouble:") [f64] value))
+
+(defn kind? [(value (ptr i8)) (name (ptr i8))] (-> bool)
+  (!= (msg i8 value (sel c"isKindOfClass:") [(ptr i8)] (class name)) (p/cast i8 0)))
+
+(defn get [(dict (ptr i8)) (key (ptr i8))] (-> (ptr i8))
+  (if (kind? dict c"NSDictionary") (msg (ptr i8) dict (sel c"objectForKey:") [(ptr i8)] (ns key)) (nil)))
+
+(defn numeric? [(dict (ptr i8)) (key (ptr i8))] (-> bool)
+  (kind? (get dict key) c"NSNumber"))
+
+(defn value [(dict (ptr i8)) (key (ptr i8))] (-> f64)
+  (let [v (get dict key)] (if (kind? v c"NSNumber") (msg f64 v (sel c"doubleValue") []) 0.0)))
+
+(defn count [(arr (ptr i8))] (-> i64)
+  (if (kind? arr c"NSArray") (msg i64 arr (sel c"count") []) 0))
+
+(defn at [(arr (ptr i8)) (index i64)] (-> (ptr i8))
+  (if (and (>= index 0) (< index (count arr))) (msg (ptr i8) arr (sel c"objectAtIndex:") [i64] index) (nil)))
+
+(defn path [] (-> (ptr i8))
+  (msg (ptr i8) (ns c"~/Library/Application Support/JimCoil/layout.json") (sel c"stringByExpandingTildeInPath") []))
+
+(defn read [] (-> (ptr i8))
+  (let [data (msg (ptr i8) (class c"NSData") (sel c"dataWithContentsOfFile:") [(ptr i8)] (path))]
+    (if (= (p/cast i64 data) 0)
+        (nil)
+        (msg (ptr i8)
+             (class c"NSJSONSerialization")
+             (sel c"JSONObjectWithData:options:error:")
+             [(ptr i8) u64 (ptr i8)]
+             data
+             0
+             (nil)))))
+
+(defn write! [(snapshot (ptr i8))] (-> bool)
+  (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+        file (path)
+        data
+          (msg (ptr i8)
+               (class c"NSJSONSerialization")
+               (sel c"dataWithJSONObject:options:error:")
+               [(ptr i8) u64 (ptr i8)]
+               snapshot
+               1
+               (nil))]
+    (do
+      (msg i8
+           manager
+           (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+           [(ptr i8) i8 (ptr i8) (ptr i8)]
+           (msg (ptr i8) file (sel c"stringByDeletingLastPathComponent") [])
+           (p/cast i8 1)
+           (nil)
+           (nil))
+      (!= (msg i8 data (sel c"writeToFile:atomically:") [(ptr i8) i8] file (p/cast i8 1)) (p/cast i8 0)))))

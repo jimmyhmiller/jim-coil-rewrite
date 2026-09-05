@@ -1,0 +1,15 @@
+font-family = JetBrains Mono
+font-size = 13
+background = 11151c
+foreground = d9e2ef
+cursor-color = 72c7ec
+selection-background = 30475f
+window-padding-x = 16
+window-padding-y = 12
+shell-integration = detect
+confirm-close-surface = false
+clipboard-read = deny
+clipboard-write = allow
+
+# Invalid input should never produce an audible bell.
+bell-features = no-system,no-audio

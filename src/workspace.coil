@@ -1,0 +1,27 @@
+(module jim.workspace)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+;;; Geometry is shared by flat and overview layouts. Workspaces retain their
+;;; native views and GPU surfaces; only their layer transforms change.
+(defn wrap [(index i64) (count i64)] (-> i64)
+  (if (<= count 0) 0 (% (+ (% index count) count) count)))
+
+(defn face-angle [(index i64) (count i64)] (-> f64)
+  (/ (* (p/cast f64 index) 6.283185307179586) (p/cast f64 count)))
+
+(defn face-transform [(index i64) (count i64) (width f64)] (-> Transform)
+  (CATransform3DRotate (CATransform3DMakeTranslation 0.0 0.0 0.0)
+                       (face-angle index count)
+                       0.0
+                       1.0
+                       0.0))
+
+(defn perspective [(distance f64)] (-> Transform)
+  (let [(mut t) (CATransform3DMakeTranslation 0.0 0.0 0.0)]
+    (do (set! (.m34 t) (/ -1.0 distance)) (load t))))
+
+(defn root-transform [(angle f64) (overview bool) (width f64)] (-> Transform)
+  (let [base (CATransform3DMakeTranslation 0.0 0.0 (if overview (* width -1.25) (* width -0.5)))
+        turned (CATransform3DRotate base angle 0.0 1.0 0.0)]
+    (if overview (CATransform3DRotate turned -0.13 1.0 0.0 0.0) turned)))

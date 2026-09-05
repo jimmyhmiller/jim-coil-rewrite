@@ -1,0 +1,13 @@
+[package]
+name = "jim"
+entry = "src/main.coil"
+source-roots = ["src", "vendor", "tests"]
+
+[link]
+frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers"]
+libs = ["objc", "c++"]
+flags = ["build/ghostty/lib/libghostty-internal.a"]
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

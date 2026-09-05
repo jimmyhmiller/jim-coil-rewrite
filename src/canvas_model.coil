@@ -1,0 +1,103 @@
+(module jim.canvas-model)
+(import "jim.native" :use [Point Rect rect])
+(import "coil.primitive" :as p)
+
+(extern exp :cc c [f64] (-> f64))
+
+;;; Canvas coordinates use top-left origin and positive-down y, independently
+;;; of AppKit's bottom-left coordinates. Jim clamps the camera at the top-left
+;;; origin; the canvas extends without a right or bottom boundary.
+(defstruct Camera [(x f64) (y f64) (zoom f64)])
+
+(defstruct Edges [(left f64) (right f64) (top f64) (bottom f64)])
+
+(defn camera [] (-> Camera)
+  (Camera
+    :x 0.0
+    :y 0.0
+    :zoom 1.0))
+
+(defn clamp [(x f64) (low f64) (high f64)] (-> f64)
+  (cond (< x low) low (> x high) high :else x))
+
+(defn screen-to-world [(c Camera) (point Point)] (-> Point)
+  (Point :x (+ (.x c) (/ (.x point) (.zoom c))) :y (+ (.y c) (/ (.y point) (.zoom c)))))
+
+(defn project [(c Camera) (bounds Rect)] (-> Rect)
+  (rect (* (- (.x bounds) (.x c)) (.zoom c))
+        (* (- (.y bounds) (.y c)) (.zoom c))
+        (* (.w bounds) (.zoom c))
+        (* (.h bounds) (.zoom c))))
+
+(defn contains? [(r Rect) (pt Point)] (-> bool)
+  (and (and (>= (.x pt) (.x r)) (< (.x pt) (+ (.x r) (.w r))))
+       (and (>= (.y pt) (.y r)) (< (.y pt) (+ (.y r) (.h r))))))
+
+(defn visible? [(r Rect) (width f64) (height f64)] (-> bool)
+  (and (and (> (+ (.x r) (.w r)) 0.0) (< (.x r) width))
+       (and (> (+ (.y r) (.h r)) 0.0) (< (.y r) height))))
+
+(defn zoom-at [(c Camera) (anchor Point) (factor f64)] (-> Camera)
+  (let [world (screen-to-world c anchor)
+        zoom (clamp (* (.zoom c) factor) 0.2 4.0)]
+    (clamp-camera (Camera
+                    :x (- (.x world) (/ (.x anchor) zoom))
+                    :y (- (.y world) (/ (.y anchor) zoom))
+                    :zoom zoom))))
+
+(defn edges [(c Camera) (width f64) (height f64) (distance f64)] (-> Edges)
+  (Edges
+    :left (clamp (/ (.x c) distance) 0.0 1.0)
+    :right (clamp (/ (- 0.0 (+ (.x c) (/ width (.zoom c)))) distance) 0.0 1.0)
+    :top (clamp (/ (.y c) distance) 0.0 1.0)
+    :bottom (clamp (/ (- 0.0 (+ (.y c) (/ height (.zoom c)))) distance) 0.0 1.0)))
+
+(extern pow :cc c [f64 f64] (-> f64))
+
+(defn clamp-camera [(c Camera)] (-> Camera)
+  (Camera
+    :x (if (< (.x c) 0.0) 0.0 (.x c))
+    :y (if (< (.y c) 0.0) 0.0 (.y c))
+    :zoom (.zoom c)))
+
+(defn pan-by [(c Camera) (dx f64) (dy f64)] (-> Camera)
+  (clamp-camera (Camera
+                  :x (- (.x c) (/ dx (.zoom c)))
+                  :y (- (.y c) (/ dy (.zoom c)))
+                  :zoom (.zoom c))))
+
+;;; Winit converts precise AppKit deltas to physical pixels; Jim consumes those
+;;; directly. Discrete wheel ticks become 16 pixels. Preserve that sensitivity.
+(defn wheel-scale [(precise bool) (backing-scale f64)] (-> f64)
+  (if precise backing-scale 16.0))
+
+(defn wheel-route [(command bool) (option bool) (zoom-enabled bool)] (-> i64)
+  (if command (if (and option zoom-enabled) 2 1) 0))
+
+(defn wheel-factor [(pixels f64)] (-> f64)
+  (pow 1.08 (/ pixels 16.0)))
+
+(defn pinch-factor [(delta f64)] (-> f64)
+  (let [factor (+ 1.0 (* delta 3.5))] (if (< factor 0.01) 0.01 factor)))
+
+(defn reset-zoom [(c Camera)] (-> Camera)
+  (clamp-camera (Camera
+                  :x (.x c)
+                  :y (.y c)
+                  :zoom 1.0)))
+
+(defn jump-to-pane [(bounds Rect)] (-> Camera)
+  (clamp-camera (Camera
+                  :x (- (.x bounds) 24.0)
+                  :y (- (.y bounds) 24.0)
+                  :zoom 1.0)))
+
+;;; Keep the originally grabbed world-space point attached to the cursor,
+;;; even when the camera moves or zooms without a mouse-motion event.
+(defn dragged-bounds [(camera Camera) (start-world Point) (pointer Point) (bounds Rect) (resize bool)] (-> Rect)
+  (let [world (screen-to-world camera pointer)
+        dx (- (.x world) (.x start-world))
+        dy (- (.y world) (.y start-world))]
+    (if resize
+        (rect (.x bounds) (.y bounds) (clamp (+ (.w bounds) dx) 320.0 4096.0) (clamp (+ (.h bounds) dy) 180.0 4096.0))
+        (rect (+ (.x bounds) dx) (+ (.y bounds) dy) (.w bounds) (.h bounds)))))
