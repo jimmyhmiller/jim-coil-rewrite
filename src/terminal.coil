@@ -253,29 +253,29 @@
             (method! cls c"becomeFirstResponder" (p/cast (ptr i8) (p/fnptr-of focus-in)) c"c@:")
             (method! cls c"resignFirstResponder" (p/cast (ptr i8) (p/fnptr-of focus-out)) c"c@:")
             (method! cls c"hasMarkedText" (p/cast (ptr i8) (p/fnptr-of has-marked)) c"c@:")
-            (method! cls c"markedRange" (p/cast (ptr i8) (p/fnptr-of jim_terminal_marked_range)) c"{_NSRange=QQ}@:")
-            (method! cls c"selectedRange" (p/cast (ptr i8) (p/fnptr-of jim_terminal_selected_range)) c"{_NSRange=QQ}@:")
+            (method! cls c"markedRange" (p/cast (ptr i8) (p/fnptr-of marked-range)) c"{_NSRange=QQ}@:")
+            (method! cls c"selectedRange" (p/cast (ptr i8) (p/fnptr-of selected-range)) c"{_NSRange=QQ}@:")
             (method! cls c"unmarkText" (p/cast (ptr i8) (p/fnptr-of unmark)) c"v@:")
             (method! cls
                      c"insertText:replacementRange:"
-                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_insert))
+                     (p/cast (ptr i8) (p/fnptr-of insert))
                      c"v@:@{_NSRange=QQ}")
             (method! cls
                      c"setMarkedText:selectedRange:replacementRange:"
-                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_set_marked))
+                     (p/cast (ptr i8) (p/fnptr-of set-marked))
                      c"v@:@{_NSRange=QQ}{_NSRange=QQ}")
             (method! cls c"validAttributesForMarkedText" (p/cast (ptr i8) (p/fnptr-of attributes)) c"@@:")
             (method! cls
                      c"attributedSubstringForProposedRange:actualRange:"
-                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_substring))
+                     (p/cast (ptr i8) (p/fnptr-of substring))
                      c"@@:{_NSRange=QQ}^{_NSRange=QQ}")
             (method! cls
                      c"characterIndexForPoint:"
-                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_character_index))
+                     (p/cast (ptr i8) (p/fnptr-of character-index))
                      c"Q@:{CGPoint=dd}")
             (method! cls
                      c"firstRectForCharacterRange:actualRange:"
-                     (p/cast (ptr i8) (p/fnptr-of jim_terminal_first_rect))
+                     (p/cast (ptr i8) (p/fnptr-of first-rect))
                      c"{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}")
             (method! cls c"doCommandBySelector:" (p/cast (ptr i8) (p/fnptr-of command)) c"v@::")
             (method! cls c"keyDown:" (p/cast (ptr i8) (p/fnptr-of key-down)) c"v@:@")
@@ -369,21 +369,13 @@
             config (g/ghostty_config_new)
             (mut runtime) (p/zeroed g/Runtime)]
         (do
-          (jim_callbacks_init (p/cast (ptr i8) (p/fnptr-of action))
-                              (p/cast (ptr i8) (p/fnptr-of insert))
-                              (p/cast (ptr i8) (p/fnptr-of set-marked))
-                              (p/cast (ptr i8) (p/fnptr-of substring))
-                              (p/cast (ptr i8) (p/fnptr-of character-index))
-                              (p/cast (ptr i8) (p/fnptr-of first-rect-into))
-                              (p/cast (ptr i8) (p/fnptr-of marked-range-into))
-                              (p/cast (ptr i8) (p/fnptr-of selected-range-into)))
           (method! cls c"tick:" (p/cast (ptr i8) (p/fnptr-of tick)) c"v@:@")
           (objc_registerClassPair cls)
           (set! (dispatcher-cell) (new c"JimGhosttyDispatcher"))
           (g/ghostty_config_load_file config c"config/ghostty")
           (g/ghostty_config_finalize config)
           (set! (.wakeup runtime) (p/cast (ptr i8) (p/fnptr-of wakeup)))
-          (set! (.action runtime) (p/cast (ptr i8) (p/fnptr-of jim_terminal_action)))
+          (set! (.action runtime) (p/cast (ptr i8) (p/fnptr-of action)))
           (set! (.read runtime) (p/cast (ptr i8) (p/fnptr-of read-clipboard)))
           (set! (.confirm runtime) (p/cast (ptr i8) (p/fnptr-of confirm-clipboard)))
           (set! (.write runtime) (p/cast (ptr i8) (p/fnptr-of write-clipboard)))
@@ -450,29 +442,11 @@
     (set! (app-cell) (nil))
     (release (load (dispatcher-cell)))))
 
-(extern jim_terminal_action :cc c [(ptr i8) g/Target g/Action] (-> bool))
-
-(extern jim_terminal_insert :cc c [(ptr i8) (ptr i8) (ptr i8) Range] (-> void))
-
-(extern jim_terminal_set_marked :cc c [(ptr i8) (ptr i8) (ptr i8) Range Range] (-> void))
-
-(extern jim_terminal_substring :cc c [(ptr i8) (ptr i8) Range (ptr Range)] (-> (ptr i8)))
-
-(extern jim_terminal_character_index :cc c [(ptr i8) (ptr i8) Point] (-> u64))
-
-(extern jim_terminal_first_rect :cc c [(ptr i8) (ptr i8) Range (ptr Range)] (-> Rect))
-
-(extern jim_callbacks_init :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> void))
-
-(extern jim_terminal_marked_range :cc c [(ptr i8) (ptr i8)] (-> Range))
-
-(extern jim_terminal_selected_range :cc c [(ptr i8) (ptr i8)] (-> Range))
-
-(defn first-rect-into [(self (ptr i8)) (cmd (ptr i8)) (range Range) (actual (ptr Range)) (result (ptr Rect))] (-> void)
-  (do (set! result (first-rect self cmd range actual)) (do)))
-
-(defn marked-range-into [(self (ptr i8)) (cmd (ptr i8)) (result (ptr Range))] (-> void)
-  (do (set! result (marked-range self cmd)) (do)))
-
-(defn selected-range-into [(self (ptr i8)) (cmd (ptr i8)) (result (ptr Range))] (-> void)
-  (do (set! result (selected-range self cmd)) (do)))
+(export-c [action :as "jim_terminal_action"]
+          [insert :as "jim_terminal_insert"]
+          [set-marked :as "jim_terminal_set_marked"]
+          [substring :as "jim_terminal_substring"]
+          [character-index :as "jim_terminal_character_index"]
+          [first-rect :as "jim_terminal_first_rect"]
+          [marked-range :as "jim_terminal_marked_range"]
+          [selected-range :as "jim_terminal_selected_range"])

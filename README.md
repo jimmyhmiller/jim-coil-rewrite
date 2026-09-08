@@ -5,7 +5,10 @@ project canvases, live Coil theme settings, and a composited workspace cube.
 
 ## Run
 
-Requires Coil, Zig 0.16.0, Xcode's Metal toolchain, and a local signing identity. On a fresh checkout:
+Requires Coil, Zig 0.16.0 for pinned Ghostty, Xcode's Metal toolchain, and a
+local signing identity. Jim's session service and transport are Coil; Zig is
+used only to build the pinned Ghostty dependency and its project-local backend
+extension. On a fresh checkout:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain

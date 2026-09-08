@@ -10,15 +10,26 @@
    (scroll (ptr i8))
    (document (ptr i8))
    (header (ptr i8))
+   (indicators (ptr i8))
    (footer (ptr i8))
+   (footer-icon (ptr i8))
+   (footer-pupil (ptr i8))
    (add-project (ptr i8))
    (add-profile (ptr i8))
    (target (ptr i8))
    (swipe f64)
+   (swipe-y f64)
+   (swipe-axis i64)
+   (swipe-time f64)
+   (transition f64)
    (switched bool)
    (model (ptr i8))
    (rows (ptr i8))
    (show-hidden bool)
+   (hovered i64)
+   (renaming i64)
+   (rename-field (ptr i8))
+   (delete-project i64)
    (pending i64)
    (pressed i64)
    (start Point)
@@ -33,8 +44,91 @@
 (defn width [] (-> f64)
   (.width (state)))
 
+(defn transition! [(offset f64)] (-> void)
+  (set! (.transition (state)) offset))
+
+(defn finish-rename! [] (-> void)
+  (let [st (state)]
+    (if (and (> (.renaming st) 0) (!= (.rename-field st) (nil)))
+        (let [text
+                (msg (ptr i8)
+                     (msg (ptr i8) (.rename-field st) (sel c"stringValue") [])
+                     (sel c"stringByTrimmingCharactersInSet:")
+                     [(ptr i8)]
+                     (msg (ptr i8) (class c"NSCharacterSet") (sel c"whitespaceAndNewlineCharacterSet") []))]
+          (do
+            (if (> (msg u64 text (sel c"length") []) 0)
+                (s/put! (projects/find (projects/list (.model st)) (.renaming st)) c"name" text)
+                0)
+            (set! (.renaming st) 0)
+            (set! (.rename-field st) (nil))
+            (set! (.pending st) -2)))
+        (do))))
+
+(defn rename! [(id i64)] (-> void)
+  (if (> id 0) (do (set! (.renaming (state)) id) (refresh!)) (do)))
+
 (defn row-id [(index i64)] (-> i64)
   (projects/id (s/at (.rows (state)) index)))
+
+(defn row-tag [(id i64) (part i64)] (-> i64)
+  (+ 100 (+ (* id 3) part)))
+
+(defn tag-id [(tag i64)] (-> i64)
+  (/ (- tag 100) 3))
+
+(defn tag-part [(tag i64)] (-> i64)
+  (% (- tag 100) 3))
+
+(defn request-delete! [(id i64)] (-> void)
+  (do (set! (.delete-project (state)) id) (set! (.pending (state)) 26) (do)))
+
+(defn take-delete-project! [] (-> i64)
+  (let [id (.delete-project (state))] (do (set! (.delete-project (state)) 0) id)))
+
+(defn eye-title [(id i64) (revealed bool)] (-> (ptr i8))
+  (let [hidden (projects/hidden? (projects/profile (.model (state))) id)]
+    (if (or hidden revealed) (if hidden c"○" c"⊙") c"")))
+
+(defn reveal-eye! [(id i64) (revealed bool)] (-> void)
+  (let [children (msg (ptr i8) (.document (state)) (sel c"subviews") [])
+        wanted (row-tag id 1)]
+    (do
+      (for [i 0 (s/count children)]
+        (let [child (s/at children i)]
+          (if (= (msg i64 child (sel c"tag") []) wanted)
+              (do (msg i64 child (sel c"setTitle:") [(ptr i8)] (ns (eye-title id revealed))) (do))
+              (do))))
+      (do))))
+
+(defn begin-transition! [] (-> void)
+  (let [st (state)]
+    (if (p/fcmp-eq (.transition st) 0.0)
+        (do)
+        (let [animation (msg (ptr i8) (class c"CATransition") (sel c"animation") [])]
+          (do
+            (msg i64 animation (sel c"setType:") [(ptr i8)] (ns c"push"))
+            (msg i64
+                 animation
+                 (sel c"setSubtype:")
+                 [(ptr i8)]
+                 (ns (if (> (.transition st) 0.0) c"fromRight" c"fromLeft")))
+            (msg i64 animation (sel c"setDuration:") [f64] 0.22)
+            (msg i64
+                 animation
+                 (sel c"setTimingFunction:")
+                 [(ptr i8)]
+                 (msg (ptr i8)
+                      (class c"CAMediaTimingFunction")
+                      (sel c"functionWithName:")
+                      [(ptr i8)]
+                      (ns c"easeInEaseOut")))
+            (msg i64
+                 (layer (.document st))
+                 (sel c"addAnimation:forKey:")
+                 [(ptr i8) (ptr i8)]
+                 animation
+                 (ns c"profile-transition")))))))
 
 (defn control [(parent (ptr i8)) (title (ptr i8)) (bounds Rect)] (-> (ptr i8))
   (let [b (controls/button title (.target (state)) (sel c"clicked:"))]
@@ -57,6 +151,7 @@
         old-bounds (msg Rect (.document st) (sel c"bounds") [])
         from-top (- (.h old-bounds) (+ (.y clip-bounds) (.h clip-bounds)))]
     (do
+      (begin-transition!)
       (for [i 0 (s/count copy)] (msg i64 (s/at copy i) (sel c"removeFromSuperview") []))
       (release copy)
       (for [i 0 (s/count (projects/list root))]
@@ -67,61 +162,119 @@
       (release (.rows st))
       (set! (.rows st) (msg (ptr i8) rows (sel c"retain") []))
       (let [height
-              (if (> (* (p/cast f64 (s/count rows)) 40.0) (- (.height st) 94.0))
-                  (* (p/cast f64 (s/count rows)) 40.0)
-                  (- (.height st) 94.0))]
+              (if (> (+ (* (p/cast f64 (s/count rows)) 28.0) 29.0) (- (.height st) 76.0))
+                  (+ (* (p/cast f64 (s/count rows)) 28.0) 29.0)
+                  (- (.height st) 76.0))]
         (do
-          (frame! (.document st) (rect 0.0 0.0 (- (.width st) 16.0) height))
+          (frame! (.document st) (rect 0.0 0.0 (- (.width st) 1.0) height))
           (let [y (- height (+ (.h clip-bounds) (if (> from-top 0.0) from-top 0.0)))]
             (msg i64 clip (sel c"scrollToPoint:") [Point] (Point :x 0.0 :y (if (> y 0.0) y 0.0))))
           (msg i64 (.scroll st) (sel c"reflectScrolledClipView:") [(ptr i8)] clip)
           (for [i 0 (s/count rows)]
             (let [record (s/at rows i)
                   hidden (projects/hidden? (projects/profile root) (projects/id record))
+                  active (= (projects/id record) (projects/active root))
+                  bottom (- height (* (p/cast f64 (+ i 1)) 28.0))
                   b
                     (control (.document st)
-                             (utf8 (s/get record c"name"))
-                             (rect 0.0 (- height (* (p/cast f64 (+ i 1)) 40.0)) (- (.width st) 44.0) 38.0))]
+                             c""
+                             (rect 0.0 bottom (- (.width st) 1.0) 28.0))
+                  title
+                    (if (= (.renaming st) (projects/id record))
+                        (nil)
+                        (label (.document st)
+                               (utf8 (s/get record c"name"))
+                               (rect 14.0 (+ bottom 4.0) (- (.width st) 74.0) 20.0)
+                               13.0
+                               (not active)))]
               (do
-                (msg i64
-                     b
-                     (sel c"setTitle:")
-                     [(ptr i8)]
-                     (msg (ptr i8)
-                          (s/get record c"name")
-                          (sel c"stringByAppendingString:")
-                          [(ptr i8)]
-                          (ns (if hidden c"  ◌" c""))))
-                (msg i64 b (sel c"setTag:") [i64] (+ 100 (* (projects/id record) 2)))
+                (msg i64 b (sel c"setTag:") [i64] (row-tag (projects/id record) 0))
                 (msg i64 b (sel c"setToolTip:") [(ptr i8)] (s/get record c"directory"))
-                (msg i64 b (sel c"setAlphaValue:") [f64] (if hidden 0.5 1.0))
-                (controls/select! b (= (projects/id record) (projects/active root)))
+                (if (!= title (nil)) (msg i64 title (sel c"setAlphaValue:") [f64] (if hidden 0.5 1.0)) 0)
+                (controls/select! b active)
+                (if (= (.renaming st) (projects/id record))
+                    (let [field
+                            (msg (ptr i8)
+                                 (msg (ptr i8) (class c"NSTextField") (sel c"alloc") [])
+                                 (sel c"initWithFrame:")
+                                 [Rect]
+                                 (rect 14.0 (+ bottom 3.0) (- (.width st) 74.0) 22.0))]
+                      (do
+                        (msg i64 field (sel c"setStringValue:") [(ptr i8)] (s/get record c"name"))
+                        (msg i64 field (sel c"setBordered:") [i8] (p/cast i8 0))
+                        (msg i64 field (sel c"setDrawsBackground:") [i8] (p/cast i8 0))
+                        (msg i64 field (sel c"setFocusRingType:") [u64] (p/cast u64 1))
+                        (msg i64
+                             field
+                             (sel c"setFont:")
+                             [(ptr i8)]
+                             (msg (ptr i8) (class c"NSFont") (sel c"systemFontOfSize:") [f64] 13.0))
+                        (msg i64 field (sel c"setTextColor:") [(ptr i8)] (color 0.88 0.91 0.96 1.0))
+                        (msg i64 field (sel c"setTarget:") [(ptr i8)] (.target st))
+                        (msg i64 field (sel c"setAction:") [(ptr i8)] (sel c"renameCommitted:"))
+                        (msg i64 field (sel c"setDelegate:") [(ptr i8)] (.target st))
+                        (msg i64 (.document st) (sel c"addSubview:") [(ptr i8)] field)
+                        (set! (.rename-field st) field)
+                        (release field)
+                        (msg i8
+                             (msg (ptr i8) (.view st) (sel c"window") [])
+                             (sel c"makeFirstResponder:")
+                             [(ptr i8)]
+                             field)))
+                    0)
                 (let [eye
                         (control (.document st)
-                                 (if hidden c"+" c"−")
-                                 (rect (- (.width st) 44.0) (+ (- height (* (p/cast f64 (+ i 1)) 40.0)) 3.0) 26.0 30.0))]
-                  (msg i64 eye (sel c"setTag:") [i64] (+ 101 (* (projects/id record) 2)))))))))
-      (msg i64 (.header st) (sel c"removeAllItems") [])
-      (for [i 0 (s/count (projects/profiles root))]
-        (let [profile (s/at (projects/profiles root) i)
-              item
-                (msg (ptr i8)
-                     (msg (ptr i8) (class c"NSMenuItem") (sel c"alloc") [])
-                     (sel c"initWithTitle:action:keyEquivalent:")
-                     [(ptr i8) (ptr i8) (ptr i8)]
-                     (s/get profile c"name")
-                     (nil)
-                     (ns c""))]
-          (do
-            (msg i64 item (sel c"setTag:") [i64] (projects/id profile))
-            (msg i64 (msg (ptr i8) (.header st) (sel c"menu") []) (sel c"addItem:") [(ptr i8)] item)
-            (release item))))
-      (msg i8 (.header st) (sel c"selectItemWithTag:") [i64] (projects/id (projects/profile root)))
+                                 (eye-title (projects/id record) false)
+                                 (rect (- (.width st) 45.0) bottom 22.0 28.0))
+                      delete
+                        (control (.document st)
+                                 c"×"
+                                 (rect (- (.width st) 23.0) bottom 22.0 28.0))]
+                  (do
+                    (msg i64 eye (sel c"setTag:") [i64] (row-tag (projects/id record) 1))
+                    (controls/transparent! eye)
+                    (msg i64 eye (sel c"setToolTip:") [(ptr i8)] (ns (if hidden c"Show project" c"Hide project")))
+                    (msg i64 delete (sel c"setTag:") [i64] (row-tag (projects/id record) 2))
+                    (msg i64 delete (sel c"setToolTip:") [(ptr i8)] (ns c"Delete project"))
+                    (controls/transparent! delete))))))
+          (let [new-project
+                  (control (.document st)
+                           c""
+                           (rect 0.0 (- height (+ (* (p/cast f64 (s/count rows)) 28.0) 29.0)) (- (.width st) 1.0) 28.0))
+                new-title
+                  (label (.document st)
+                         c"+  New Project"
+                         (rect 14.0 (- height (+ (* (p/cast f64 (s/count rows)) 28.0) 25.0)) (- (.width st) 28.0) 20.0)
+                         13.0
+                         true)]
+            (do
+              (msg i64 new-project (sel c"setTag:") [i64] 15)
+              (msg i64 new-project (sel c"setToolTip:") [(ptr i8)] (ns c"New project"))
+              (do new-title (do))
+              (do)))))
       (msg i64
-           (.footer st)
-           (sel c"setTitle:")
+           (.header st)
+           (sel c"setStringValue:")
            [(ptr i8)]
-           (ns (if (.show-hidden st) c"Hide hidden projects" c"Show hidden projects")))
+           (msg (ptr i8) (s/get (projects/profile root) c"name") (sel c"uppercaseString") []))
+      (let [items (msg (ptr i8) (.indicators st) (sel c"subviews") [])
+            copy (msg (ptr i8) items (sel c"copy") [])
+            profiles (projects/profiles root)
+            total (s/count profiles)]
+        (do
+          (for [i 0 (s/count copy)] (msg i64 (s/at copy i) (sel c"removeFromSuperview") []))
+          (release copy)
+          (for [i 0 total]
+            (let [profile (s/at profiles i)
+                  bar
+                    (view (.indicators st)
+                          (rect (- (- (.width st) 42.0) (* (p/cast f64 (- total i)) 15.0)) 16.0 10.0 3.0))]
+              (if (= (projects/id profile) (projects/id (projects/profile root)))
+                  (background! bar 0.88 0.68 0.31)
+                  (background! bar 0.38 0.42 0.48))))
+          (do)))
+      (msg i64 (.footer-pupil st) (sel c"setHidden:") [i8] (p/cast i8 (if (.show-hidden st) 0 1)))
+      (set! (.transition st) 0.0)
       (do))))
 
 (defn layout! [(height f64)] (-> void)
@@ -129,11 +282,12 @@
     (do
       (set! (.height st) height)
       (frame! (.view st) (rect 0.0 0.0 (.width st) height))
-      (frame! (.header st) (rect 12.0 (- height 42.0) (- (.width st) 54.0) 30.0))
-      (frame! (.scroll st) (rect 8.0 48.0 (- (.width st) 16.0) (- height 94.0)))
-      (frame! (.footer st) (rect 12.0 8.0 (- (.width st) 48.0) 30.0))
-      (frame! (.add-project st) (rect (- (.width st) 34.0) 8.0 26.0 30.0))
-      (frame! (.add-profile st) (rect (- (.width st) 34.0) (- height 42.0) 26.0 30.0))
+      (frame! (.header st) (rect 12.0 (- height 36.0) (- (.width st) 48.0) 28.0))
+      (frame! (.indicators st) (rect 0.0 (- height 36.0) (.width st) 28.0))
+      (frame! (.scroll st) (rect 0.0 40.0 (- (.width st) 1.0) (- height 76.0)))
+      (frame! (.footer st) (rect 0.0 0.0 40.0 40.0))
+      (frame! (.add-project st) (rect 0.0 0.0 0.0 0.0))
+      (frame! (.add-profile st) (rect (- (.width st) 32.0) (- height 36.0) 24.0 28.0))
       (refresh!))))
 
 (defn clicked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
@@ -141,16 +295,66 @@
         tag (msg i64 sender (sel c"tag") [])]
     (do
       (cond (>= tag 100)
-              (let [id (/ (- tag 100) 2)]
+              (let [id (tag-id tag)]
                 (do
-                  (if (= (% tag 2) 0)
-                      (projects/select! (.model st) id)
-                      (projects/hide! (.model st) id (not (projects/hidden? (projects/profile (.model st)) id))))
-                  (set! (.pending st) -2)
+                  (cond (= (tag-part tag) 0) (projects/select! (.model st) id)
+                        (= (tag-part tag) 1)
+                          (projects/hide! (.model st) id (not (projects/hidden? (projects/profile (.model st)) id)))
+                        :else (request-delete! id))
+                  (if (!= (tag-part tag) 2) (set! (.pending st) -2) 0)
                   (do)))
             (= tag 23) (do (set! (.show-hidden st) (not (.show-hidden st))) (refresh!))
             :else (do (set! (.pending st) tag) (do)))
       (do))))
+
+(defn hovered [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (let [tag (msg i64 sender (sel c"tag") [])]
+    (cond (>= tag 100)
+            (let [id (tag-id tag)]
+              (do
+                (if (and (> (.hovered (state)) 0) (!= (.hovered (state)) id))
+                    (do (reveal-eye! (.hovered (state)) false) (do))
+                    (do))
+                (set! (.hovered (state)) id)
+                (reveal-eye! id true)))
+          (= tag 23)
+            (do
+              (msg i64
+                   (layer (.footer-icon (state)))
+                   (sel c"setBorderColor:")
+                   [(ptr i8)]
+                   (msg (ptr i8) (color 0.88 0.68 0.31 1.0) (sel c"CGColor") []))
+              (background! (.footer-pupil (state)) 0.88 0.68 0.31))
+          :else (do))))
+
+(defn unhovered [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (let [tag (msg i64 sender (sel c"tag") [])]
+    (cond (and (>= tag 100) (= (tag-part tag) 0)) (do (reveal-eye! (tag-id tag) false) (set! (.hovered (state)) 0))
+          (= tag 23)
+            (do
+              (msg i64
+                   (layer (.footer-icon (state)))
+                   (sel c"setBorderColor:")
+                   [(ptr i8)]
+                   (msg (ptr i8) (color 0.38 0.42 0.48 1.0) (sel c"CGColor") []))
+              (background! (.footer-pupil (state)) 0.38 0.42 0.48))
+          :else (do))))
+
+(defn rename-committed [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (finish-rename!))
+
+(defn rename-ended [(self (ptr i8)) (cmd (ptr i8)) (notification (ptr i8))] (-> void)
+  (finish-rename!))
+
+(defn rename-command [(self (ptr i8)) (cmd (ptr i8)) (control (ptr i8)) (editor (ptr i8)) (command (ptr i8))] (-> i8)
+  (cond (= command (sel c"cancelOperation:"))
+          (do
+            (set! (.renaming (state)) 0)
+            (set! (.rename-field (state)) (nil))
+            (set! (.pending (state)) -2)
+            (p/cast i8 1))
+        (= command (sel c"insertNewline:")) (do (finish-rename!) (p/cast i8 1))
+        :else (p/cast i8 0)))
 
 (defn profile-selected [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
   (do
@@ -171,29 +375,39 @@
       (let [cls (objc_allocateClassPair (class c"NSObject") c"JimSidebarActions" 0)]
         (do
           (method! cls c"clicked:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
+          (method! cls c"hovered:" (p/cast (ptr i8) (p/fnptr-of hovered)) c"v@:@")
+          (method! cls c"unhovered:" (p/cast (ptr i8) (p/fnptr-of unhovered)) c"v@:@")
+          (method! cls c"renameCommitted:" (p/cast (ptr i8) (p/fnptr-of rename-committed)) c"v@:@")
+          (method! cls c"controlTextDidEndEditing:" (p/cast (ptr i8) (p/fnptr-of rename-ended)) c"v@:@")
+          (method! cls
+                   c"control:textView:doCommandBySelector:"
+                   (p/cast (ptr i8) (p/fnptr-of rename-command))
+                   c"c@:@@:")
           (method! cls c"profileSelected:" (p/cast (ptr i8) (p/fnptr-of profile-selected)) c"v@:@")
           (objc_registerClassPair cls)
           (set! (.target st) (new c"JimSidebarActions"))))
-      (set! (.header st)
-            (msg (ptr i8)
-                 (msg (ptr i8) (class c"NSPopUpButton") (sel c"alloc") [])
-                 (sel c"initWithFrame:pullsDown:")
-                 [Rect i8]
-                 (rect 12.0 816.0 170.0 30.0)
-                 (p/cast i8 0)))
-      (msg i64 (.header st) (sel c"setBordered:") [i8] (p/cast i8 0))
-      (msg i64 (.header st) (sel c"setTarget:") [(ptr i8)] (.target st))
-      (msg i64 (.header st) (sel c"setAction:") [(ptr i8)] (sel c"profileSelected:"))
-      (msg i64 (.view st) (sel c"addSubview:") [(ptr i8)] (.header st))
-      (release (.header st))
+      (set! (.header st) (label (.view st) c"" (rect 12.0 816.0 170.0 30.0) 12.0 true))
+      (set! (.indicators st) (view (.view st) (rect 0.0 824.0 (.width st) 28.0)))
       (set! (.add-profile st) (control (.view st) c"+" (rect 186.0 816.0 26.0 30.0)))
       (msg i64 (.add-profile st) (sel c"setTag:") [i64] 20)
       (msg i64 (.add-profile st) (sel c"setToolTip:") [(ptr i8)] (ns c"New profile"))
       (set! (.add-project st) (control (.view st) c"+" (rect 186.0 8.0 26.0 30.0)))
       (msg i64 (.add-project st) (sel c"setTag:") [i64] 15)
       (msg i64 (.add-project st) (sel c"setToolTip:") [(ptr i8)] (ns c"New project"))
-      (set! (.footer st) (control (.view st) c"Show hidden projects" (rect 12.0 8.0 170.0 30.0)))
+      (set! (.footer-icon st) (view (.view st) (rect 16.0 16.0 8.0 8.0)))
+      (msg i64 (layer (.footer-icon st)) (sel c"setCornerRadius:") [f64] 4.0)
+      (msg i64 (layer (.footer-icon st)) (sel c"setBorderWidth:") [f64] 1.0)
+      (msg i64
+           (layer (.footer-icon st))
+           (sel c"setBorderColor:")
+           [(ptr i8)]
+           (msg (ptr i8) (color 0.38 0.42 0.48 1.0) (sel c"CGColor") []))
+      (set! (.footer-pupil st) (view (.footer-icon st) (rect 3.0 3.0 2.0 2.0)))
+      (msg i64 (layer (.footer-pupil st)) (sel c"setCornerRadius:") [f64] 1.0)
+      (background! (.footer-pupil st) 0.38 0.42 0.48)
+      (set! (.footer st) (control (.view st) c"" (rect 0.0 0.0 40.0 40.0)))
       (msg i64 (.footer st) (sel c"setTag:") [i64] 23)
+      (controls/transparent! (.footer st))
       (set! (.scroll st) (new c"NSScrollView"))
       (msg i64 (.scroll st) (sel c"setDrawsBackground:") [i8] (p/cast i8 0))
       (msg i64 (.scroll st) (sel c"setHasVerticalScroller:") [i8] (p/cast i8 1))
@@ -206,6 +420,7 @@
                  [Rect]
                  (rect 0.0 0.0 204.0 720.0)))
       (msg i64 (.scroll st) (sel c"setDocumentView:") [(ptr i8)] (.document st))
+      (msg i64 (.document st) (sel c"setWantsLayer:") [i8] (p/cast i8 1))
       (release (.document st))
       (layout! 860.0))))
 
@@ -231,26 +446,71 @@
                (msg Point event (sel c"locationInWindow") [])
                (nil))
         bounds (msg Rect (.document st) (sel c"bounds") [])
-        row (p/cast i64 (/ (- (.h bounds) (.y doc)) 40.0))
-        in-row (and (>= (.y pt) 48.0) (< (.y pt) (- (.height st) 46.0)) (>= row 0) (< row (s/count (.rows st))))]
-    (cond (and (= kind 22)
-               (>= (.x pt) 0.0)
-               (< (.x pt) (.width st))
-               (let [dx (msg f64 event (sel c"scrollingDeltaX") [])
-                     dy (msg f64 event (sel c"scrollingDeltaY") [])]
-                 (> (* dx dx) (* dy dy))))
+        from-top (- (.h bounds) (.y doc))
+        row (p/cast i64 (/ from-top 28.0))
+        in-band (and (>= (.y pt) 40.0) (< (.y pt) (- (.height st) 36.0)))
+        in-row (and in-band (>= row 0) (< row (s/count (.rows st))))
+        new-top (+ (* (p/cast f64 (s/count (.rows st))) 28.0) 1.0)
+        in-new-row (and in-band (>= from-top new-top) (< from-top (+ new-top 28.0)))]
+    (cond (and (= kind 22) (>= (.x pt) 0.0) (< (.x pt) (.width st)))
             (let [phase (msg u64 event (sel c"phase") [])
-                  dx (msg f64 event (sel c"scrollingDeltaX") [])]
+                  dx (msg f64 event (sel c"scrollingDeltaX") [])
+                  dy (msg f64 event (sel c"scrollingDeltaY") [])
+                  now (msg f64 (class c"NSDate") (sel c"timeIntervalSinceReferenceDate") [])
+                  quiet (or (p/fcmp-eq (.swipe-time st) 0.0) (> (- now (.swipe-time st)) 0.18))
+                  reversed
+                    (and (not (p/fcmp-eq dx 0.0))
+                         (not (p/fcmp-eq (.swipe st) 0.0))
+                         (< (* dx (.swipe st)) 0.0))]
               (do
-                (if (or (= phase (p/cast u64 1)) (= phase (p/cast u64 0)))
-                    (do (set! (.swipe st) 0.0) (set! (.switched st) false))
+                (if (or (= phase (p/cast u64 1)) quiet reversed)
+                    (do
+                      (set! (.swipe st) 0.0)
+                      (set! (.swipe-y st) 0.0)
+                      (set! (.swipe-axis st) 0)
+                      (set! (.switched st) false))
                     0)
+                (set! (.swipe-time st) now)
                 (set! (.swipe st) (+ (.swipe st) dx))
-                (if (and (not (.switched st)) (or (> (.swipe st) 40.0) (< (.swipe st) -40.0)))
-                    (do (set! (.pending st) (if (> (.swipe st) 0.0) 25 24)) (set! (.switched st) true))
+                (set! (.swipe-y st) (+ (.swipe-y st) dy))
+                (if (= (.swipe-axis st) 0)
+                    (cond (and (or (> (.swipe st) 6.0) (< (.swipe st) -6.0))
+                               (> (* (.swipe st) (.swipe st)) (* 1.44 (* (.swipe-y st) (.swipe-y st)))))
+                            (set! (.swipe-axis st) 1)
+                          (and (or (> (.swipe-y st) 12.0) (< (.swipe-y st) -12.0))
+                               (> (* (.swipe-y st) (.swipe-y st)) (* 2.56 (* (.swipe st) (.swipe st)))))
+                            (set! (.swipe-axis st) 2)
+                          :else 0)
+                    0)
+                (if (and (= (.swipe-axis st) 1)
+                         (not (.switched st))
+                         (or (> (.swipe st) 20.0) (< (.swipe st) -20.0)))
+                    (do (set! (.pending st) (if (> (.swipe st) 0.0) 24 25)) (set! (.switched st) true))
+                    0)
+                ;; Own the stream from its first packet. Passing an undecided
+                ;; packet to NSScrollView lets AppKit enter its private tracking
+                ;; loop and consume the remainder, so horizontal swipes only
+                ;; worked over the header. Once the gesture resolves vertical,
+                ;; forward it explicitly so ordinary list scrolling is intact.
+                (if (and (= (.swipe-axis st) 2) (>= (.y pt) 40.0) (< (.y pt) (- (.height st) 36.0)))
+                    (msg i64 (.scroll st) (sel c"scrollWheel:") [(ptr i8)] event)
                     0)
                 true))
-          (and (= kind 1) (>= (.x pt) 0.0) (< (.x pt) (- (.width st) 40.0)) (> (.y pt) (- (.height st) 46.0))) false
+          (and (= kind 1) (>= (.x pt) 0.0) (< (.x pt) (- (.width st) 40.0)) (> (.y pt) (- (.height st) 36.0)))
+            (let [profiles (projects/profiles (.model st))
+                  total (s/count profiles)
+                  first (- (- (.width st) 42.0) (* (p/cast f64 total) 15.0))
+                  index (p/cast i64 (/ (- (.x pt) first) 15.0))]
+              (if (and (>= index 0) (< index total))
+                  (let [current (msg i64 profiles (sel c"indexOfObject:") [(ptr i8)] (projects/profile (.model st)))]
+                    (do
+                      (if (!= index current)
+                          (set! (.transition st) (if (< index current) (- 0.0 (.width st)) (.width st)))
+                          0)
+                      (projects/switch-profile! (.model st) (projects/id (s/at profiles index)))
+                      (set! (.pending st) -2)
+                      true))
+                  false))
           (and (= kind 1) (>= (.x pt) (- (.width st) 4.0)) (<= (.x pt) (+ (.width st) 4.0)))
             (do (set! (.resizing st) true) true)
           (.resizing st)
@@ -292,16 +552,21 @@
                       (if (> (.x pt) (- (.width st) 40.0))
                           (do (set! (.pending st) 15) (do))
                           (do (set! (.show-hidden st) (not (.show-hidden st))) (refresh!)))
+                    in-new-row (do (set! (.pending st) 15) (do))
                     in-row
-                      (if (> (.x pt) (- (.width st) 44.0))
-                          (do
-                            (projects/hide! (.model st)
-                                            (row-id row)
-                                            (not (projects/hidden? (projects/profile (.model st)) (row-id row))))
-                            (refresh!)
-                            (set! (.pending st) -2)
-                            (do))
-                          (do (set! (.pressed st) (row-id row)) (set! (.start st) pt) (do)))
+                      (cond (> (.x pt) (- (.width st) 23.0)) (request-delete! (row-id row))
+                            (> (.x pt) (- (.width st) 45.0))
+                              (do
+                                (projects/hide! (.model st)
+                                                (row-id row)
+                                                (not (projects/hidden? (projects/profile (.model st)) (row-id row))))
+                                (refresh!)
+                                (set! (.pending st) -2)
+                                (do))
+                            :else
+                              (if (>= (msg i64 event (sel c"clickCount") []) 2)
+                                  (do (projects/select! (.model st) (row-id row)) (rename! (row-id row)))
+                                  (do (set! (.pressed st) (row-id row)) (set! (.start st) pt) (do))))
                     :else (do))
               true)
           :else false)))

@@ -108,6 +108,36 @@ class SessionTest(unittest.TestCase):
         self.assertEqual((self.directory / 'reattached-pid').read_text(), pid)
         self.assertIn(b'shell-pid', replay)
 
+    def test_closed_launcher_stdio_does_not_close_shell_pty(self):
+        path = str(self.directory / 'closed-stdio.sock')
+        subprocess.run(
+            [str(ROOT / 'build/jim-session'), path, self.tmp.name,
+             str(ROOT / 'build/ghostty/share/ghostty'), '/bin/sh', '-i'],
+            check=True,
+            preexec_fn=lambda: os.closerange(0, 3),
+        )
+        for _ in range(200):
+            if Path(path).exists():
+                break
+            time.sleep(.01)
+        sock = socket.socket(socket.AF_UNIX)
+        sock.settimeout(5)
+        sock.connect(path)
+        send(sock, 1, SIZE)
+        while receive(sock)[0] != 17:
+            pass
+        send(sock, 2, b'printf "CLOSED_STDIO_%s\\n" yes\n')
+        data = bytearray()
+        while b'CLOSED_STDIO_yes' not in data:
+            kind, part = receive(sock)
+            if kind == 16:
+                data.extend(part)
+        sock.close()
+        killer = socket.socket(socket.AF_UNIX)
+        killer.connect(path)
+        send(killer, 4)
+        killer.close()
+
     def test_core_answers_queries_without_a_renderer(self):
         client, _ = self.attach()
         # Query while detached; the child cannot finish unless the daemon's

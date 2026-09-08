@@ -18,6 +18,8 @@
 (deftest palette-search-supports-case-and-keywords
          (assert (>= (actions/match-score (ns c"FPS") 10) 0))
          (assert (>= (actions/match-score (ns c"ghostty") 0) 0))
+         (assert (>= (actions/match-score (ns c"cwd") 19) 0))
+         (assert (>= (actions/match-score (ns c"pwd") 19) 0))
          (assert (>= (actions/score (ns c"É") (ns c"éclair")) 0)))
 
 (deftest original-zoom-shortcuts-stay-distinct

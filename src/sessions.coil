@@ -1,10 +1,7 @@
 (module jim.sessions)
 (import "jim.native" :use *)
+(import "jim.session.transport" :as transport)
 (import "coil.primitive" :as p)
-
-(extern jim_session_open :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> i32))
-
-(extern jim_session_kill :cc c [(ptr i8)] (-> i32))
 
 (extern chmod :cc c [(ptr i8) u16] (-> i32))
 
@@ -41,19 +38,19 @@
            (nil))
       (chmod (utf8 (directory)) (p/cast u16 448))
       (if (valid-id? id)
-          (jim_session_open (utf8 (msg (ptr i8)
-                                       base
-                                       (sel c"stringByAppendingPathComponent:")
-                                       [(ptr i8)]
-                                       (ns c"build/jim-session")))
-                            (utf8 (path id))
-                            cwd
-                            (utf8 (msg (ptr i8)
-                                       base
-                                       (sel c"stringByAppendingPathComponent:")
-                                       [(ptr i8)]
-                                       (ns c"build/ghostty/share/ghostty"))))
+          (transport/session-open (utf8 (msg (ptr i8)
+                                             base
+                                             (sel c"stringByAppendingPathComponent:")
+                                             [(ptr i8)]
+                                             (ns c"build/jim-session")))
+                                  (utf8 (path id))
+                                  cwd
+                                  (utf8 (msg (ptr i8)
+                                             base
+                                             (sel c"stringByAppendingPathComponent:")
+                                             [(ptr i8)]
+                                             (ns c"build/ghostty/share/ghostty"))))
           (p/cast i32 -1)))))
 
 (defn kill! [(id (ptr i8))] (-> bool)
-  (and (valid-id? id) (= (jim_session_kill (utf8 (path id))) (p/cast i32 0))))
+  (and (valid-id? id) (= (transport/session-kill (utf8 (path id))) (p/cast i32 0))))

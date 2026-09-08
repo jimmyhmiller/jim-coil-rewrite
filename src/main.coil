@@ -74,7 +74,7 @@
   (if (>= i 0) (utf8 (storage/get (record i) c"name")) c"No visible project"))
 
 (defn status! [(text (ptr i8))] (-> i64)
-  (msg i64 (.status (shell)) (sel c"setStringValue:") [(ptr i8)] (ns text)))
+  (p/cast i64 (printf c"Jim: %s\n" text)))
 
 (defn pose! [(duration f64)] (-> void)
   (let [s (shell)
@@ -166,6 +166,8 @@
         fh (- height 124.0)
         scale (msg f64 (.window s) (sel c"backingScaleFactor") [])]
     (do
+      (transaction! 0.0)
+      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
       (set! (.width s) width)
       (set! (.height s) height)
       (sidebar/layout! height)
@@ -197,7 +199,9 @@
       (background! (.view (sidebar/state)) (.rail-r (.config s)) (.rail-g (.config s)) (.rail-b (.config s)))
       (for [i 0 (count)] (canvas/apply-theme! (project i) (.config s)))
       (palette/layout!)
-      (pose! 0.0))))
+      (pose! 0.0)
+      (commit!)
+      (do))))
 
 (defn reload-start! [] (-> void)
   (let [s (shell)]
@@ -287,6 +291,35 @@
       (set! (.overview s) false)
       (layout!)
       (if (save-layout!) (do) (do (status! c"Could not save project layout") (do))))))
+
+(defn delete-project! [(wanted i64)] (-> void)
+  (let [s (shell)
+        (mut index) -1]
+    (do
+      (for [i 0 (count)]
+        (let [r (runtime i)] (if (= (.id r) wanted) (store! index i) 0)))
+      (if (>= (load index) 0)
+          (let [index (load index)
+                r (runtime index)
+                deleted-name (storage/get (record index) c"name")]
+            (do
+              (printf c"Jim: deleting project %s and closing its terminals\n" (utf8 deleted-name))
+              (let [c (.canvas r)] (while (> (canvas/count c) 0) (canvas/close! c (canvas/pane c 0))))
+              (projects/delete-project! (.model s) (.id r))
+              (canvas/free! (.canvas r))
+              (msg i64 (.face r) (sel c"removeFromSuperview") [])
+              (for [i index (- (count) 1)] (al/al-set! [ProjectView] (mut (.projects s)) i (runtime (+ i 1))))
+              (al/al-pop! [ProjectView] (mut (.projects s)))
+              (sync-selection!)))
+          (do)))))
+
+(defn new-project! [] (-> void)
+  (let [s (shell)
+        record (projects/new-project! (.model s) (ns c"Project"))]
+    (do
+      (storage/put! record c"name" (indexed-string c"Project " (projects/id record) c""))
+      (add-project-view! record)
+      (sync-selection!))))
 
 (defn add-project-view! [(record (ptr i8))] (-> bool)
   (let [s (shell)
@@ -382,8 +415,8 @@
     (cond (= id -2) (sync-selection!)
           (>= id 28)
             (do (projects/select! model (projects/id (storage/at (projects/list model) (- id 28)))) (sync-selection!))
-          (= id 15) (palette/prompt! 15 c"New project name" c"")
-          (= id 16) (if (>= (.selected s) 0) (palette/prompt! 16 c"Rename project" (name (.selected s))) (do))
+          (= id 15) (new-project!)
+          (= id 16) (if (>= (.selected s) 0) (sidebar/rename! (projects/active model)) (do))
           (= id 17)
             (if (>= (.selected s) 0) (do (projects/hide! model (projects/active model) true) (sync-selection!)) (do))
           (= id 18)
@@ -413,16 +446,18 @@
             (let [profiles (projects/profiles model)
                   index (msg i64 profiles (sel c"indexOfObject:") [(ptr i8)] (projects/profile model))
                   next (workspace/wrap (+ index (if (= id 24) -1 1)) (storage/count profiles))]
-              (do (projects/switch-profile! model (projects/id (storage/at profiles next))) (sync-selection!)))
+              (do
+                (sidebar/transition! (if (= id 24) (- 0.0 (sidebar/width)) (sidebar/width)))
+                (projects/switch-profile! model (projects/id (storage/at profiles next)))
+                (sync-selection!)))
           (= id 27)
             (when (and (>= (.selected s) 0) (!= (p/cast i64 (.focused (current))) 0))
               (if (canvas/reconnect! (current) (.focused (current)))
                   (do (status! c"Terminal reconnected") (do))
                   (do (status! c"Cannot reconnect terminal; saved session retained") (do))))
           (= id 26)
-            (if (>= (.selected s) 0)
-                (palette/prompt! 26 c"Delete project and close its terminals? Type its name" c"")
-                (do))
+            (let [requested (sidebar/take-delete-project!)]
+              (delete-project! (if (> requested 0) requested (projects/active model))))
           (or (= id 9) (= id 10) (and (>= id 11) (< id 15))) (canvas-action! id)
           (>= (.selected s) 0) (canvas-action! id)
           :else (do (status! c"Create or show a project first") (do)))))
@@ -462,25 +497,6 @@
                         (do (store! invalid-directory true) (do))))
                 (= id 20) (projects/new-profile! model text)
                 (= id 21) (do (storage/put! (projects/profile model) c"name" text) (do))
-                (= id 26)
-                  (if (!= (msg i8
-                               text
-                               (sel c"isEqualToString:")
-                               [(ptr i8)]
-                               (storage/get (record (.selected s)) c"name"))
-                          (p/cast i8 0))
-                      (let [index (.selected s)
-                            r (runtime index)]
-                        (do
-                          (projects/delete-project! model (.id r))
-                          (let [c (.canvas r)] (while (> (canvas/count c) 0) (canvas/close! c (canvas/pane c 0))))
-                          (canvas/free! (.canvas r))
-                          (msg i64 (.face r) (sel c"removeFromSuperview") [])
-                          (for [i index (- (count) 1)]
-                            (al/al-set! [ProjectView] (mut (.projects s)) i (runtime (+ i 1))))
-                          (al/al-pop! [ProjectView] (mut (.projects s)))
-                          (do)))
-                      (do))
                 :else (do))
           (sync-selection!)
           (when (load invalid-directory)
@@ -642,8 +658,10 @@
           (set! (.stage s) (view root (rect 224.0 40.0 1096.0 820.0)))
           (set! (.cube s) (layer-view (.stage s) (rect 32.0 32.0 1032.0 736.0) c"CATransformLayer"))
           (msg i64 (layer (.stage s)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-          (set! (.status s) (label root c"Starting Ghostty…" (rect 256.0 10.0 1000.0 20.0) 11.0 true))
-          (set! (.heading s) (label root c"Workspace" (rect 256.0 816.0 400.0 24.0) 17.0 false))
+          ;; Jim Editor keeps the canvas edge clear. Operational status is
+          ;; logged instead of creating a persistent hint strip in the UI.
+          (set! (.status s) (nil))
+          (set! (.heading s) (nil))
           (palette/setup! window)
           (timings/setup! window)
           (msg i64 app (sel c"finishLaunching") [])

@@ -31,7 +31,7 @@
         (= id 16) c"Project: Rename current project"
         (= id 17) c"Project: Hide current project"
         (= id 18) c"Project: Set directory"
-        (= id 19) c"Project: Use focused terminal’s current directory"
+        (= id 19) c"Project: Set directory from focused terminal"
         (= id 20) c"Profile: New profile"
         (= id 21) c"Profile: Rename current profile"
         (= id 22) c"Profile: Delete current profile"
@@ -68,6 +68,7 @@
         (= id 2) c" home origin"
         (= id 8) c" compiz overview workspaces"
         (= id 10) c" fps performance profiler latency frame time"
+        (= id 19) c" cwd pwd working current default new terminal"
         :else c""))
 
 ;;; Original Jim's subsequence score: consecutive and word-start bonuses.

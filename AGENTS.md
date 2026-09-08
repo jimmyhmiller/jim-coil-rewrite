@@ -28,9 +28,10 @@ another terminal multiplexer. App shutdown detaches; explicit pane/project
 closure terminates the corresponding sessions. Preserve stable session IDs.
 Run `python3 tests/session_test.py` after building the service for lifecycle or
 protocol changes. Verify real app quit/reopen for renderer integration changes.
-Format native boundary code with `clang-format` and the Ghostty extension with
-`zig fmt`. Compile C with warnings treated as errors. Keep native callbacks'
-by-value C ABI separate from Coil's internal struct-reference convention.
+Format native Coil boundary code with `coil fmt` and the Ghostty extension with
+`zig fmt`. Export
+native callbacks with `export-c`; `fnptr-of` then selects their C ABI wrappers
+while direct Coil calls retain Coil's internal struct-reference convention.
 
 Only patch the project-local pinned Ghostty dependency under build/deps; never
 modify original Jim's checkout or installed Ghostty. Reproduce patches through

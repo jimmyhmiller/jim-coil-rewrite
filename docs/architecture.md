@@ -42,14 +42,15 @@ layouts. Invalid saved documents are rejected without overwriting them. Session
 connection failures retain recoverable panes rather than deleting saved metadata.
 
 The Ghostty dependency is pinned to `7aa9591746ffa4d2eee458960c76554352832595`.
-Its C header is retained under `vendor/`, and the used ABI subset has checks in
-both C and Coil. The Objective-C messaging and animation modules come from the
+Its C header is retained under `vendor/`, and the used ABI subset has compile-time
+checks in Coil. The Objective-C messaging and animation modules come from the
 existing Coil GPU UI experiment and are maintained in `src/` as Jim modules;
 see [source origins](PROVENANCE.md).
 
 ## Session ownership and transport
 
-`src/session/server.c` is a small per-terminal private service. A same-user,
+`src/session/server.coil` is a small per-terminal private service, and
+`src/session/transport.coil` owns the shared JIM1 framing and connection API. A same-user,
 mode-0700 socket directory and peer-UID checks protect its Unix connection. A file
 lock serializes creation of a session UUID. The service owns the PTY child,
 terminal query responses, foreground cwd discovery, and an anonymous disk journal.
@@ -78,10 +79,10 @@ and frees pending writes; daemon shutdown is a separate explicit action.
 Replay is exact for the recorded stream, not a model snapshot. Journal compaction,
 reboot recovery, and graphics referencing vanished files require further work.
 
-`src/callbacks.c` is a typed C ABI adapter for by-value native callback structures.
-It passes borrowed addresses to Coil's internal struct-reference convention. This
-avoids relying on an incompatible raw Coil function pointer for AppKit ranges,
-points, and Ghostty actions. All objects retained by AppKit have explicit owners;
+Coil exports AppKit and Ghostty callbacks with `export-c`; `fnptr-of` selects the
+generated C ABI entry point and marshals by-value native structures without a
+handwritten adapter. Direct Coil calls retain Coil's internal struct-reference
+convention. All objects retained by AppKit have explicit owners;
 unparented document views remain owned until NSScrollView takes ownership.
 
 The dependency extension is reproducible through

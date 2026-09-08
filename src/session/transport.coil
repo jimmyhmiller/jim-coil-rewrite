@@ -1,0 +1,274 @@
+(module jim.session.transport)
+(import "coil.os" :as os)
+(import "coil.primitive" :as p)
+
+(const MAGIC 1246317873)
+
+(const MAX-PAYLOAD 65536)
+
+(const JIM-ATTACH 1)
+
+(const JIM-INPUT 2)
+
+(const JIM-RESIZE 3)
+
+(const JIM-KILL 4)
+
+(const JIM-COLORS 5)
+
+(const JIM-OUTPUT 16)
+
+(const JIM-READY 17)
+
+(const JIM-EXITED 18)
+
+(const JIM-ERROR 19)
+
+(const JIM-DIRECTORY 20)
+
+(const AF-UNIX 1)
+
+(const SOCK-STREAM 1)
+
+(const SOL-SOCKET 65535)
+
+(const SO-NOSIGPIPE 4130)
+
+(const F-SETFD 2)
+
+(const FD-CLOEXEC 1)
+
+(const SHUT-RDWR 2)
+
+(const EINTR 4)
+
+(const ENOENT 2)
+
+(const EACCES 13)
+
+(const EMSGSIZE 40)
+
+(const EPROTO 100)
+
+(const ECONNREFUSED 61)
+
+(const POSIX-SPAWN-CLOEXEC-DEFAULT 16384)
+
+;;; Darwin's sockaddr_un begins with one-byte length and family fields.
+(defstruct SockaddrUn [(length u8) (family u8) (path (array i8 104))])
+
+(static-assert (= (p/sizeof SockaddrUn) 106) "Darwin sockaddr_un ABI size")
+
+(static-assert (= (p/offsetof SockaddrUn path) 2) "Darwin sockaddr_un path offset")
+
+(extern socket :cc c [i32 i32 i32] (-> i32))
+
+(extern connect :cc c [i32 (ptr i8) u32] (-> i32))
+
+(extern setsockopt :cc c [i32 i32 i32 (ptr i8) u32] (-> i32))
+
+(extern getpeereid :cc c [i32 (ptr u32) (ptr u32)] (-> i32))
+
+(extern getuid :cc c [] (-> u32))
+
+(extern send :cc c [i32 (ptr i8) isize i32] (-> isize))
+
+(extern recv :cc c [i32 (ptr i8) isize i32] (-> isize))
+
+(extern shutdown :cc c [i32 i32] (-> i32))
+
+(extern close :cc c [i32] (-> i32))
+
+(extern fcntl :cc c [i32 i32 ...] (-> i32))
+
+(extern strlen :cc c [(ptr i8)] (-> isize))
+
+(extern memcpy :cc c [(ptr i8) (ptr i8) isize] (-> (ptr i8)))
+
+(extern nanosleep :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern waitpid :cc c [i32 (ptr i32) i32] (-> i32))
+
+(extern posix_spawn :cc c [(ptr i32) (ptr i8) (ptr i8) (ptr i8) (ptr (ptr i8)) (ptr (ptr i8))] (-> i32))
+
+(extern posix_spawnattr_init :cc c [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawnattr_destroy :cc c [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawnattr_setflags :cc c [(ptr (ptr i8)) i16] (-> i32))
+
+(extern _NSGetEnviron :cc c [] (-> (ptr (ptr (ptr i8)))))
+
+(extern __error :cc c [] (-> (ptr i32)))
+
+(defn set-errno! [(value i32)] (-> i64)
+  (set! (p/index (__error) 0) value)
+  0)
+
+(defn byte-at [(base (ptr i8)) (offset i64)] (-> u8)
+  (p/cast u8 (load (p/index base offset))))
+
+(defn put-byte! [(base (ptr i8)) (offset i64) (value u8)] (-> i64)
+  (set! (p/index base offset) (p/cast i8 value))
+  0)
+
+(defn put-u32-be! [(base (ptr i8)) (offset i64) (value u32)] (-> i64)
+  (put-byte! base offset (p/cast u8 (>> value (p/cast u32 24))))
+  (put-byte! base (+ offset 1) (p/cast u8 (>> value (p/cast u32 16))))
+  (put-byte! base (+ offset 2) (p/cast u8 (>> value (p/cast u32 8))))
+  (put-byte! base (+ offset 3) (p/cast u8 value))
+  0)
+
+(defn u32-be [(base (ptr i8)) (offset i64)] (-> u32)
+  (| (| (<< (p/cast u32 (byte-at base offset)) (p/cast u32 24))
+        (<< (p/cast u32 (byte-at base (+ offset 1))) (p/cast u32 16)))
+     (| (<< (p/cast u32 (byte-at base (+ offset 2))) (p/cast u32 8))
+        (p/cast u32 (byte-at base (+ offset 3))))))
+
+(defn transfer [(fd i32) (data (ptr i8)) (length i64) (sending bool)] (-> i32)
+  (let [(mut at) 0]
+    (block :done
+             (loop (if (>= (load at) length)
+                       (break (p/cast i32 0))
+                       (let [n
+                               (if sending
+                                   (send fd (p/index data (load at)) (p/cast isize (- length (load at))) 0)
+                                   (recv fd (p/index data (load at)) (p/cast isize (- length (load at))) 0))]
+                         (if (and (< n 0) (= (os/os-errno) EINTR))
+                             0
+                             (if (<= n 0)
+                                 (return-from :done (p/cast i32 -1))
+                                 (set! at (+ (load at) (p/cast i64 n)))))))
+               (p/cast i32 0)))))
+
+(defn session-send [(fd i32) (kind u32) (bytes (ptr i8)) (length i64)] (-> i32)
+  (if (> length MAX-PAYLOAD)
+      (do (set-errno! EMSGSIZE) (p/cast i32 -1))
+      (let [header (p/alloc-stack (array i8 12))
+            out (p/cast (ptr i8) header)]
+        (put-u32-be! out 0 (p/cast u32 MAGIC))
+        (put-u32-be! out 4 kind)
+        (put-u32-be! out 8 (p/cast u32 length))
+        (if (< (transfer fd out 12 true) 0)
+            (p/cast i32 -1)
+            (transfer fd bytes length true)))))
+
+(defn session-receive [(fd i32) (kind (ptr u32)) (bytes (ptr i8)) (capacity i64)] (-> i32)
+  (let [header (p/alloc-stack (array i8 12))
+        input (p/cast (ptr i8) header)]
+    (if (< (transfer fd input 12 false) 0)
+        (p/cast i32 -1)
+        (let [length (p/cast i64 (u32-be input 8))]
+          (if (or (!= (u32-be input 0) (p/cast u32 MAGIC))
+                  (> length capacity)
+                  (> length MAX-PAYLOAD))
+              (do (set-errno! EPROTO) (p/cast i32 -1))
+              (do
+                (set! (p/index kind 0) (u32-be input 4))
+                (if (< (transfer fd bytes length false) 0) (p/cast i32 -1) (p/cast i32 length))))))))
+
+(defn session-connect [(path (ptr i8))] (-> i32)
+  (let [address (p/alloc-stack SockaddrUn)
+        path-length (p/cast i64 (strlen path))]
+    (if (>= path-length 104)
+        (do (set-errno! 63) (p/cast i32 -1))
+        (do
+          (set! address (p/zeroed SockaddrUn))
+          (set! (.length address) (p/cast u8 106))
+          (set! (.family address) (p/cast u8 AF-UNIX))
+          (memcpy (p/cast (ptr i8) (p/index (field address path) 0)) path (p/cast isize (+ path-length 1)))
+          (let [fd (socket AF-UNIX SOCK-STREAM 0)]
+            (if (< fd 0)
+                fd
+                (let [yes (p/alloc-stack i32)]
+                  (set! yes 1)
+                  (fcntl fd F-SETFD FD-CLOEXEC)
+                  (setsockopt fd SOL-SOCKET SO-NOSIGPIPE (p/cast (ptr i8) yes) (p/cast u32 4))
+                  (if (< (connect fd (p/cast (ptr i8) address) (p/cast u32 106)) 0)
+                      (do (close fd) (p/cast i32 -1))
+                      (let [uid (p/alloc-stack u32)
+                            gid (p/alloc-stack u32)]
+                        (if (or (< (getpeereid fd uid gid) 0) (!= (load uid) (getuid)))
+                            (do (close fd) (set-errno! EACCES) (p/cast i32 -1))
+                            fd))))))))))
+
+(defn attach [(fd i32)] (-> i32)
+  (let [size (p/alloc-stack (array i8 8))
+        bytes (p/cast (ptr i8) size)]
+    (set! size (p/zeroed (array i8 8)))
+    (put-byte! bytes 1 (p/cast u8 80))
+    (put-byte! bytes 3 (p/cast u8 24))
+    (if (< (session-send fd (p/cast u32 JIM-ATTACH) bytes 8) 0)
+        (do (close fd) (p/cast i32 -1))
+        fd)))
+
+(defstruct Timespec [(seconds i64) (nanoseconds i64)])
+
+(defn session-open [(executable (ptr i8)) (path (ptr i8)) (cwd (ptr i8)) (resources (ptr i8))] (-> i32)
+  (let [existing (session-connect path)]
+    (if (>= existing 0)
+        (attach existing)
+        (if (and (!= (os/os-errno) ENOENT) (!= (os/os-errno) ECONNREFUSED))
+            (p/cast i32 -1)
+            (let [attributes (p/alloc-stack (ptr i8))
+                  pid (p/alloc-stack i32)]
+              (set! attributes (p/cast (ptr i8) 0))
+              (if (!= (posix_spawnattr_init attributes) (p/cast i32 0))
+                  (p/cast i32 -1)
+                  (let [argv (p/alloc-stack (array (ptr i8) 5))]
+                    (set! (p/index argv 0) executable)
+                    (set! (p/index argv 1) path)
+                    (set! (p/index argv 2) cwd)
+                    (set! (p/index argv 3) resources)
+                    (set! (p/index argv 4) (p/cast (ptr i8) 0))
+                    (let [flags-error (posix_spawnattr_setflags attributes (p/cast i16 POSIX-SPAWN-CLOEXEC-DEFAULT))
+                          spawn-error
+                            (if (= flags-error 0)
+                                (posix_spawn pid
+                                             executable
+                                             (p/cast (ptr i8) 0)
+                                             (p/cast (ptr i8) attributes)
+                                             (p/cast (ptr (ptr i8)) argv)
+                                             (load (_NSGetEnviron)))
+                                flags-error)]
+                      (posix_spawnattr_destroy attributes)
+                      (if (!= spawn-error (p/cast i32 0))
+                          (do (set-errno! spawn-error) (p/cast i32 -1))
+                          (do
+                            (loop (if (>= (waitpid (load pid) (p/cast (ptr i32) 0) 0) 0)
+                                      (break (p/cast i32 0))
+                                      (if (!= (os/os-errno) EINTR) (break (p/cast i32 0)) (p/cast i32 0))))
+                            (let [(mut attempts) 0
+                                  delay (p/alloc-stack Timespec)]
+                              (set! delay (Timespec :seconds 0 :nanoseconds 10000000))
+                              (block :connected
+                                       (loop (if (>= (load attempts) 200)
+                                                 (break (p/cast i32 0))
+                                                 (let [fd (session-connect path)]
+                                                   (if (>= fd 0)
+                                                       (return-from :connected (attach fd))
+                                                       (do
+                                                         (nanosleep (p/cast (ptr i8) delay) (p/cast (ptr i8) 0))
+                                                         (set! attempts (+ (load attempts) 1))))))
+                                         (p/cast i32 -1))))))))))))))
+
+(defn session-kill [(path (ptr i8))] (-> i32)
+  (let [fd (session-connect path)]
+    (if (< fd 0)
+        (if (= (os/os-errno) ENOENT) (p/cast i32 0) (p/cast i32 -1))
+        (let [result (session-send fd (p/cast u32 JIM-KILL) (p/cast (ptr i8) 0) 0)]
+          (close fd)
+          result))))
+
+(defn session-shutdown [(fd i32)] (-> void)
+  (shutdown fd SHUT-RDWR))
+
+(defn session-close [(fd i32)] (-> void)
+  (close fd))
+
+(export-c [session-send :as "jim_session_send"]
+          [session-receive :as "jim_session_receive"]
+          [session-open :as "jim_session_open"]
+          [session-kill :as "jim_session_kill"]
+          [session-shutdown :as "jim_session_shutdown"]
+          [session-close :as "jim_session_close"])

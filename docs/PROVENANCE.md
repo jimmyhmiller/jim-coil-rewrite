@@ -12,9 +12,10 @@ supplies easing and spring mathematics. See [design attribution](THIRD_PARTY_NOT
 The external Ghostty embedding header and its license remain in `vendor/`.
 The header is pinned and checked by the dependency build and ABI tests.
 
-`src/session/GhosttySession.zig` and `scripts/ghostty/session-backend.py` are Jim's
-native transport extension to pinned Ghostty. The build applies it only to the
-local dependency under `build/deps`. `server.c`, `transport.c`, and `callbacks.c`
-are Jim-owned session/lifetime/ABI code, not copied multiplexer implementations.
+`src/session/server.coil` and `src/session/transport.coil` are Jim's native session
+and transport implementation. `src/session/GhosttySession.zig` and
+`scripts/ghostty/session-backend.py` form the Ghostty-side dependency extension. It is applied
+only to the local pinned Ghostty source under `build/deps`. No project-owned C
+source remains; native aggregate callbacks are exported directly from Coil.
 The service links Ghostty's public headless VT library from the same revision as
 the renderer. Both retain Ghostty's MIT license (`vendor/GHOSTTY-LICENSE`).

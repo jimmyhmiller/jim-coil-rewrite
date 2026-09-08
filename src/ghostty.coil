@@ -1,6 +1,7 @@
 (module jim.ghostty)
+(import "coil.primitive" :as p)
 
-;;; Audited subset of vendor/ghostty.h. tests/abi.c checks this boundary.
+;;; Audited subset of vendor/ghostty.h. Compile-time assertions below check this boundary.
 (defstruct SurfaceConfig
   [(platform-tag i32)
    (view (ptr i8))
@@ -37,6 +38,38 @@
    (confirm (ptr i8))
    (write (ptr i8))
    (close (ptr i8))])
+
+(static-assert (= (p/sizeof SurfaceConfig) 88) "Ghostty surface config ABI size")
+
+(static-assert (= (p/alignof SurfaceConfig) 8) "Ghostty surface config ABI alignment")
+
+(static-assert (= (p/offsetof SurfaceConfig platform-tag) 0) "Ghostty platform tag offset")
+
+(static-assert (= (p/offsetof SurfaceConfig view) 8) "Ghostty platform payload offset")
+
+(static-assert (= (p/offsetof SurfaceConfig userdata) 16) "Ghostty userdata offset")
+
+(static-assert (= (p/offsetof SurfaceConfig scale) 24) "Ghostty scale offset")
+
+(static-assert (= (p/offsetof SurfaceConfig cwd) 40) "Ghostty cwd offset")
+
+(static-assert (= (p/offsetof SurfaceConfig context) 84) "Ghostty context offset")
+
+(static-assert (= (p/sizeof Key) 32) "Ghostty key ABI size")
+
+(static-assert (= (p/offsetof Key text) 16) "Ghostty key text offset")
+
+(static-assert (= (p/offsetof Key composing) 28) "Ghostty key composing offset")
+
+(static-assert (= (p/sizeof Runtime) 64) "Ghostty runtime ABI size")
+
+(static-assert (= (p/offsetof Runtime wakeup) 16) "Ghostty wakeup callback offset")
+
+(static-assert (= (p/sizeof Target) 16) "Ghostty target ABI size")
+
+(static-assert (= (p/sizeof Action) 32) "Ghostty action ABI size")
+
+(static-assert (= (p/alignof Action) 8) "Ghostty action ABI alignment")
 
 (defstruct ClipboardContent [(mime (ptr i8)) (data (ptr i8))])
 
