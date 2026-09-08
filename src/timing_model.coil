@@ -1,7 +1,14 @@
 (module jim.timing-model)
 (import "coil.primitive" :as p)
 
-(defstruct Sample [(interval f64) (budget f64) (input f64) (maintenance f64) (windows f64) (ghostty f64) (overlay f64)])
+(defstruct Sample
+  [(interval f64)
+   (budget f64)
+   (input f64)
+   (maintenance f64)
+   (windows f64)
+   (ghostty f64)
+   (overlay f64)])
 
 (defstruct History [(samples (array Sample 120)) (count i64) (next i64)])
 
@@ -39,23 +46,32 @@
               (mut at) i]
           (do
             (store! sum (+ (load sum) (.interval s)))
-            (if (> (.interval s) (* 1.5 (.budget s))) (store! late (+ (load late) 1)) 0)
+            (if (> (.interval s) (* 1.5 (.budget s)))
+                (store! late (+ (load late) 1))
+                0)
             (store! input (+ (load input) (.input s)))
             (store! maintenance (+ (load maintenance) (.maintenance s)))
             (store! windows (+ (load windows) (.windows s)))
             (store! ghostty (+ (load ghostty) (.ghostty s)))
             (store! overlay (+ (load overlay) (.overlay s)))
-            (while (and (> (load at) 0) (> (load (p/index sorted (- (load at) 1))) (.interval s)))
+            (while (and (> (load at) 0)
+                        (> (load (p/index sorted (- (load at) 1)))
+                           (.interval s)))
               (do
-                (store! (p/index sorted (load at)) (load (p/index sorted (- (load at) 1))))
+                (store! (p/index sorted (load at))
+                        (load (p/index sorted (- (load at) 1))))
                 (store! at (- (load at) 1))))
             (store! (p/index sorted (load at)) (.interval s)))))
       (let [n (p/cast f64 (if (> (.count h) 0) (.count h) 1))]
         (Summary
           :hz (if (> (load sum) 0.0) (/ (* n 1000.0) (load sum)) 0.0)
           :mean (/ (load sum) n)
-          :p95 (if (> (.count h) 0) (load (p/index sorted (- (/ (+ (* (.count h) 95) 99) 100) 1))) 0.0)
-          :maximum (if (> (.count h) 0) (load (p/index sorted (- (.count h) 1))) 0.0)
+          :p95
+            (if (> (.count h) 0)
+                (load (p/index sorted (- (/ (+ (* (.count h) 95) 99) 100) 1)))
+                0.0)
+          :maximum
+            (if (> (.count h) 0) (load (p/index sorted (- (.count h) 1))) 0.0)
           :late (load late)
           :input (/ (load input) n)
           :maintenance (/ (load maintenance) n)

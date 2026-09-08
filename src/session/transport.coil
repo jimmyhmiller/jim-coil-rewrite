@@ -59,7 +59,8 @@
 
 (static-assert (= (p/sizeof SockaddrUn) 106) "Darwin sockaddr_un ABI size")
 
-(static-assert (= (p/offsetof SockaddrUn path) 2) "Darwin sockaddr_un path offset")
+(static-assert (= (p/offsetof SockaddrUn path) 2)
+               "Darwin sockaddr_un path offset")
 
 (extern socket :cc c [i32 i32 i32] (-> i32))
 
@@ -89,7 +90,11 @@
 
 (extern waitpid :cc c [i32 (ptr i32) i32] (-> i32))
 
-(extern posix_spawn :cc c [(ptr i32) (ptr i8) (ptr i8) (ptr i8) (ptr (ptr i8)) (ptr (ptr i8))] (-> i32))
+(extern posix_spawn
+        :cc
+        c
+        [(ptr i32) (ptr i8) (ptr i8) (ptr i8) (ptr (ptr i8)) (ptr (ptr i8))]
+        (-> i32))
 
 (extern posix_spawnattr_init :cc c [(ptr (ptr i8))] (-> i32))
 
@@ -132,8 +137,14 @@
                        (break (p/cast i32 0))
                        (let [n
                                (if sending
-                                   (send fd (p/index data (load at)) (p/cast isize (- length (load at))) 0)
-                                   (recv fd (p/index data (load at)) (p/cast isize (- length (load at))) 0))]
+                                   (send fd
+                                         (p/index data (load at))
+                                         (p/cast isize (- length (load at)))
+                                         0)
+                                   (recv fd
+                                         (p/index data (load at))
+                                         (p/cast isize (- length (load at)))
+                                         0))]
                          (if (and (< n 0) (= (os/os-errno) EINTR))
                              0
                              (if (<= n 0)
@@ -153,7 +164,10 @@
             (p/cast i32 -1)
             (transfer fd bytes length true)))))
 
-(defn session-receive [(fd i32) (kind (ptr u32)) (bytes (ptr i8)) (capacity i64)] (-> i32)
+(defn session-receive [(fd i32)
+                       (kind (ptr u32))
+                       (bytes (ptr i8))
+                       (capacity i64)] (-> i32)
   (let [header (p/alloc-stack (array i8 12))
         input (p/cast (ptr i8) header)]
     (if (< (transfer fd input 12 false) 0)
@@ -165,7 +179,9 @@
               (do (set-errno! EPROTO) (p/cast i32 -1))
               (do
                 (set! (p/index kind 0) (u32-be input 4))
-                (if (< (transfer fd bytes length false) 0) (p/cast i32 -1) (p/cast i32 length))))))))
+                (if (< (transfer fd bytes length false) 0)
+                    (p/cast i32 -1)
+                    (p/cast i32 length))))))))
 
 (defn session-connect [(path (ptr i8))] (-> i32)
   (let [address (p/alloc-stack SockaddrUn)
@@ -176,19 +192,27 @@
           (set! address (p/zeroed SockaddrUn))
           (set! (.length address) (p/cast u8 106))
           (set! (.family address) (p/cast u8 AF-UNIX))
-          (memcpy (p/cast (ptr i8) (p/index (field address path) 0)) path (p/cast isize (+ path-length 1)))
+          (memcpy (p/cast (ptr i8) (p/index (field address path) 0))
+                  path
+                  (p/cast isize (+ path-length 1)))
           (let [fd (socket AF-UNIX SOCK-STREAM 0)]
             (if (< fd 0)
                 fd
                 (let [yes (p/alloc-stack i32)]
                   (set! yes 1)
                   (fcntl fd F-SETFD FD-CLOEXEC)
-                  (setsockopt fd SOL-SOCKET SO-NOSIGPIPE (p/cast (ptr i8) yes) (p/cast u32 4))
-                  (if (< (connect fd (p/cast (ptr i8) address) (p/cast u32 106)) 0)
+                  (setsockopt fd
+                              SOL-SOCKET
+                              SO-NOSIGPIPE
+                              (p/cast (ptr i8) yes)
+                              (p/cast u32 4))
+                  (if (< (connect fd (p/cast (ptr i8) address) (p/cast u32 106))
+                         0)
                       (do (close fd) (p/cast i32 -1))
                       (let [uid (p/alloc-stack u32)
                             gid (p/alloc-stack u32)]
-                        (if (or (< (getpeereid fd uid gid) 0) (!= (load uid) (getuid)))
+                        (if (or (< (getpeereid fd uid gid) 0)
+                                (!= (load uid) (getuid)))
                             (do (close fd) (set-errno! EACCES) (p/cast i32 -1))
                             fd))))))))))
 
@@ -204,7 +228,10 @@
 
 (defstruct Timespec [(seconds i64) (nanoseconds i64)])
 
-(defn session-open [(executable (ptr i8)) (path (ptr i8)) (cwd (ptr i8)) (resources (ptr i8))] (-> i32)
+(defn session-open [(executable (ptr i8))
+                    (path (ptr i8))
+                    (cwd (ptr i8))
+                    (resources (ptr i8))] (-> i32)
   (let [existing (session-connect path)]
     (if (>= existing 0)
         (attach existing)
@@ -221,7 +248,10 @@
                     (set! (p/index argv 2) cwd)
                     (set! (p/index argv 3) resources)
                     (set! (p/index argv 4) (p/cast (ptr i8) 0))
-                    (let [flags-error (posix_spawnattr_setflags attributes (p/cast i16 POSIX-SPAWN-CLOEXEC-DEFAULT))
+                    (let [flags-error
+                            (posix_spawnattr_setflags attributes
+                                                      (p/cast i16
+                                                              POSIX-SPAWN-CLOEXEC-DEFAULT))
                           spawn-error
                             (if (= flags-error 0)
                                 (posix_spawn pid
@@ -235,28 +265,41 @@
                       (if (!= spawn-error (p/cast i32 0))
                           (do (set-errno! spawn-error) (p/cast i32 -1))
                           (do
-                            (loop (if (>= (waitpid (load pid) (p/cast (ptr i32) 0) 0) 0)
+                            (loop (if (>= (waitpid (load pid)
+                                                   (p/cast (ptr i32) 0)
+                                                   0)
+                                          0)
                                       (break (p/cast i32 0))
-                                      (if (!= (os/os-errno) EINTR) (break (p/cast i32 0)) (p/cast i32 0))))
+                                      (if (!= (os/os-errno) EINTR)
+                                          (break (p/cast i32 0))
+                                          (p/cast i32 0))))
                             (let [(mut attempts) 0
                                   delay (p/alloc-stack Timespec)]
-                              (set! delay (Timespec :seconds 0 :nanoseconds 10000000))
+                              (set! delay
+                                    (Timespec :seconds 0 :nanoseconds 10000000))
                               (block :connected
                                        (loop (if (>= (load attempts) 200)
                                                  (break (p/cast i32 0))
                                                  (let [fd (session-connect path)]
                                                    (if (>= fd 0)
-                                                       (return-from :connected (attach fd))
+                                                       (return-from :connected
+                                                                      (attach fd))
                                                        (do
-                                                         (nanosleep (p/cast (ptr i8) delay) (p/cast (ptr i8) 0))
-                                                         (set! attempts (+ (load attempts) 1))))))
+                                                         (nanosleep (p/cast (ptr i8)
+                                                                            delay)
+                                                                    (p/cast (ptr i8)
+                                                                            0))
+                                                         (set! attempts
+                                                               (+ (load attempts)
+                                                                  1))))))
                                          (p/cast i32 -1))))))))))))))
 
 (defn session-kill [(path (ptr i8))] (-> i32)
   (let [fd (session-connect path)]
     (if (< fd 0)
         (if (= (os/os-errno) ENOENT) (p/cast i32 0) (p/cast i32 -1))
-        (let [result (session-send fd (p/cast u32 JIM-KILL) (p/cast (ptr i8) 0) 0)]
+        (let [result
+                (session-send fd (p/cast u32 JIM-KILL) (p/cast (ptr i8) 0) 0)]
           (close fd)
           result))))
 

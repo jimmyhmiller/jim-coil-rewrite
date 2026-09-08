@@ -49,7 +49,8 @@
                second (projects/new-project! root (ns c"Two"))]
            (s/put! first c"layout" (ns c"retained"))
            (projects/reorder! root (projects/id second) (projects/id first))
-           (assert (= (projects/id (s/at (projects/list root) 0)) (projects/id second)))
+           (assert (= (projects/id (s/at (projects/list root) 0))
+                      (projects/id second)))
            (assert (!= (msg i8
                             (s/get (s/at (projects/list root) 1) c"layout")
                             (sel c"isEqualToString:")

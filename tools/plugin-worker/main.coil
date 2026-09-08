@@ -1,0 +1,41 @@
+(module atelier.plugin-worker)
+(import "coil.alloc" :as alloc)
+(import "coil.fs" :as fs)
+(import "coil.str" :as str)
+(import "coil.result" :use *)
+(import "coil.jit" :as jit)
+(import "coil.primitive" :as p)
+
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+(extern fflush :cc c [(ptr i8)] (-> i32))
+
+;;; A deliberately small, versioned boundary: native plugin code cannot draw
+;;; into the UI process. The host only accepts a successfully completed result.
+(defn emit [(value i64)] (-> i64)
+  (printf c"ATELIER/1 %lld\n" value)
+  (fflush (p/cast (ptr i8) 0))
+  0)
+
+(export-c [emit :as "atelier_plugin_emit"])
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  ; Keep the public callback reachable for the embedded compiler's lookup.
+  (let [callback (p/fnptr-of emit)]
+    (when (= (p/cast (ptr i8) callback) (p/cast (ptr i8) 0))
+      (printf c"missing callback\n")))
+  (if (!= argc (p/cast i32 2))
+      2
+      (try (let [source
+                   (try-or! (fs/read-file (alloc/malloc-allocator)
+                                          (str/cstr->str (load (p/index argv 1))))
+                            2)]
+             (let [(mut session) (jit/jit-session-new (alloc/malloc-allocator))]
+               (if (!= (jit/jit-replace-source! (mut session) source) 0)
+                   1
+                   (if (!= (jit/jit-submit! (mut session)
+                                            "(extern atelier_plugin_emit :cc c [i64] (-> i64))")
+                           0)
+                       1
+                       (jit/jit-submit! (mut session)
+                                        "(atelier_plugin_emit (specimen))"))))))))

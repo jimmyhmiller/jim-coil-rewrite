@@ -1,0 +1,27 @@
+(module jim.atelier-icon)
+(import "paper.flow" :use *)
+(import "paper.platform" :as host)
+(import "jim.atelier-ui" :as ui)
+(import "coil.primitive" :as p)
+
+(defn draw [] (-> i64)
+  (host/paper_begin 0x69725e)
+  (panel (rect 0.0 0.0 512.0 512.0) 80.0 3.0 (felt 0x69725e))
+  (panel (rect 72.0 70.0 371.0 391.0) 12.0 10.0 (kraft 0xb49a74))
+  (panel (rect 58.0 53.0 375.0 394.0) 10.0 16.0 (laid-paper 0xe8ddc3))
+  (panel (rect 58.0 53.0 12.0 394.0) 2.0 20.0 (leather 0xa65b42))
+  (label 92.0 78.0 55.0 0x46513c 1 c"jim")
+  (label 235.0 113.0 12.0 0x7d785f 2 c"ATELIER")
+  (rule 96.0 166.0 301.0 0xbab398)
+  (with-elevation 9.0 (ui/rosette 255.0 293.0 105.0 9 false))
+  0)
+
+(defn event [(kind i64) (id i64) (x f64) (y f64)] (-> i64)
+  0)
+
+(defn main [] (-> i64)
+  (host/paper_configure c"Jim Atelier icon" 512.0 512.0)
+  (host/paper_run (p/fnptr-of draw) (p/fnptr-of event)))
+
+(export-c [draw :as "jim_atelier_icon_draw"]
+          [event :as "jim_atelier_icon_event"])

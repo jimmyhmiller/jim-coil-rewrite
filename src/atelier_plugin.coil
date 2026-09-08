@@ -1,0 +1,205 @@
+(module jim.atelier-plugin)
+(import "jim.native" :use *)
+(import "jim.storage" :as storage)
+(import "coil.primitive" :as p)
+
+(extern kill :cc c [i32 i32] (-> i32))
+
+(extern CACurrentMediaTime :cc c [] (-> f64))
+
+(defstruct Plugin
+  [(task (ptr i8))
+   (output (ptr i8))
+   (stamp f64)
+   (started f64)
+   (phase i64)
+   (generation i64)
+   (value i64)
+   (paused bool)
+   (diagnostic (ptr i8))])
+
+(defn state [] (-> (ptr Plugin))
+  (p/alloc-static Plugin))
+
+(defn path [] (-> (ptr i8))
+  (ns (if (= (getenv c"JIM_ATELIER_PLUGIN") (nil))
+          c"plugins/rosette.coil"
+          (getenv c"JIM_ATELIER_PLUGIN"))))
+
+(defn modified [] (-> f64)
+  (let [attrs
+          (msg (ptr i8)
+               (msg (ptr i8)
+                    (class c"NSFileManager")
+                    (sel c"defaultManager")
+                    [])
+               (sel c"attributesOfItemAtPath:error:")
+               [(ptr i8) (ptr i8)]
+               (path)
+               (nil))]
+    (msg f64
+         (storage/get attrs c"NSFileModificationDate")
+         (sel c"timeIntervalSince1970")
+         [])))
+
+(defn message! [(text (ptr i8))] (-> void)
+  (release (.diagnostic (state)))
+  (set! (.diagnostic (state)) (msg (ptr i8) text (sel c"copy") [])))
+
+(defn initialize! [] (-> void)
+  (set! (.value (state)) 12)
+  (message! (ns c"Open the workshop to compile your first specimen.")))
+
+(defn launch! [] (-> void)
+  (let [s (state)]
+    (when (and (= (.task s) (nil)) (not (.paused s)))
+      (let [task (new c"NSTask")
+            manager
+              (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+            base (msg (ptr i8) manager (sel c"currentDirectoryPath") [])
+            output (ns c"build/atelier-plugin.log")
+            error (p/alloc-stack (ptr i8))]
+        (set! error (nil))
+        (msg bool
+             manager
+             (sel c"createFileAtPath:contents:attributes:")
+             [(ptr i8) (ptr i8) (ptr i8)]
+             output
+             (nil)
+             (nil))
+        (let [handle
+                (msg (ptr i8)
+                     (class c"NSFileHandle")
+                     (sel c"fileHandleForWritingAtPath:")
+                     [(ptr i8)]
+                     output)]
+          (msg i64
+               task
+               (sel c"setLaunchPath:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    base
+                    (sel c"stringByAppendingPathComponent:")
+                    [(ptr i8)]
+                    (ns c"build/atelier-plugin-worker")))
+          (msg i64
+               task
+               (sel c"setArguments:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (class c"NSArray")
+                    (sel c"arrayWithObject:")
+                    [(ptr i8)]
+                    (path)))
+          (msg i64 task (sel c"setStandardOutput:") [(ptr i8)] handle)
+          (msg i64 task (sel c"setStandardError:") [(ptr i8)] handle)
+          (set! (.stamp s) (modified))
+          (if (msg bool
+                   task
+                   (sel c"launchAndReturnError:")
+                   [(ptr (ptr i8))]
+                   error)
+              (do
+                (set! (.task s) task)
+                (set! (.phase s) 1)
+                (set! (.started s) (CACurrentMediaTime))
+                (message! (ns c"Compiling in the isolated Coil JIT worker…")))
+              (do
+                (set! (.phase s) 3)
+                (message! (msg (ptr i8)
+                               (load error)
+                               (sel c"localizedDescription")
+                               []))
+                (release task)
+                (do)))
+          (msg i64 handle (sel c"closeFile") []))))))
+
+;;; Complete first, validate the protocol, then publish. Failed generations
+;;; retain the previous specimen. Diagnostics remain available in the log.
+(defn poll! [] (-> bool)
+  (let [s (state)
+        task (.task s)]
+    (if (= task (nil))
+        false
+        (if (msg bool task (sel c"isRunning") [])
+            (do
+              (when (and (not (.paused s))
+                         (> (- (CACurrentMediaTime) (.started s)) 30.0))
+                (kill (msg i32 task (sel c"processIdentifier") [])
+                      (p/cast i32 9))
+                (message! (ns c"Worker exceeded 30 seconds. Previous specimen retained."))
+                0)
+              false)
+            (let [text
+                    (msg (ptr i8)
+                         (class c"NSString")
+                         (sel c"stringWithContentsOfFile:encoding:error:")
+                         [(ptr i8) u64 (ptr i8)]
+                         (ns c"build/atelier-plugin.log")
+                         4
+                         (nil))
+                  lines
+                    (msg (ptr i8)
+                         text
+                         (sel c"componentsSeparatedByString:")
+                         [(ptr i8)]
+                         (ns c"\n"))
+                  (mut accepted) false]
+              (when (= (msg i32 task (sel c"terminationStatus") [])
+                       (p/cast i32 0))
+                (for [i 0 (storage/count lines)]
+                  (let [line (storage/at lines i)]
+                    (when (msg bool
+                               line
+                               (sel c"hasPrefix:")
+                               [(ptr i8)]
+                               (ns c"ATELIER/1 "))
+                      (let [scanner
+                              (msg (ptr i8)
+                                   (class c"NSScanner")
+                                   (sel c"scannerWithString:")
+                                   [(ptr i8)]
+                                   (msg (ptr i8)
+                                        line
+                                        (sel c"substringFromIndex:")
+                                        [u64]
+                                        10))
+                            value (p/alloc-stack i64)]
+                        (set! value 0)
+                        (when (and (msg bool
+                                        scanner
+                                        (sel c"scanLongLong:")
+                                        [(ptr i64)]
+                                        value)
+                                   (msg bool scanner (sel c"isAtEnd") [])
+                                   (>= (load value) 3)
+                                   (<= (load value) 24))
+                          (set! (.value s) (load value))
+                          (set! accepted true)))))))
+              (set! (.phase s) (if (load accepted) 2 3))
+              (if (load accepted)
+                  (do
+                    (set! (.generation s) (+ (.generation s) 1))
+                    (message! (ns c"Published. Save the source to grow a different specimen.")))
+                  (message! (ns c"Generation rejected. The last good specimen is still here. Open the diagnostic log for details.")))
+              (release task)
+              (set! (.task s) (nil))
+              true)))))
+
+(defn pause! [] (-> void)
+  (let [s (state)]
+    (set! (.paused s) (not (.paused s)))
+    (when (!= (.task s) (nil))
+      (when (msg bool (.task s) (sel c"isRunning") [])
+        (kill (msg i32 (.task s) (sel c"processIdentifier") [])
+              (p/cast i32 (if (.paused s) 17 19)))
+        (when (not (.paused s)) (set! (.started s) (CACurrentMediaTime)))))))
+
+(defn stop! [] (-> void)
+  (let [task (.task (state))]
+    (when (!= task (nil))
+      (when (msg bool task (sel c"isRunning") [])
+        (kill (msg i32 task (sel c"processIdentifier") []) (p/cast i32 9)))
+      (msg i64 task (sel c"waitUntilExit") [])
+      (release task)
+      (set! (.task (state)) (nil)))))

@@ -1,0 +1,201 @@
+(module jim.atelier-host)
+(import "paper.platform" :as h)
+(import "paper.scene" :as scene)
+(import "paper.render" :as render)
+(import "paper.gpu" :as gpu)
+(import "paper.workers" :as workers)
+(import "paper.frame-clock" :as clock)
+(import "paper.ffi" :as ffi)
+(import "jim.native" :use *)
+(import "jim.storage" :as storage)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+;;; Menu/Dock Quit must return through Jim's teardown, including a paused worker.
+(defn should-terminate [(self (ptr i8)) (selector (ptr i8)) (sender (ptr i8))] (-> u64)
+  (msg i64 (.window (h/host)) (sel c"close") [])
+  0)
+
+(export-c [should-terminate :as "jim_atelier_should_terminate"])
+
+(defn delegate [] (-> (ptr i8))
+  (let [cls (objc_allocateClassPair (class c"NSObject") c"JimAtelierDelegate" 0)]
+    (method! cls
+             c"applicationShouldTerminate:"
+             (p/cast (ptr i8) (p/fnptr-of should-terminate))
+             c"Q@:@")
+    (objc_registerClassPair cls)
+    (new c"JimAtelierDelegate")))
+
+;;; Jim owns event arbitration because native terminal responders must receive
+;;; Tab, Return, arrows, IME and wheel input before Paper navigation. Rendering,
+;;; text fields, accessibility and the display clock remain Paper's components.
+;;; Setup follows paper.platform at 76d08ed580018fc3710aabae1ceffad3d7280719.
+(defn run! [(draw (fnptr c [] i64))
+            (event (fnptr c [i64 i64 f64 f64] i64))
+            (native-event (fnptr c [(ptr i8)] bool))] (-> i64)
+  (let [app (h/host)
+        pool (new c"NSAutoreleasePool")]
+    (scene/init)
+    (set! (.draw app) draw)
+    (set! (.event app) event)
+    (set! (.inputs app) (al/al-new [h/Input] (alloc/malloc-allocator)))
+    (set! (.app app)
+          (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") []))
+    (let [args
+            (msg (ptr i8)
+                 (msg (ptr i8) (class c"NSProcessInfo") (sel c"processInfo") [])
+                 (sel c"arguments")
+                 [])
+          (mut i) 1]
+      (while (< (+ (load i) 1) (storage/count args))
+        (let [arg (utf8 (storage/at args (load i)))
+              value (storage/at args (+ (load i) 1))]
+          (cond (= (strcmp arg c"--snapshot") (p/cast i32 0))
+                  (do
+                    (set! (.headless app) true)
+                    (set! (.snapshot app) value)
+                    0)
+                (= (strcmp arg c"--app") (p/cast i32 0))
+                  (set! (.app-index app)
+                        (msg i64 value (sel c"integerValue") []))
+                :else 0))
+        (set! i (+ (load i) 2))))
+    (set! (.width (scene/scene)) (p/cast i64 (* (h/logical-width) 2.0)))
+    (set! (.height (scene/scene)) (p/cast i64 (* (h/logical-height) 2.0)))
+    (render/setup)
+    (h/dispatch 0 (.app-index app) 0.0 0.0)
+    (if (.headless app)
+        (do
+          (h/refresh)
+          (let [result (h/window-snapshot (utf8 (.snapshot app)))]
+            (workers/stop)
+            (release pool)
+            result))
+        (let [screen
+                (msg Rect
+                     (msg (ptr i8) (class c"NSScreen") (sel c"mainScreen") [])
+                     (sel c"visibleFrame")
+                     [])
+              sx (/ (- (.w screen) 60.0) (h/logical-width))
+              sy (/ (- (.h screen) 80.0) (h/logical-height))
+              scale (if (< sx sy) (if (< sx 1.0) sx 1.0) (if (< sy 1.0) sy 1.0))
+              w (* (h/logical-width) scale)
+              height (* (h/logical-height) scale)
+              window (h/create-window w height)
+              view (msg (ptr i8) window (sel c"contentView") [])
+              lifecycle (delegate)]
+          (msg i64 (.app app) (sel c"setDelegate:") [(ptr i8)] lifecycle)
+          (set! (.window app) window)
+          (set! (.view app) view)
+          (set! (.window-w app) w)
+          (set! (.window-h app) height)
+          (msg i64 window (sel c"setReleasedWhenClosed:") [bool] false)
+          (msg i64 window (sel c"setAcceptsMouseMovedEvents:") [bool] true)
+          (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns (.title app)))
+          (msg i64
+               window
+               (sel c"setContentAspectRatio:")
+               [Size]
+               (Size :w (h/logical-width) :h (h/logical-height)))
+          (msg i64
+               window
+               (sel c"setContentMinSize:")
+               [Size]
+               (Size :w 960.0 :h 600.0))
+          (msg i64 view (sel c"setWantsLayer:") [bool] true)
+          (msg i64
+               view
+               (sel c"setAppearance:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (class c"NSAppearance")
+                    (sel c"appearanceNamed:")
+                    [(ptr i8)]
+                    (ns c"NSAppearanceNameAqua")))
+          (set! (.layer app)
+                (if (.available (gpu/gpu))
+                    (gpu/create-layer view
+                                      w
+                                      height
+                                      (msg f64
+                                           window
+                                           (sel c"backingScaleFactor")
+                                           []))
+                    (layer view)))
+          (msg i64
+               (.layer app)
+               (sel c"setContentsGravity:")
+               [(ptr i8)]
+               (ns c"resize"))
+          (msg i64 (.app app) (sel c"setActivationPolicy:") [i64] 0)
+          (h/native-menus)
+          (msg i64 (.app app) (sel c"finishLaunching") [])
+          (msg i64 window (sel c"center") [])
+          (msg i64 window (sel c"makeKeyAndOrderFront:") [(ptr i8)] (nil))
+          (msg i64 (.app app) (sel c"activateIgnoringOtherApps:") [bool] true)
+          (h/accessibility-init)
+          (h/refresh)
+          (clock/start view (p/fnptr-of h/display-frame) (clock/preferred-rate))
+          (while (msg bool window (sel c"isVisible") [])
+            (let [iteration (new c"NSAutoreleasePool")
+                  deadline
+                    (msg (ptr i8)
+                         (class c"NSDate")
+                         (sel c"dateWithTimeIntervalSinceNow:")
+                         [f64]
+                         (/ 1.0 120.0))
+                  ev
+                    (msg (ptr i8)
+                         (.app app)
+                         (sel c"nextEventMatchingMask:untilDate:inMode:dequeue:")
+                         [u64 (ptr i8) (ptr i8) bool]
+                         (p/cast u64 -1)
+                         deadline
+                         (ns c"kCFRunLoopDefaultMode")
+                         true)]
+              (when (and (!= ev (nil)) (not (p/call-ptr native-event ev)))
+                (let [kind (msg i64 ev (sel c"type") [])
+                      (mut consumed) false]
+                  (cond (= kind 1)
+                          (if (h/begin-window-drag ev)
+                              (do (set! consumed true) 0)
+                              (h/pointer-event ev 1))
+                        (= kind 6) (h/pointer-event ev 2)
+                        (= kind 2)
+                          (do (h/pointer-event ev 3) (h/dispatch 8 0 0.0 0.0))
+                        (= kind 10) (do (set! consumed (h/key-event ev)) 0)
+                        (= kind 22)
+                          (do (h/scroll-event ev) (set! consumed true) 0)
+                        :else 0)
+                  (when (not (load consumed))
+                    (msg i64 (.app app) (sel c"sendEvent:") [(ptr i8)] ev))))
+              (h/poll-inputs)
+              (h/poll-pointer)
+              (let [bounds (msg Rect view (sel c"bounds") [])
+                    now (ffi/CACurrentMediaTime)]
+                (when (or (p/fcmp-ne (.w bounds) (.window-w app))
+                          (p/fcmp-ne (.h bounds) (.window-h app)))
+                  (set! (.window-w app) (.w bounds))
+                  (set! (.window-h app) (.h bounds))
+                  (when (.available (gpu/gpu))
+                    (gpu/layer-size (.layer app)
+                                    (.w bounds)
+                                    (.h bounds)
+                                    (msg f64
+                                         window
+                                         (sel c"backingScaleFactor")
+                                         [])))
+                  (h/paper_redraw))
+                (when (>= (- now (.last-tick app)) (.tick-interval app))
+                  (set! (.last-tick app) now)
+                  (h/dispatch 6 0 now 0.0)))
+              (release iteration)))
+          (clock/stop)
+          (gpu/synchronize)
+          (workers/stop)
+          (msg i64 (.app app) (sel c"setDelegate:") [(ptr i8)] (nil))
+          (release lifecycle)
+          (release pool)
+          0))))

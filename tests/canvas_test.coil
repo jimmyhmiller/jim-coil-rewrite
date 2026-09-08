@@ -13,7 +13,8 @@
                    :zoom 0.5)
                pointer (Point :x 320.0 :y 220.0)
                before (model/screen-to-world c pointer)
-               after (model/screen-to-world (model/zoom-at c pointer 1.8) pointer)]
+               after
+                 (model/screen-to-world (model/zoom-at c pointer 1.8) pointer)]
            (assert (near? (.x before) (.x after)))
            (assert (near? (.y before) (.y after)))))
 
@@ -22,7 +23,8 @@
                anchor (Point :x 400.0 :y 300.0)
                zoomed (model/zoom-at c anchor 1000.0)]
            (assert (near? (.zoom zoomed) 4.0))
-           (let [world (model/screen-to-world zoomed anchor)] (assert (near? (.x world) 400.0)))))
+           (let [world (model/screen-to-world zoomed anchor)]
+             (assert (near? (.x world) 400.0)))))
 
 (deftest origin-inside-viewport-has-no-edge-shading
          (let [e

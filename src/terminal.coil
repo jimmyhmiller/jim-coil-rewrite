@@ -33,10 +33,16 @@
   (let [m (msg u64 event (sel c"modifierFlags") [])]
     (p/cast i32
             (| (| (>> (& m 131072) 17) (>> (& m 262144) 17))
-               (| (>> (& m 524288) 17) (| (>> (& m 1048576) 17) (>> (& m 65536) 12)))))))
+               (| (>> (& m 524288) 17)
+                  (| (>> (& m 1048576) 17) (>> (& m 65536) 12)))))))
 
 (defn string-value [(value (ptr i8))] (-> (ptr i8))
-  (if (!= (msg i8 value (sel c"isKindOfClass:") [(ptr i8)] (class c"NSAttributedString")) (p/cast i8 0))
+  (if (!= (msg i8
+               value
+               (sel c"isKindOfClass:")
+               [(ptr i8)]
+               (class c"NSAttributedString"))
+          (p/cast i8 0))
       (msg (ptr i8) value (sel c"string") [])
       value))
 
@@ -44,11 +50,14 @@
   (p/cast i8 1))
 
 (defn has-marked [(self (ptr i8)) (cmd (ptr i8))] (-> i8)
-  (p/cast i8 (if (> (msg u64 (.marked (terminal self)) (sel c"length") []) 0) 1 0)))
+  (p/cast i8
+          (if (> (msg u64 (.marked (terminal self)) (sel c"length") []) 0) 1 0)))
 
 (defn marked-range [(self (ptr i8)) (cmd (ptr i8))] (-> Range)
   (let [n (msg u64 (.marked (terminal self)) (sel c"length") [])]
-    (Range :location (if (> n 0) (p/cast u64 0) (p/cast u64 9223372036854775807)) :length n)))
+    (Range :location
+             (if (> n 0) (p/cast u64 0) (p/cast u64 9223372036854775807))
+      :length n)))
 
 (defn selected-range [(self (ptr i8)) (cmd (ptr i8))] (-> Range)
   (.selection (terminal self)))
@@ -58,16 +67,24 @@
     (msg i64 (.marked (terminal self)) (sel c"setString:") [(ptr i8)] (ns c""))
     (g/ghostty_surface_preedit (.surface (terminal self)) (nil) 0)))
 
-(defn insert [(self (ptr i8)) (cmd (ptr i8)) (value (ptr i8)) (replacement Range)] (-> void)
+(defn insert [(self (ptr i8))
+              (cmd (ptr i8))
+              (value (ptr i8))
+              (replacement Range)] (-> void)
   (let [t (terminal self)
         s (string-value value)]
     (do
       (unmark self cmd)
       (if (.in-key t)
           (msg i64 (.accum t) (sel c"appendString:") [(ptr i8)] s)
-          (let [bytes (utf8 s)] (g/ghostty_surface_text (.surface t) bytes (strlen bytes)))))))
+          (let [bytes (utf8 s)]
+            (g/ghostty_surface_text (.surface t) bytes (strlen bytes)))))))
 
-(defn set-marked [(self (ptr i8)) (cmd (ptr i8)) (value (ptr i8)) (selected Range) (replacement Range)] (-> void)
+(defn set-marked [(self (ptr i8))
+                  (cmd (ptr i8))
+                  (value (ptr i8))
+                  (selected Range)
+                  (replacement Range)] (-> void)
   (let [t (terminal self)
         s (string-value value)
         bytes (utf8 s)]
@@ -79,15 +96,22 @@
 (defn attributes [(self (ptr i8)) (cmd (ptr i8))] (-> (ptr i8))
   (msg (ptr i8) (class c"NSArray") (sel c"array") []))
 
-(defn substring [(self (ptr i8)) (cmd (ptr i8)) (range Range) (actual (ptr Range))] (-> (ptr i8))
+(defn substring [(self (ptr i8))
+                 (cmd (ptr i8))
+                 (range Range)
+                 (actual (ptr Range))] (-> (ptr i8))
   (let [s (.marked (terminal self))
         n (msg u64 s (sel c"length") [])]
-    (if (and (<= (.location range) n) (<= (.length range) (- n (.location range))))
+    (if (and (<= (.location range) n)
+             (<= (.length range) (- n (.location range))))
         (do
           (if (!= (p/cast i64 actual) 0) (set! actual range) 0)
           (msg (ptr i8)
                (msg (ptr i8)
-                    (msg (ptr i8) (class c"NSAttributedString") (sel c"alloc") [])
+                    (msg (ptr i8)
+                         (class c"NSAttributedString")
+                         (sel c"alloc")
+                         [])
                     (sel c"initWithString:")
                     [(ptr i8)]
                     (msg (ptr i8) s (sel c"substringWithRange:") [Range] range))
@@ -98,7 +122,10 @@
 (defn character-index [(self (ptr i8)) (cmd (ptr i8)) (point Point)] (-> u64)
   0)
 
-(defn first-rect [(self (ptr i8)) (cmd (ptr i8)) (range Range) (actual (ptr Range))] (-> Rect)
+(defn first-rect [(self (ptr i8))
+                  (cmd (ptr i8))
+                  (range Range)
+                  (actual (ptr Range))] (-> Rect)
   (let [(mut x) 0.0
         (mut y) 0.0
         (mut w) 0.0
@@ -115,7 +142,10 @@
                 self
                 (sel c"convertRect:toView:")
                 [Rect (ptr i8)]
-                (rect (load x) (- (.h bounds) (+ (load y) (load h))) (load w) (load h))
+                (rect (load x)
+                      (- (.h bounds) (+ (load y) (load h)))
+                      (load w)
+                      (load h))
                 (nil))))))
 
 (defn command [(self (ptr i8)) (cmd (ptr i8)) (selector (ptr i8))] (-> void)
@@ -131,7 +161,8 @@
       (set! (.mods key) (mods event))
       (set! (.keycode key) (p/cast u32 (msg u16 event (sel c"keyCode") [])))
       (if (> (msg u64 raw (sel c"length") []) 0)
-          (set! (.unshifted key) (p/cast u32 (msg u16 raw (sel c"characterAtIndex:") [u64] 0)))
+          (set! (.unshifted key)
+                (p/cast u32 (msg u16 raw (sel c"characterAtIndex:") [u64] 0)))
           0)
       (if (!= action (p/cast i32 0))
           (do
@@ -141,19 +172,31 @@
                  self
                  (sel c"interpretKeyEvents:")
                  [(ptr i8)]
-                 (msg (ptr i8) (class c"NSArray") (sel c"arrayWithObject:") [(ptr i8)] event))
+                 (msg (ptr i8)
+                      (class c"NSArray")
+                      (sel c"arrayWithObject:")
+                      [(ptr i8)]
+                      event))
             (set! (.in-key t) false)
             (if (> (msg u64 (.accum t) (sel c"length") []) 0)
                 (do
                   (set! (.text key) (utf8 (.accum t)))
                   ; A committed IME string has no physical modifier semantics.
-                  (if before (do (set! (.mods key) 0) (set! (.keycode key) 0) (set! (.unshifted key) 0)) 0))
-                (set! (.composing key) (or before (!= (has-marked self (nil)) (p/cast i8 0))))))
+                  (if before
+                      (do
+                        (set! (.mods key) 0)
+                        (set! (.keycode key) 0)
+                        (set! (.unshifted key) 0))
+                      0))
+                (set! (.composing key)
+                      (or before (!= (has-marked self (nil)) (p/cast i8 0))))))
           0)
       (g/ghostty_surface_key (.surface t) (load key)))))
 
 (defn key-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
-  (key-event self event (if (!= (msg i8 event (sel c"isARepeat") []) (p/cast i8 0)) 2 1)))
+  (key-event self
+             event
+             (if (!= (msg i8 event (sel c"isARepeat") []) (p/cast i8 0)) 2 1)))
 
 (defn key-up [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
   (key-event self event 0))
@@ -167,15 +210,27 @@
                (msg Point event (sel c"locationInWindow") [])
                (nil))
         bounds (msg Rect self (sel c"bounds") [])]
-    (g/ghostty_surface_mouse_pos (.surface (terminal self)) (.x pt) (- (.h bounds) (.y pt)) (mods event))))
+    (g/ghostty_surface_mouse_pos (.surface (terminal self))
+                                 (.x pt)
+                                 (- (.h bounds) (.y pt))
+                                 (mods event))))
 
 (defn mouse-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
   (do
-    (msg i8 (msg (ptr i8) self (sel c"window") []) (sel c"makeFirstResponder:") [(ptr i8)] self)
+    (msg i8
+         (msg (ptr i8) self (sel c"window") [])
+         (sel c"makeFirstResponder:")
+         [(ptr i8)]
+         self)
     (mouse-position! self event)
     (g/ghostty_surface_mouse_button (.surface (terminal self))
                                     1
-                                    (p/cast i32 (+ 1 (msg i64 event (sel c"buttonNumber") [])))
+                                    (p/cast i32
+                                            (+ 1
+                                               (msg i64
+                                                    event
+                                                    (sel c"buttonNumber")
+                                                    [])))
                                     (mods event))))
 
 (defn mouse-up [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
@@ -183,7 +238,12 @@
     (mouse-position! self event)
     (g/ghostty_surface_mouse_button (.surface (terminal self))
                                     0
-                                    (p/cast i32 (+ 1 (msg i64 event (sel c"buttonNumber") [])))
+                                    (p/cast i32
+                                            (+ 1
+                                               (msg i64
+                                                    event
+                                                    (sel c"buttonNumber")
+                                                    [])))
                                     (mods event))))
 
 (defn mouse-move [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
@@ -195,19 +255,33 @@
     (g/ghostty_surface_mouse_scroll (.surface (terminal self))
                                     (msg f64 event (sel c"scrollingDeltaX") [])
                                     (msg f64 event (sel c"scrollingDeltaY") [])
-                                    (if (!= (msg i8 event (sel c"hasPreciseScrollingDeltas") []) (p/cast i8 0)) 1 0))))
+                                    (if (!= (msg i8
+                                                 event
+                                                 (sel c"hasPreciseScrollingDeltas")
+                                                 [])
+                                            (p/cast i8 0))
+                                        1
+                                        0))))
 
 (defn focus-in [(self (ptr i8)) (cmd (ptr i8))] (-> i8)
-  (do (g/ghostty_surface_set_focus (.surface (terminal self)) true) (p/cast i8 1)))
+  (do
+    (g/ghostty_surface_set_focus (.surface (terminal self)) true)
+    (p/cast i8 1)))
 
 (defn focus-out [(self (ptr i8)) (cmd (ptr i8))] (-> i8)
-  (do (g/ghostty_surface_set_focus (.surface (terminal self)) false) (p/cast i8 1)))
+  (do
+    (g/ghostty_surface_set_focus (.surface (terminal self)) false)
+    (p/cast i8 1)))
 
 (defn copy [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
-  (g/ghostty_surface_binding_action (.surface (terminal self)) c"copy_to_clipboard" 17))
+  (g/ghostty_surface_binding_action (.surface (terminal self))
+                                    c"copy_to_clipboard"
+                                    17))
 
 (defn paste [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
-  (g/ghostty_surface_binding_action (.surface (terminal self)) c"paste_from_clipboard" 20))
+  (g/ghostty_surface_binding_action (.surface (terminal self))
+                                    c"paste_from_clipboard"
+                                    20))
 
 (defn select-all [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
   (g/ghostty_surface_binding_action (.surface (terminal self)) c"select_all" 10))
@@ -236,26 +310,58 @@
     (if (and (!= (p/cast i64 t) 0)
              (!= (p/cast i64 (.surface t)) 0)
              (g/ghostty_surface_read_text (.surface t) selection text))
-        (let [value (ns (.text text))] (do (g/ghostty_surface_free_text (.surface t) text) value))
+        (let [value (ns (.text text))]
+          (do (g/ghostty_surface_free_text (.surface t) text) value))
         (ns c""))))
 
 (defn view-class [] (-> (ptr i8))
   (let [existing (class c"JimTerminalView")]
     (if (!= (p/cast i64 existing) 0)
         existing
-        (let [cls (objc_allocateClassPair (class c"NSView") c"JimTerminalView" 0)]
+        (let [cls
+                (objc_allocateClassPair (class c"NSView") c"JimTerminalView" 0)]
           (do
             (class_addProtocol cls (objc_getProtocol c"NSTextInputClient"))
-            (method! cls c"isAccessibilityElement" (p/cast (ptr i8) (p/fnptr-of accepts)) c"c@:")
-            (method! cls c"accessibilityRole" (p/cast (ptr i8) (p/fnptr-of accessibility-role)) c"@@:")
-            (method! cls c"accessibilityValue" (p/cast (ptr i8) (p/fnptr-of accessibility-value)) c"@@:")
-            (method! cls c"acceptsFirstResponder" (p/cast (ptr i8) (p/fnptr-of accepts)) c"c@:")
-            (method! cls c"becomeFirstResponder" (p/cast (ptr i8) (p/fnptr-of focus-in)) c"c@:")
-            (method! cls c"resignFirstResponder" (p/cast (ptr i8) (p/fnptr-of focus-out)) c"c@:")
-            (method! cls c"hasMarkedText" (p/cast (ptr i8) (p/fnptr-of has-marked)) c"c@:")
-            (method! cls c"markedRange" (p/cast (ptr i8) (p/fnptr-of marked-range)) c"{_NSRange=QQ}@:")
-            (method! cls c"selectedRange" (p/cast (ptr i8) (p/fnptr-of selected-range)) c"{_NSRange=QQ}@:")
-            (method! cls c"unmarkText" (p/cast (ptr i8) (p/fnptr-of unmark)) c"v@:")
+            (method! cls
+                     c"isAccessibilityElement"
+                     (p/cast (ptr i8) (p/fnptr-of accepts))
+                     c"c@:")
+            (method! cls
+                     c"accessibilityRole"
+                     (p/cast (ptr i8) (p/fnptr-of accessibility-role))
+                     c"@@:")
+            (method! cls
+                     c"accessibilityValue"
+                     (p/cast (ptr i8) (p/fnptr-of accessibility-value))
+                     c"@@:")
+            (method! cls
+                     c"acceptsFirstResponder"
+                     (p/cast (ptr i8) (p/fnptr-of accepts))
+                     c"c@:")
+            (method! cls
+                     c"becomeFirstResponder"
+                     (p/cast (ptr i8) (p/fnptr-of focus-in))
+                     c"c@:")
+            (method! cls
+                     c"resignFirstResponder"
+                     (p/cast (ptr i8) (p/fnptr-of focus-out))
+                     c"c@:")
+            (method! cls
+                     c"hasMarkedText"
+                     (p/cast (ptr i8) (p/fnptr-of has-marked))
+                     c"c@:")
+            (method! cls
+                     c"markedRange"
+                     (p/cast (ptr i8) (p/fnptr-of marked-range))
+                     c"{_NSRange=QQ}@:")
+            (method! cls
+                     c"selectedRange"
+                     (p/cast (ptr i8) (p/fnptr-of selected-range))
+                     c"{_NSRange=QQ}@:")
+            (method! cls
+                     c"unmarkText"
+                     (p/cast (ptr i8) (p/fnptr-of unmark))
+                     c"v@:")
             (method! cls
                      c"insertText:replacementRange:"
                      (p/cast (ptr i8) (p/fnptr-of insert))
@@ -264,7 +370,10 @@
                      c"setMarkedText:selectedRange:replacementRange:"
                      (p/cast (ptr i8) (p/fnptr-of set-marked))
                      c"v@:@{_NSRange=QQ}{_NSRange=QQ}")
-            (method! cls c"validAttributesForMarkedText" (p/cast (ptr i8) (p/fnptr-of attributes)) c"@@:")
+            (method! cls
+                     c"validAttributesForMarkedText"
+                     (p/cast (ptr i8) (p/fnptr-of attributes))
+                     c"@@:")
             (method! cls
                      c"attributedSubstringForProposedRange:actualRange:"
                      (p/cast (ptr i8) (p/fnptr-of substring))
@@ -277,30 +386,77 @@
                      c"firstRectForCharacterRange:actualRange:"
                      (p/cast (ptr i8) (p/fnptr-of first-rect))
                      c"{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}")
-            (method! cls c"doCommandBySelector:" (p/cast (ptr i8) (p/fnptr-of command)) c"v@::")
-            (method! cls c"keyDown:" (p/cast (ptr i8) (p/fnptr-of key-down)) c"v@:@")
-            (method! cls c"keyUp:" (p/cast (ptr i8) (p/fnptr-of key-up)) c"v@:@")
-            (method! cls c"mouseDown:" (p/cast (ptr i8) (p/fnptr-of mouse-down)) c"v@:@")
-            (method! cls c"rightMouseDown:" (p/cast (ptr i8) (p/fnptr-of mouse-down)) c"v@:@")
-            (method! cls c"otherMouseDown:" (p/cast (ptr i8) (p/fnptr-of mouse-down)) c"v@:@")
-            (method! cls c"mouseUp:" (p/cast (ptr i8) (p/fnptr-of mouse-up)) c"v@:@")
-            (method! cls c"rightMouseUp:" (p/cast (ptr i8) (p/fnptr-of mouse-up)) c"v@:@")
-            (method! cls c"otherMouseUp:" (p/cast (ptr i8) (p/fnptr-of mouse-up)) c"v@:@")
-            (method! cls c"mouseDragged:" (p/cast (ptr i8) (p/fnptr-of mouse-move)) c"v@:@")
-            (method! cls c"rightMouseDragged:" (p/cast (ptr i8) (p/fnptr-of mouse-move)) c"v@:@")
-            (method! cls c"otherMouseDragged:" (p/cast (ptr i8) (p/fnptr-of mouse-move)) c"v@:@")
-            (method! cls c"mouseMoved:" (p/cast (ptr i8) (p/fnptr-of mouse-move)) c"v@:@")
-            (method! cls c"scrollWheel:" (p/cast (ptr i8) (p/fnptr-of scroll)) c"v@:@")
+            (method! cls
+                     c"doCommandBySelector:"
+                     (p/cast (ptr i8) (p/fnptr-of command))
+                     c"v@::")
+            (method! cls
+                     c"keyDown:"
+                     (p/cast (ptr i8) (p/fnptr-of key-down))
+                     c"v@:@")
+            (method! cls
+                     c"keyUp:"
+                     (p/cast (ptr i8) (p/fnptr-of key-up))
+                     c"v@:@")
+            (method! cls
+                     c"mouseDown:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-down))
+                     c"v@:@")
+            (method! cls
+                     c"rightMouseDown:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-down))
+                     c"v@:@")
+            (method! cls
+                     c"otherMouseDown:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-down))
+                     c"v@:@")
+            (method! cls
+                     c"mouseUp:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-up))
+                     c"v@:@")
+            (method! cls
+                     c"rightMouseUp:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-up))
+                     c"v@:@")
+            (method! cls
+                     c"otherMouseUp:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-up))
+                     c"v@:@")
+            (method! cls
+                     c"mouseDragged:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-move))
+                     c"v@:@")
+            (method! cls
+                     c"rightMouseDragged:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-move))
+                     c"v@:@")
+            (method! cls
+                     c"otherMouseDragged:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-move))
+                     c"v@:@")
+            (method! cls
+                     c"mouseMoved:"
+                     (p/cast (ptr i8) (p/fnptr-of mouse-move))
+                     c"v@:@")
+            (method! cls
+                     c"scrollWheel:"
+                     (p/cast (ptr i8) (p/fnptr-of scroll))
+                     c"v@:@")
             (method! cls c"copy:" (p/cast (ptr i8) (p/fnptr-of copy)) c"v@:@")
             (method! cls c"paste:" (p/cast (ptr i8) (p/fnptr-of paste)) c"v@:@")
-            (method! cls c"selectAll:" (p/cast (ptr i8) (p/fnptr-of select-all)) c"v@:@")
+            (method! cls
+                     c"selectAll:"
+                     (p/cast (ptr i8) (p/fnptr-of select-all))
+                     c"v@:@")
             (objc_registerClassPair cls)
             cls)))))
 
 (defn tick [(self (ptr i8)) (cmd (ptr i8)) (unused (ptr i8))] (-> void)
   (let [start (timings/now)]
     (do
-      (if (!= (p/cast i64 (load (app-cell))) 0) (g/ghostty_app_tick (load (app-cell))) (do))
+      (if (!= (p/cast i64 (load (app-cell))) 0)
+          (g/ghostty_app_tick (load (app-cell)))
+          (do))
       (timings/record! 3 (* 1000.0 (- (timings/now) start))))))
 
 (defn wakeup [(userdata (ptr i8))] (-> void)
@@ -317,37 +473,63 @@
 
 (defn action [(app (ptr i8)) (target g/Target) (value g/Action)] (-> bool)
   (if (and (= (.tag target) (p/cast i32 1)) (= (.tag value) (p/cast i32 35)))
-      (let [t (p/cast (ptr Terminal) (g/ghostty_surface_userdata (.surface target)))
+      (let [t
+              (p/cast (ptr Terminal)
+                      (g/ghostty_surface_userdata (.surface target)))
             path (p/cast (ptr i8) (load (p/index (field value data) 0)))]
         (if (and (!= (p/cast i64 t) 0) (!= (p/cast i64 path) 0))
-            (do (release (.directory t)) (set! (.directory t) (msg (ptr i8) (ns path) (sel c"retain") [])) true)
+            (do
+              (release (.directory t))
+              (set! (.directory t) (msg (ptr i8) (ns path) (sel c"retain") []))
+              true)
             false))
       false))
 
 (defn read-clipboard [(userdata (ptr i8)) (kind i32) (request (ptr i8))] (-> bool)
   (let [t (p/cast (ptr Terminal) userdata)
         pb (msg (ptr i8) (class c"NSPasteboard") (sel c"generalPasteboard") [])
-        s (msg (ptr i8) pb (sel c"stringForType:") [(ptr i8)] (ns c"public.utf8-plain-text"))]
+        s
+          (msg (ptr i8)
+               pb
+               (sel c"stringForType:")
+               [(ptr i8)]
+               (ns c"public.utf8-plain-text"))]
     (do
       (g/ghostty_surface_complete_clipboard_request (.surface t)
-                                                    (if (= (p/cast i64 s) 0) c"" (utf8 s))
+                                                    (if (= (p/cast i64 s) 0)
+                                                        c""
+                                                        (utf8 s))
                                                     request
                                                     false)
       true)))
 
-(defn confirm-clipboard [(userdata (ptr i8)) (text (ptr i8)) (request (ptr i8)) (kind i32)] (-> void)
+(defn confirm-clipboard [(userdata (ptr i8))
+                         (text (ptr i8))
+                         (request (ptr i8))
+                         (kind i32)] (-> void)
   ; Explicit paste is permitted. Unsolicited terminal reads are disabled by config.
-  (g/ghostty_surface_complete_clipboard_request (.surface (p/cast (ptr Terminal) userdata))
-                                                (if (= kind (p/cast i32 0)) text c"")
+  (g/ghostty_surface_complete_clipboard_request (.surface (p/cast (ptr Terminal)
+                                                                  userdata))
+                                                (if (= kind (p/cast i32 0))
+                                                    text
+                                                    c"")
                                                 request
                                                 true))
 
-(defn write-clipboard [(userdata (ptr i8)) (kind i32) (contents (ptr g/ClipboardContent)) (count u64) (confirm bool)] (-> void)
+(defn write-clipboard [(userdata (ptr i8))
+                       (kind i32)
+                       (contents (ptr g/ClipboardContent))
+                       (count u64)
+                       (confirm bool)] (-> void)
   (do
     (for [i 0 (p/cast i64 count)]
       (let [c (p/index contents i)]
         (if (= (strcmp (.mime c) c"text/plain") (p/cast i32 0))
-            (let [pb (msg (ptr i8) (class c"NSPasteboard") (sel c"generalPasteboard") [])]
+            (let [pb
+                    (msg (ptr i8)
+                         (class c"NSPasteboard")
+                         (sel c"generalPasteboard")
+                         [])]
               (do
                 (msg i64 pb (sel c"clearContents") [])
                 (msg i8
@@ -365,7 +547,10 @@
 (defn start! [] (-> (ptr i8))
   (if (!= (g/ghostty_init 0 (p/cast (ptr (ptr i8)) 0)) (p/cast i32 0))
       (nil)
-      (let [cls (objc_allocateClassPair (class c"NSObject") c"JimGhosttyDispatcher" 0)
+      (let [cls
+              (objc_allocateClassPair (class c"NSObject")
+                                      c"JimGhosttyDispatcher"
+                                      0)
             config (g/ghostty_config_new)
             (mut runtime) (p/zeroed g/Runtime)]
         (do
@@ -377,18 +562,31 @@
           (set! (.wakeup runtime) (p/cast (ptr i8) (p/fnptr-of wakeup)))
           (set! (.action runtime) (p/cast (ptr i8) (p/fnptr-of action)))
           (set! (.read runtime) (p/cast (ptr i8) (p/fnptr-of read-clipboard)))
-          (set! (.confirm runtime) (p/cast (ptr i8) (p/fnptr-of confirm-clipboard)))
+          (set! (.confirm runtime)
+                (p/cast (ptr i8) (p/fnptr-of confirm-clipboard)))
           (set! (.write runtime) (p/cast (ptr i8) (p/fnptr-of write-clipboard)))
           (set! (.close runtime) (p/cast (ptr i8) (p/fnptr-of close-surface)))
           (set! (app-cell) (g/ghostty_app_new runtime config))
           (g/ghostty_config_free config)
           (load (app-cell))))))
 
-(defn create! [(parent (ptr i8)) (bounds Rect) (cwd (ptr i8)) (session-id (ptr i8))] (-> (ptr Terminal))
-  (let [v (msg (ptr i8) (msg (ptr i8) (view-class) (sel c"alloc") []) (sel c"initWithFrame:") [Rect] bounds)
+(defn create! [(parent (ptr i8))
+               (bounds Rect)
+               (cwd (ptr i8))
+               (session-id (ptr i8))] (-> (ptr Terminal))
+  (let [v
+          (msg (ptr i8)
+               (msg (ptr i8) (view-class) (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               bounds)
         t (alloc/box! (alloc/malloc-allocator) Terminal (p/zeroed Terminal))
         (mut config) (g/ghostty_surface_config_new)
-        scale (msg f64 (msg (ptr i8) parent (sel c"window") []) (sel c"backingScaleFactor") [])]
+        scale
+          (msg f64
+               (msg (ptr i8) parent (sel c"window") [])
+               (sel c"backingScaleFactor")
+               [])]
     (do
       (set! (.view t) v)
       (set! (.session-id t) (msg (ptr i8) session-id (sel c"retain") []))
@@ -404,7 +602,8 @@
       (set! (.cwd config) cwd)
       (let [fd (sessions/open! session-id cwd)]
         (if (>= fd (p/cast i32 0))
-            (set! (.surface t) (g/ghostty_surface_new_session (load (app-cell)) config fd))
+            (set! (.surface t)
+                  (g/ghostty_surface_new_session (load (app-cell)) config fd))
             0))
       (if (!= (p/cast i64 (.surface t)) 0)
           (g/ghostty_surface_set_size (.surface t)
@@ -422,11 +621,15 @@
   (when (!= (p/cast i64 (.surface t)) 0)
     (frame! (.view t) bounds)
     (g/ghostty_surface_set_content_scale (.surface t) scale scale)
-    (g/ghostty_surface_set_size (.surface t) (p/cast u32 (* (.w bounds) scale)) (p/cast u32 (* (.h bounds) scale)))))
+    (g/ghostty_surface_set_size (.surface t)
+                                (p/cast u32 (* (.w bounds) scale))
+                                (p/cast u32 (* (.h bounds) scale)))))
 
 (defn free! [(t (ptr Terminal))] (-> void)
   (do
-    (if (!= (p/cast i64 (.surface t)) 0) (g/ghostty_surface_free (.surface t)) (do))
+    (if (!= (p/cast i64 (.surface t)) 0)
+        (g/ghostty_surface_free (.surface t))
+        (do))
     (objc_setAssociatedObject (.view t) (association-key) (nil) 0)
     (msg i64 (.view t) (sel c"removeFromSuperview") [])
     (release (.view t))

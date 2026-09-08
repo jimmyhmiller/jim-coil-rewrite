@@ -38,13 +38,17 @@
 
 (extern objc_registerClassPair :cc c [(ptr i8)] (-> void))
 
-(extern class_addMethod :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> i8))
+(extern class_addMethod :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> bool))
 
 (extern class_addProtocol :cc c [(ptr i8) (ptr i8)] (-> i8))
 
 (extern objc_getProtocol :cc c [(ptr i8)] (-> (ptr i8)))
 
-(extern objc_setAssociatedObject :cc c [(ptr i8) (ptr i8) (ptr i8) u64] (-> void))
+(extern objc_setAssociatedObject
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr i8) u64]
+        (-> void))
 
 (extern objc_getAssociatedObject :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
 
@@ -87,7 +91,14 @@
   (msg (ptr i8) view (sel c"layer") []))
 
 (defn color [(r f64) (g f64) (b f64) (a f64)] (-> (ptr i8))
-  (msg (ptr i8) (class c"NSColor") (sel c"colorWithSRGBRed:green:blue:alpha:") [f64 f64 f64 f64] r g b a))
+  (msg (ptr i8)
+       (class c"NSColor")
+       (sel c"colorWithSRGBRed:green:blue:alpha:")
+       [f64 f64 f64 f64]
+       r
+       g
+       b
+       a))
 
 (defn background! [(view (ptr i8)) (r f64) (g f64) (b f64)] (-> i64)
   (msg i64
@@ -97,9 +108,18 @@
        (msg (ptr i8) (color r g b 1.0) (sel c"CGColor") [])))
 
 (defn layer-view [(parent (ptr i8)) (r Rect) (kind (ptr i8))] (-> (ptr i8))
-  (let [v (msg (ptr i8) (msg (ptr i8) (class c"NSView") (sel c"alloc") []) (sel c"initWithFrame:") [Rect] r)]
+  (let [v
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSView") (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               r)]
     (do
-      (msg i64 v (sel c"setLayer:") [(ptr i8)] (msg (ptr i8) (class kind) (sel c"layer") []))
+      (msg i64
+           v
+           (sel c"setLayer:")
+           [(ptr i8)]
+           (msg (ptr i8) (class kind) (sel c"layer") []))
       (msg i64 v (sel c"setWantsLayer:") [i8] (p/cast i8 1))
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
       (release v)
@@ -108,8 +128,17 @@
 (defn view [(parent (ptr i8)) (r Rect)] (-> (ptr i8))
   (layer-view parent r c"CALayer"))
 
-(defn label [(parent (ptr i8)) (value (ptr i8)) (r Rect) (size f64) (muted bool)] (-> (ptr i8))
-  (let [v (msg (ptr i8) (class c"NSTextField") (sel c"labelWithString:") [(ptr i8)] (ns value))]
+(defn label [(parent (ptr i8))
+             (value (ptr i8))
+             (r Rect)
+             (size f64)
+             (muted bool)] (-> (ptr i8))
+  (let [v
+          (msg (ptr i8)
+               (class c"NSTextField")
+               (sel c"labelWithString:")
+               [(ptr i8)]
+               (ns value))]
     (do
       (frame! v r)
       (msg i64 v (sel c"setAutoresizingMask:") [u64] 8)
@@ -117,18 +146,31 @@
            v
            (sel c"setFont:")
            [(ptr i8)]
-           (msg (ptr i8) (class c"NSFont") (sel c"systemFontOfSize:weight:") [f64 f64] size 0.2))
-      (msg i64 v (sel c"setTextColor:") [(ptr i8)] (if muted (color 0.51 0.57 0.65 1.0) (color 0.88 0.91 0.96 1.0)))
+           (msg (ptr i8)
+                (class c"NSFont")
+                (sel c"systemFontOfSize:weight:")
+                [f64 f64]
+                size
+                0.2))
+      (msg i64
+           v
+           (sel c"setTextColor:")
+           [(ptr i8)]
+           (if muted (color 0.51 0.57 0.65 1.0) (color 0.88 0.91 0.96 1.0)))
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
       v)))
 
 (defn method! [(cls (ptr i8)) (name (ptr i8)) (fn (ptr i8)) (encoding (ptr i8))] (-> i8)
-  (class_addMethod cls (sel name) fn encoding))
+  (p/cast i8 (if (class_addMethod cls (sel name) fn encoding) 1 0)))
 
 (defn transaction! [(duration f64)] (-> i64)
   (do
     (msg i64 (class c"CATransaction") (sel c"begin") [])
-    (msg i64 (class c"CATransaction") (sel c"setAnimationDuration:") [f64] duration)))
+    (msg i64
+         (class c"CATransaction")
+         (sel c"setAnimationDuration:")
+         [f64]
+         duration)))
 
 (defn commit! [] (-> i64)
   (msg i64 (class c"CATransaction") (sel c"commit") []))
@@ -137,24 +179,45 @@
 
 (defn transform! [(l (ptr i8)) (t Transform) (duration f64)] (-> i64)
   (let [shown (msg (ptr i8) l (sel c"presentationLayer") [])
-        current (msg Transform (if (= (p/cast i64 shown) 0) l shown) (sel c"transform") [])]
+        current
+          (msg Transform
+               (if (= (p/cast i64 shown) 0) l shown)
+               (sel c"transform")
+               [])]
     (do
       (transaction! 0.0)
-      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (msg i64
+           (class c"CATransaction")
+           (sel c"setDisableActions:")
+           [i8]
+           (p/cast i8 1))
       (msg i64 l (sel c"setTransform:") [Transform] t)
       (if (> duration 0.0)
-          (let [a (msg (ptr i8) (class c"CABasicAnimation") (sel c"animationWithKeyPath:") [(ptr i8)] (ns c"transform"))]
+          (let [a
+                  (msg (ptr i8)
+                       (class c"CABasicAnimation")
+                       (sel c"animationWithKeyPath:")
+                       [(ptr i8)]
+                       (ns c"transform"))]
             (do
               (msg i64
                    a
                    (sel c"setFromValue:")
                    [(ptr i8)]
-                   (msg (ptr i8) (class c"NSValue") (sel c"valueWithCATransform3D:") [Transform] current))
+                   (msg (ptr i8)
+                        (class c"NSValue")
+                        (sel c"valueWithCATransform3D:")
+                        [Transform]
+                        current))
               (msg i64
                    a
                    (sel c"setToValue:")
                    [(ptr i8)]
-                   (msg (ptr i8) (class c"NSValue") (sel c"valueWithCATransform3D:") [Transform] t))
+                   (msg (ptr i8)
+                        (class c"NSValue")
+                        (sel c"valueWithCATransform3D:")
+                        [Transform]
+                        t))
               (msg i64 a (sel c"setDuration:") [f64] duration)
               (msg i64
                    a
@@ -165,8 +228,17 @@
                         (sel c"functionWithName:")
                         [(ptr i8)]
                         (ns c"easeInEaseOut")))
-              (msg i64 l (sel c"addAnimation:forKey:") [(ptr i8) (ptr i8)] a (ns c"workspace-transition"))))
-          (msg i64 l (sel c"removeAnimationForKey:") [(ptr i8)] (ns c"workspace-transition")))
+              (msg i64
+                   l
+                   (sel c"addAnimation:forKey:")
+                   [(ptr i8) (ptr i8)]
+                   a
+                   (ns c"workspace-transition"))))
+          (msg i64
+               l
+               (sel c"removeAnimationForKey:")
+               [(ptr i8)]
+               (ns c"workspace-transition")))
       (commit!))))
 
 ;;; Non-variadic Foundation formatting keeps the Objective-C/C ABI explicit.
@@ -177,7 +249,11 @@
             (sel c"stringByAppendingString:")
             [(ptr i8)]
             (msg (ptr i8)
-                 (msg (ptr i8) (class c"NSNumber") (sel c"numberWithLongLong:") [i64] value)
+                 (msg (ptr i8)
+                      (class c"NSNumber")
+                      (sel c"numberWithLongLong:")
+                      [i64]
+                      value)
                  (sel c"stringValue")
                  []))
        (sel c"stringByAppendingString:")

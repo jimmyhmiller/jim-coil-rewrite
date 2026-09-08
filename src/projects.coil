@@ -16,7 +16,8 @@
 (defn find [(records (ptr i8)) (wanted i64)] (-> (ptr i8))
   (let [(mut result) (nil)]
     (do
-      (for [i 0 (s/count records)] (if (= (id (s/at records i)) wanted) (store! result (s/at records i)) 0))
+      (for [i 0 (s/count records)]
+        (if (= (id (s/at records i)) wanted) (store! result (s/at records i)) 0))
       (load result))))
 
 (defn profile [(root (ptr i8))] (-> (ptr i8))
@@ -26,23 +27,34 @@
   (p/cast i64 (s/value (profile root) c"active")))
 
 (defn hidden? [(profile (ptr i8)) (project i64)] (-> bool)
-  (!= (msg i8 (s/get profile c"hidden") (sel c"containsObject:") [(ptr i8)] (s/number (p/cast f64 project)))
+  (!= (msg i8
+           (s/get profile c"hidden")
+           (sel c"containsObject:")
+           [(ptr i8)]
+           (s/number (p/cast f64 project)))
       (p/cast i8 0)))
 
 (defn select! [(root (ptr i8)) (project i64)] (-> void)
-  (if (and (> project 0) (!= (p/cast i64 (find (list root) project)) 0) (not (hidden? (profile root) project)))
-      (do (s/put! (profile root) c"active" (s/number (p/cast f64 project))) (do))
+  (if (and (> project 0)
+           (!= (p/cast i64 (find (list root) project)) 0)
+           (not (hidden? (profile root) project)))
+      (do
+        (s/put! (profile root) c"active" (s/number (p/cast f64 project)))
+        (do))
       (do)))
 
 (defn repair-selection! [(root (ptr i8))] (-> void)
   (let [pr (profile root)
         selected (active root)]
-    (if (or (= (p/cast i64 (find (list root) selected)) 0) (hidden? pr selected))
+    (if (or (= (p/cast i64 (find (list root) selected)) 0)
+            (hidden? pr selected))
         (do
           (s/put! pr c"active" (s/number 0.0))
           (for [i 0 (s/count (list root))]
             (let [candidate (id (s/at (list root) i))]
-              (if (and (= (active root) 0) (not (hidden? pr candidate))) (select! root candidate) (do))))
+              (if (and (= (active root) 0) (not (hidden? pr candidate)))
+                  (select! root candidate)
+                  (do))))
           (do))
         (do))))
 
@@ -57,7 +69,9 @@
 
 (defn switch-profile! [(root (ptr i8)) (wanted i64)] (-> void)
   (if (!= (p/cast i64 (find (profiles root) wanted)) 0)
-      (do (s/put! root c"profile" (s/number (p/cast f64 wanted))) (repair-selection! root))
+      (do
+        (s/put! root c"profile" (s/number (p/cast f64 wanted)))
+        (repair-selection! root))
       (do)))
 
 (defn next-id! [(root (ptr i8))] (-> i64)
@@ -70,11 +84,15 @@
     (do
       (s/put! record c"id" (s/number (p/cast f64 next)))
       (s/put! record c"name" name)
-      (s/put! record c"directory" (msg (ptr i8) (ns c"~") (sel c"stringByExpandingTildeInPath") []))
+      (s/put! record
+              c"directory"
+              (msg (ptr i8) (ns c"~") (sel c"stringByExpandingTildeInPath") []))
       (s/add! (list root) record)
       (for [i 0 (s/count (profiles root))]
         (let [pr (s/at (profiles root) i)]
-          (if (!= (id pr) (id (profile root))) (s/add! (s/get pr c"hidden") (s/number (p/cast f64 next))) 0)))
+          (if (!= (id pr) (id (profile root)))
+              (s/add! (s/get pr c"hidden") (s/number (p/cast f64 next)))
+              0)))
       (select! root next)
       record)))
 
@@ -84,7 +102,8 @@
         old (profile root)
         hidden (s/array)]
     (do
-      (for [i 0 (s/count (s/get old c"hidden"))] (s/add! hidden (s/at (s/get old c"hidden") i)))
+      (for [i 0 (s/count (s/get old c"hidden"))]
+        (s/add! hidden (s/at (s/get old c"hidden") i)))
       (s/put! record c"id" (s/number (p/cast f64 next)))
       (s/put! record c"name" name)
       (s/put! record c"hidden" hidden)
@@ -95,7 +114,11 @@
 (defn delete-profile! [(root (ptr i8))] (-> bool)
   (if (> (s/count (profiles root)) 1)
       (do
-        (msg i64 (profiles root) (sel c"removeObject:") [(ptr i8)] (profile root))
+        (msg i64
+             (profiles root)
+             (sel c"removeObject:")
+             [(ptr i8)]
+             (profile root))
         (switch-profile! root (id (s/at (profiles root) 0)))
         true)
       false))
@@ -103,11 +126,19 @@
 (defn delete-project! [(root (ptr i8)) (wanted i64)] (-> void)
   (let [previous (id (profile root))]
     (do
-      (msg i64 (list root) (sel c"removeObject:") [(ptr i8)] (find (list root) wanted))
+      (msg i64
+           (list root)
+           (sel c"removeObject:")
+           [(ptr i8)]
+           (find (list root) wanted))
       (for [i 0 (s/count (profiles root))]
         (let [pr (s/at (profiles root) i)]
           (do
-            (msg i64 (s/get pr c"hidden") (sel c"removeObject:") [(ptr i8)] (s/number (p/cast f64 wanted)))
+            (msg i64
+                 (s/get pr c"hidden")
+                 (sel c"removeObject:")
+                 [(ptr i8)]
+                 (s/number (p/cast f64 wanted)))
             (switch-profile! root (id pr)))))
       (switch-profile! root previous))))
 
@@ -115,7 +146,9 @@
   (let [items (list root)
         item (find items moving)
         target (find items before)]
-    (if (and (!= moving before) (!= (p/cast i64 item) 0) (!= (p/cast i64 target) 0))
+    (if (and (!= moving before)
+             (!= (p/cast i64 item) 0)
+             (!= (p/cast i64 target) 0))
         (do
           (msg (ptr i8) item (sel c"retain") [])
           (msg i64 items (sel c"removeObject:") [(ptr i8)] item)
@@ -159,10 +192,16 @@
                               (< (s/value r c"id") 1000000000.0)
                               (p/fcmp-eq (s/value r c"id") (p/cast f64 (id r)))
                               (s/kind? (s/get r c"name") c"NSString")
-                              (= (msg i8 seen (sel c"containsObject:") [(ptr i8)] number) (p/cast i8 0))
+                              (= (msg i8
+                                      seen
+                                      (sel c"containsObject:")
+                                      [(ptr i8)]
+                                      number)
+                                 (p/cast i8 0))
                               (if (= group 0)
                                   (s/kind? (s/get r c"directory") c"NSString")
-                                  (and (s/kind? (s/get r c"hidden") c"NSArray") (s/numeric? r c"active")))))
+                                  (and (s/kind? (s/get r c"hidden") c"NSArray")
+                                       (s/numeric? r c"active")))))
                     (store! ok false)
                     0)
                 (if (!= (p/cast i64 number) 0) (s/add! seen number) 0))))))
@@ -170,7 +209,8 @@
 
 ;;; Upgrade the original rewrite's anonymous four-canvas file without losing layout.
 (defn restore [(saved (ptr i8))] (-> (ptr i8))
-  (if (and (p/fcmp-eq (s/value saved c"version") 2.0) (> (s/count (profiles saved)) 0))
+  (if (and (p/fcmp-eq (s/value saved c"version") 2.0)
+           (> (s/count (profiles saved)) 0))
       (do (repair-selection! saved) saved)
       (let [root (fresh)
             old (s/get saved c"projects")]
@@ -185,7 +225,9 @@
                                                   (= i 2) c"Build & run"
                                                   :else c"Scratch")))]
                     (s/put! record c"layout" (s/at old i))))
-                (select! root (id (s/at (list root) (p/cast i64 (s/value saved c"selected"))))))
+                (select! root
+                         (id (s/at (list root)
+                                   (p/cast i64 (s/value saved c"selected"))))))
               (do (new-project! root (ns c"Workspace")) (do)))
           root))))
 
@@ -196,7 +238,9 @@
       (for [i 0 (s/count (list root))]
         (let [record (s/at (list root) i)]
           (if (not (hidden? (profile root) (id record)))
-              (do (if (= (load at) rank) (store! found (id record)) 0) (store! at (+ (load at) 1)))
+              (do
+                (if (= (load at) rank) (store! found (id record)) 0)
+                (store! at (+ (load at) 1)))
               0)))
       (load found))))
 
@@ -204,7 +248,9 @@
   (let [items (list root)
         item (find items moving)
         target (find items target-id)]
-    (if (and (!= moving target-id) (!= (p/cast i64 item) 0) (!= (p/cast i64 target) 0))
+    (if (and (!= moving target-id)
+             (!= (p/cast i64 item) 0)
+             (!= (p/cast i64 target) 0))
         (do
           (msg (ptr i8) item (sel c"retain") [])
           (msg i64 items (sel c"removeObject:") [(ptr i8)] item)
@@ -213,6 +259,7 @@
                (sel c"insertObject:atIndex:")
                [(ptr i8) u64]
                item
-               (+ (msg u64 items (sel c"indexOfObject:") [(ptr i8)] target) (p/cast u64 (if after 1 0))))
+               (+ (msg u64 items (sel c"indexOfObject:") [(ptr i8)] target)
+                  (p/cast u64 (if after 1 0))))
           (release item))
         (do))))

@@ -21,7 +21,8 @@
   (cond (< x low) low (> x high) high :else x))
 
 (defn screen-to-world [(c Camera) (point Point)] (-> Point)
-  (Point :x (+ (.x c) (/ (.x point) (.zoom c))) :y (+ (.y c) (/ (.y point) (.zoom c)))))
+  (Point :x (+ (.x c) (/ (.x point) (.zoom c)))
+    :y (+ (.y c) (/ (.y point) (.zoom c)))))
 
 (defn project [(c Camera) (bounds Rect)] (-> Rect)
   (rect (* (- (.x bounds) (.x c)) (.zoom c))
@@ -94,10 +95,17 @@
 
 ;;; Keep the originally grabbed world-space point attached to the cursor,
 ;;; even when the camera moves or zooms without a mouse-motion event.
-(defn dragged-bounds [(camera Camera) (start-world Point) (pointer Point) (bounds Rect) (resize bool)] (-> Rect)
+(defn dragged-bounds [(camera Camera)
+                      (start-world Point)
+                      (pointer Point)
+                      (bounds Rect)
+                      (resize bool)] (-> Rect)
   (let [world (screen-to-world camera pointer)
         dx (- (.x world) (.x start-world))
         dy (- (.y world) (.y start-world))]
     (if resize
-        (rect (.x bounds) (.y bounds) (clamp (+ (.w bounds) dx) 320.0 4096.0) (clamp (+ (.h bounds) dy) 180.0 4096.0))
+        (rect (.x bounds)
+              (.y bounds)
+              (clamp (+ (.w bounds) dx) 320.0 4096.0)
+              (clamp (+ (.h bounds) dy) 180.0 4096.0))
         (rect (+ (.x bounds) dx) (+ (.y bounds) dy) (.w bounds) (.h bounds)))))

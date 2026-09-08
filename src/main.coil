@@ -65,7 +65,9 @@
   (let [r (runtime i)] (.canvas r)))
 
 (defn current [] (-> (ptr canvas/Canvas))
-  (if (>= (.selected (shell)) 0) (project (.selected (shell))) (p/cast (ptr canvas/Canvas) 0)))
+  (if (>= (.selected (shell)) 0)
+      (project (.selected (shell)))
+      (p/cast (ptr canvas/Canvas) 0)))
 
 (defn record [(i i64)] (-> (ptr i8))
   (let [r (runtime i)] (projects/find (projects/list (.model (shell))) (.id r))))
@@ -89,18 +91,25 @@
         (do
           (transform! (layer (face i))
                       (if (.overview s)
-                          (CATransform3DTranslate (workspace/face-transform i (count) width) 0.0 0.0 (* width 0.5))
+                          (CATransform3DTranslate (workspace/face-transform i
+                                                                            (count)
+                                                                            width)
+                                                  0.0
+                                                  0.0
+                                                  (* width 0.5))
                           (CATransform3DMakeTranslation 0.0 0.0 0.0))
                       duration)
           (canvas/visibility! (project i)
-                              (and (not (projects/hidden? (projects/profile (.model s)) (projects/id (record i))))
+                              (and (not (projects/hidden? (projects/profile (.model s))
+                                                          (projects/id (record i))))
                                    (or (.overview s) (= i (.selected s)))))
           (msg i64
                (face i)
                (sel c"setHidden:")
                [i8]
                (p/cast i8
-                       (if (and (not (projects/hidden? (projects/profile (.model s)) (projects/id (record i))))
+                       (if (and (not (projects/hidden? (projects/profile (.model s))
+                                                       (projects/id (record i))))
                                 (or (.overview s) (= i (.selected s))))
                            0
                            1)))
@@ -114,12 +123,20 @@
           (do
             (if (palette/open?)
                 (palette/focus!)
-                (do (msg i8 (.window s) (sel c"makeFirstResponder:") [(ptr i8)] (nil)) (do)))
+                (do
+                  (msg i8
+                       (.window s)
+                       (sel c"makeFirstResponder:")
+                       [(ptr i8)]
+                       (nil))
+                  (do)))
             (status! c"Drag to rotate   ·   ← → choose   ·   Return to enter   ·   Esc to return"))
           (do
             (if (palette/open?)
                 (palette/focus!)
-                (if (>= (.selected s) 0) (canvas/focus! (current) (load (field (current) focused))) (do)))
+                (if (>= (.selected s) 0)
+                    (canvas/focus! (current) (load (field (current) focused)))
+                    (do)))
             (status! c"⌘ scroll  Pan   ·   ⌘⌥ scroll / pinch  Zoom   ·   Space / middle drag  Pan   ·   ⌘⇧0  Origin"))))))
 
 (defn visible-index [(index i64) (direction i64)] (-> i64)
@@ -128,7 +145,8 @@
       (for [i 0 (count)]
         (let [r (runtime (load candidate))]
           (if (projects/hidden? (projects/profile (.model (shell))) (.id r))
-              (store! candidate (workspace/wrap (+ (load candidate) direction) (count)))
+              (store! candidate
+                      (workspace/wrap (+ (load candidate) direction) (count)))
               0)))
       (load candidate))))
 
@@ -144,7 +162,11 @@
       ;; Project navigation is an immediate swap, including during an
       ;; unfinished cube transition. Suppress implicit visibility changes too.
       (transaction! 0.0)
-      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (msg i64
+           (class c"CATransaction")
+           (sel c"setDisableActions:")
+           [i8]
+           (p/cast i8 1))
       (pose! 0.0)
       (commit!)
       (do))))
@@ -167,36 +189,82 @@
         scale (msg f64 (.window s) (sel c"backingScaleFactor") [])]
     (do
       (transaction! 0.0)
-      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (msg i64
+           (class c"CATransaction")
+           (sel c"setDisableActions:")
+           [i8]
+           (p/cast i8 1))
       (set! (.width s) width)
       (set! (.height s) height)
       (sidebar/layout! height)
       (frame! (.stage s) (rect rail 40.0 (- width rail) (- height 40.0)))
-      (transform! (layer (.cube s)) (CATransform3DMakeTranslation 0.0 0.0 0.0) 0.0)
-      (for [i 0 (count)] (transform! (layer (face i)) (CATransform3DMakeTranslation 0.0 0.0 0.0) 0.0))
+      (transform! (layer (.cube s))
+                  (CATransform3DMakeTranslation 0.0 0.0 0.0)
+                  0.0)
+      (for [i 0 (count)]
+        (transform! (layer (face i))
+                    (CATransform3DMakeTranslation 0.0 0.0 0.0)
+                    0.0))
       (frame! (.cube s) (rect 32.0 32.0 fw fh))
-      (msg i64 (layer (.stage s)) (sel c"setAnchorPoint:") [Point] (Point :x 0.5 :y 0.5))
+      (msg i64
+           (layer (.stage s))
+           (sel c"setAnchorPoint:")
+           [Point]
+           (Point :x 0.5 :y 0.5))
       (msg i64
            (layer (.stage s))
            (sel c"setPosition:")
            [Point]
-           (Point :x (+ rail (* (- width rail) 0.5)) :y (+ 40.0 (* (- height 40.0) 0.5))))
-      (msg i64 (layer (.cube s)) (sel c"setAnchorPoint:") [Point] (Point :x 0.5 :y 0.5))
-      (msg i64 (layer (.cube s)) (sel c"setPosition:") [Point] (Point :x (+ 32.0 (* fw 0.5)) :y (+ 32.0 (* fh 0.5))))
+           (Point :x (+ rail (* (- width rail) 0.5))
+             :y (+ 40.0 (* (- height 40.0) 0.5))))
+      (msg i64
+           (layer (.cube s))
+           (sel c"setAnchorPoint:")
+           [Point]
+           (Point :x 0.5 :y 0.5))
+      (msg i64
+           (layer (.cube s))
+           (sel c"setPosition:")
+           [Point]
+           (Point :x (+ 32.0 (* fw 0.5)) :y (+ 32.0 (* fh 0.5))))
       (frame! (.heading s) (rect (+ rail 32.0) (- height 44.0) 450.0 24.0))
-      (frame! (.status s) (rect (+ rail 32.0) 10.0 (- width (+ rail 45.0)) 20.0))
-      (msg i64 (layer (.stage s)) (sel c"setSublayerTransform:") [Transform] (workspace/perspective (* width 2.0)))
+      (frame! (.status s)
+              (rect (+ rail 32.0) 10.0 (- width (+ rail 45.0)) 20.0))
+      (msg i64
+           (layer (.stage s))
+           (sel c"setSublayerTransform:")
+           [Transform]
+           (workspace/perspective (* width 2.0)))
       (for [i 0 (count)]
         (do
           (frame! (face i) (rect 0.0 0.0 fw fh))
-          (msg i64 (layer (face i)) (sel c"setAnchorPoint:") [Point] (Point :x 0.5 :y 0.5))
-          (msg i64 (layer (face i)) (sel c"setPosition:") [Point] (Point :x (* fw 0.5) :y (* fh 0.5)))
+          (msg i64
+               (layer (face i))
+               (sel c"setAnchorPoint:")
+               [Point]
+               (Point :x 0.5 :y 0.5))
+          (msg i64
+               (layer (face i))
+               (sel c"setPosition:")
+               [Point]
+               (Point :x (* fw 0.5) :y (* fh 0.5)))
           (transform! (layer (face i))
-                      (CATransform3DTranslate (workspace/face-transform i (count) fw) 0.0 0.0 (* fw 0.5))
+                      (CATransform3DTranslate (workspace/face-transform i
+                                                                        (count)
+                                                                        fw)
+                                              0.0
+                                              0.0
+                                              (* fw 0.5))
                       0.0)
           (canvas/resize! (project i) fw fh scale)))
-      (background! (.root s) (.canvas-r (.config s)) (.canvas-g (.config s)) (.canvas-b (.config s)))
-      (background! (.view (sidebar/state)) (.rail-r (.config s)) (.rail-g (.config s)) (.rail-b (.config s)))
+      (background! (.root s)
+                   (.canvas-r (.config s))
+                   (.canvas-g (.config s))
+                   (.canvas-b (.config s)))
+      (background! (.view (sidebar/state))
+                   (.rail-r (.config s))
+                   (.rail-g (.config s))
+                   (.rail-b (.config s)))
       (for [i 0 (count)] (canvas/apply-theme! (project i) (.config s)))
       (palette/layout!)
       (pose! 0.0)
@@ -207,7 +275,10 @@
   (let [s (shell)]
     (if (= (p/cast i64 (.task s)) 0)
         (let [task (new c"NSTask")
-              output (indexed-string c"../build/config-" (+ (.generation s) 1) c".dylib")
+              output
+                (indexed-string c"../build/config-"
+                                (+ (.generation s) 1)
+                                c".dylib")
               argv (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
               error (p/alloc-stack (ptr i8))]
           (do
@@ -217,7 +288,11 @@
                  task
                  (sel c"setExecutableURL:")
                  [(ptr i8)]
-                 (msg (ptr i8) (class c"NSURL") (sel c"fileURLWithPath:") [(ptr i8)] (ns c"/usr/bin/env")))
+                 (msg (ptr i8)
+                      (class c"NSURL")
+                      (sel c"fileURLWithPath:")
+                      [(ptr i8)]
+                      (ns c"/usr/bin/env")))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"coil"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"build"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"shell.coil"))
@@ -225,13 +300,25 @@
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"-o"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] output)
             (msg i64 task (sel c"setArguments:") [(ptr i8)] argv)
-            (msg i64 task (sel c"setCurrentDirectoryPath:") [(ptr i8)] (ns c"config"))
-            (if (!= (msg i8 task (sel c"launchAndReturnError:") [(ptr (ptr i8))] error) (p/cast i8 0))
+            (msg i64
+                 task
+                 (sel c"setCurrentDirectoryPath:")
+                 [(ptr i8)]
+                 (ns c"config"))
+            (if (!= (msg i8
+                         task
+                         (sel c"launchAndReturnError:")
+                         [(ptr (ptr i8))]
+                         error)
+                    (p/cast i8 0))
                 (do
                   (set! (.task s) task)
-                  (store! (field s output) (msg (ptr i8) output (sel c"retain") []))
+                  (store! (field s output)
+                          (msg (ptr i8) output (sel c"retain") []))
                   (status! c"Compiling Coil configuration…"))
-                (do (release task) (status! c"Could not launch Coil compiler; see launch environment.")))))
+                (do
+                  (release task)
+                  (status! c"Could not launch Coil compiler; see launch environment.")))))
         (do))))
 
 (defn background-maintenance! [] (-> void)
@@ -244,23 +331,28 @@
               (> (.height s) (.h bounds)))
           (layout!)
           (do))
-      (if (and (!= (p/cast i64 (.task s)) 0) (= (msg i8 (.task s) (sel c"isRunning") []) (p/cast i8 0)))
+      (if (and (!= (p/cast i64 (.task s)) 0)
+               (= (msg i8 (.task s) (sel c"isRunning") []) (p/cast i8 0)))
           (do
-            (if (and (= (msg i32 (.task s) (sel c"terminationStatus") []) (p/cast i32 0))
+            (if (and (= (msg i32 (.task s) (sel c"terminationStatus") [])
+                        (p/cast i32 0))
                      (reload/load-config! (utf8 (msg (ptr i8)
                                                      (ns c"config")
                                                      (sel c"stringByAppendingPathComponent:")
                                                      [(ptr i8)]
                                                      (.output s)))
                                           (field s config)))
-                (do (layout!) (status! c"Coil configuration reloaded · terminals preserved"))
+                (do
+                  (layout!)
+                  (status! c"Coil configuration reloaded · terminals preserved"))
                 (status! c"Reload failed · keeping last good configuration · see compiler output"))
             (release (.task s))
             (release (.output s))
             (set! (.task s) (nil))
             (set! (.output s) (nil)))
           0)
-      (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+      (let [manager
+              (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
             attrs
               (msg (ptr i8)
                    manager
@@ -268,7 +360,12 @@
                    [(ptr i8) (ptr i8)]
                    (ns c"config/shell.coil")
                    (nil))
-            date (msg (ptr i8) attrs (sel c"objectForKey:") [(ptr i8)] (ns c"NSFileModificationDate"))
+            date
+              (msg (ptr i8)
+                   attrs
+                   (sel c"objectForKey:")
+                   [(ptr i8)]
+                   (ns c"NSFileModificationDate"))
             stamp (msg f64 date (sel c"timeIntervalSince1970") [])]
         (if (and (> stamp (.stamp s)) (= (p/cast i64 (.task s)) 0))
             (do (set! (.stamp s) stamp) (reload-start!))
@@ -276,9 +373,12 @@
 
 (defn save-layout! [] (-> bool)
   (do
-    (for [i 0 (count)] (storage/put! (record i) c"layout" (canvas/snapshot (project i))))
+    (for [i 0 (count)]
+      (storage/put! (record i) c"layout" (canvas/snapshot (project i))))
     (let [ok (storage/write! (.model (shell)))]
-      (do (if ok (for [i 0 (count)] (store! (field (project i) dirty) false)) 0) ok))))
+      (do
+        (if ok (for [i 0 (count)] (store! (field (project i) dirty) false)) 0)
+        ok))))
 
 (defn sync-selection! [] (-> void)
   (let [s (shell)]
@@ -287,10 +387,15 @@
       (for [i 0 (count)]
         (let [r (runtime i)]
           (if (= (.id r) (projects/active (.model s))) (set! (.selected s) i) 0)))
-      (set! (.angle s) (if (>= (.selected s) 0) (- 0.0 (workspace/face-angle (.selected s) (count))) 0.0))
+      (set! (.angle s)
+            (if (>= (.selected s) 0)
+                (- 0.0 (workspace/face-angle (.selected s) (count)))
+                0.0))
       (set! (.overview s) false)
       (layout!)
-      (if (save-layout!) (do) (do (status! c"Could not save project layout") (do))))))
+      (if (save-layout!)
+          (do)
+          (do (status! c"Could not save project layout") (do))))))
 
 (defn delete-project! [(wanted i64)] (-> void)
   (let [s (shell)
@@ -303,12 +408,19 @@
                 r (runtime index)
                 deleted-name (storage/get (record index) c"name")]
             (do
-              (printf c"Jim: deleting project %s and closing its terminals\n" (utf8 deleted-name))
-              (let [c (.canvas r)] (while (> (canvas/count c) 0) (canvas/close! c (canvas/pane c 0))))
+              (printf c"Jim: deleting project %s and closing its terminals\n"
+                      (utf8 deleted-name))
+              (let [c (.canvas r)]
+                (while (> (canvas/count c) 0)
+                  (canvas/close! c (canvas/pane c 0))))
               (projects/delete-project! (.model s) (.id r))
               (canvas/free! (.canvas r))
               (msg i64 (.face r) (sel c"removeFromSuperview") [])
-              (for [i index (- (count) 1)] (al/al-set! [ProjectView] (mut (.projects s)) i (runtime (+ i 1))))
+              (for [i index (- (count) 1)]
+                (al/al-set! [ProjectView]
+                            (mut (.projects s))
+                            i
+                            (runtime (+ i 1))))
               (al/al-pop! [ProjectView] (mut (.projects s)))
               (sync-selection!)))
           (do)))))
@@ -317,7 +429,9 @@
   (let [s (shell)
         record (projects/new-project! (.model s) (ns c"Project"))]
     (do
-      (storage/put! record c"name" (indexed-string c"Project " (projects/id record) c""))
+      (storage/put! record
+                    c"name"
+                    (indexed-string c"Project " (projects/id record) c""))
       (add-project-view! record)
       (sync-selection!))))
 
@@ -331,7 +445,8 @@
       (msg i64 (layer f) (sel c"setCornerRadius:") [f64] 10.0)
       (msg i64 (layer f) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
       (release (.directory c))
-      (set! (.directory c) (msg (ptr i8) (storage/get record c"directory") (sel c"retain") []))
+      (set! (.directory c)
+            (msg (ptr i8) (storage/get record c"directory") (sel c"retain") []))
       (al/al-push! [ProjectView]
                    (mut (.projects s))
                    (ProjectView
@@ -363,14 +478,27 @@
                     (if (.dirty (project i)) (store! dirty true) 0)
                     (if (> (.gesture (project i)) 0) (store! dragging true) 0)))
                 (if (and (load dirty) (not (load dragging)))
-                    (if (not (save-layout!)) (status! c"Could not save canvas layout") 0)
+                    (if (not (save-layout!))
+                        (status! c"Could not save canvas layout")
+                        0)
                     0)))
             (if (= (msg i8 (.app s) (sel c"isActive") []) (p/cast i8 0))
                 (for [i 0 (count)]
-                  (do (store! (field (project i) space-held) false) (store! (field (project i) gesture) 0)))
+                  (do
+                    (store! (field (project i) space-held) false)
+                    (store! (field (project i) gesture) 0)))
                 0)
-            (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])]
-              (if (!= (msg i8 manager (sel c"fileExistsAtPath:") [(ptr i8)] (ns c"build/quit-request")) (p/cast i8 0))
+            (let [manager
+                    (msg (ptr i8)
+                         (class c"NSFileManager")
+                         (sel c"defaultManager")
+                         [])]
+              (if (!= (msg i8
+                           manager
+                           (sel c"fileExistsAtPath:")
+                           [(ptr i8)]
+                           (ns c"build/quit-request"))
+                      (p/cast i8 0))
                   (do
                     (msg i8
                          manager
@@ -387,11 +515,15 @@
   (cond (= id 0)
           (do
             (if (.overview (shell)) (select! (.selected (shell))) (do))
-            (if (not (canvas/add-visible! (current))) (status! c"Could not start terminal") 0)
+            (if (not (canvas/add-visible! (current)))
+                (status! c"Could not start terminal")
+                0)
             (do))
         (= id 1)
           (let [focused (load (field (current) focused))]
-            (if (!= (p/cast i64 focused) 0) (canvas/close! (current) focused) (do)))
+            (if (!= (p/cast i64 focused) 0)
+                (canvas/close! (current) focused)
+                (do)))
         (= id 2) (canvas/home! (current))
         (= id 3) (canvas/reset-zoom! (current))
         (= id 4) (canvas/fit! (current))
@@ -400,13 +532,19 @@
         (= id 7)
           (let [enabled (not (.zoom-enabled (current)))]
             (do
-              (for [i 0 (count)] (do (store! (field (project i) zoom-enabled) enabled) (canvas/project! (project i))))
+              (for [i 0 (count)]
+                (do
+                  (store! (field (project i) zoom-enabled) enabled)
+                  (canvas/project! (project i))))
               (do)))
         (= id 8) (if (>= (.selected (shell)) 0) (toggle!) (do))
         (= id 9) (reload-start!)
         (= id 10) (timings/toggle!)
         (and (>= id 11) (< id 15))
-          (do (projects/select! (.model (shell)) (projects/visible-id (.model (shell)) (- id 11))) (sync-selection!))
+          (do
+            (projects/select! (.model (shell))
+                              (projects/visible-id (.model (shell)) (- id 11)))
+            (sync-selection!))
         :else (do)))
 
 (defn invoke! [(id i64)] (-> void)
@@ -414,50 +552,93 @@
         model (.model s)]
     (cond (= id -2) (sync-selection!)
           (>= id 28)
-            (do (projects/select! model (projects/id (storage/at (projects/list model) (- id 28)))) (sync-selection!))
+            (do
+              (projects/select! model
+                                (projects/id (storage/at (projects/list model)
+                                                         (- id 28))))
+              (sync-selection!))
           (= id 15) (new-project!)
-          (= id 16) (if (>= (.selected s) 0) (sidebar/rename! (projects/active model)) (do))
+          (= id 16)
+            (if (>= (.selected s) 0)
+                (sidebar/rename! (projects/active model))
+                (do))
           (= id 17)
-            (if (>= (.selected s) 0) (do (projects/hide! model (projects/active model) true) (sync-selection!)) (do))
+            (if (>= (.selected s) 0)
+                (do
+                  (projects/hide! model (projects/active model) true)
+                  (sync-selection!))
+                (do))
           (= id 18)
             (if (>= (.selected s) 0)
-                (palette/prompt! 18 c"Project directory" (utf8 (storage/get (record (.selected s)) c"directory")))
+                (palette/prompt! 18
+                                 c"Project directory"
+                                 (utf8 (storage/get (record (.selected s))
+                                                    c"directory")))
                 (do))
           (= id 19)
-            (if (and (>= (.selected s) 0) (!= (p/cast i64 (.focused (current))) 0))
+            (if (and (>= (.selected s) 0)
+                     (!= (p/cast i64 (.focused (current))) 0))
                 (let [pane (.focused (current))
                       term (.terminal pane)]
                   (do
-                    (storage/put! (record (.selected s)) c"directory" (.directory term))
+                    (storage/put! (record (.selected s))
+                                  c"directory"
+                                  (.directory term))
                     (release (.directory (current)))
-                    (store! (field (current) directory) (msg (ptr i8) (.directory term) (sel c"retain") []))
+                    (store! (field (current) directory)
+                            (msg (ptr i8) (.directory term) (sel c"retain") []))
                     (sync-selection!)
                     (status! c"Project directory updated from focused terminal")))
                 (do))
           (= id 20) (palette/prompt! 20 c"New profile name" c"")
-          (= id 21) (palette/prompt! 21 c"Rename profile" (utf8 (storage/get (projects/profile model) c"name")))
+          (= id 21)
+            (palette/prompt! 21
+                             c"Rename profile"
+                             (utf8 (storage/get (projects/profile model)
+                                                c"name")))
           (= id 22)
             (do
-              (if (projects/delete-profile! model) (sync-selection!) (do (status! c"Keep at least one profile") (do)))
+              (if (projects/delete-profile! model)
+                  (sync-selection!)
+                  (do (status! c"Keep at least one profile") (do)))
               (do))
           (= id 23)
-            (do (store! (field (sidebar/state) show-hidden) (not (.show-hidden (sidebar/state)))) (sidebar/refresh!))
+            (do
+              (store! (field (sidebar/state) show-hidden)
+                      (not (.show-hidden (sidebar/state))))
+              (sidebar/refresh!))
           (or (= id 24) (= id 25))
             (let [profiles (projects/profiles model)
-                  index (msg i64 profiles (sel c"indexOfObject:") [(ptr i8)] (projects/profile model))
-                  next (workspace/wrap (+ index (if (= id 24) -1 1)) (storage/count profiles))]
+                  index
+                    (msg i64
+                         profiles
+                         (sel c"indexOfObject:")
+                         [(ptr i8)]
+                         (projects/profile model))
+                  next
+                    (workspace/wrap (+ index (if (= id 24) -1 1))
+                                    (storage/count profiles))]
               (do
-                (sidebar/transition! (if (= id 24) (- 0.0 (sidebar/width)) (sidebar/width)))
-                (projects/switch-profile! model (projects/id (storage/at profiles next)))
+                (sidebar/transition! (if (= id 24)
+                                         (- 0.0 (sidebar/width))
+                                         (sidebar/width)))
+                (projects/switch-profile! model
+                                          (projects/id (storage/at profiles
+                                                                   next)))
                 (sync-selection!)))
           (= id 27)
-            (when (and (>= (.selected s) 0) (!= (p/cast i64 (.focused (current))) 0))
+            (when (and (>= (.selected s) 0)
+                       (!= (p/cast i64 (.focused (current))) 0))
               (if (canvas/reconnect! (current) (.focused (current)))
                   (do (status! c"Terminal reconnected") (do))
-                  (do (status! c"Cannot reconnect terminal; saved session retained") (do))))
+                  (do
+                    (status! c"Cannot reconnect terminal; saved session retained")
+                    (do))))
           (= id 26)
             (let [requested (sidebar/take-delete-project!)]
-              (delete-project! (if (> requested 0) requested (projects/active model))))
+              (delete-project! (if (> requested 0)
+                                   requested
+                                   (projects/active model))))
           (or (= id 9) (= id 10) (and (>= id 11) (< id 15))) (canvas-action! id)
           (>= (.selected s) 0) (canvas-action! id)
           :else (do (status! c"Create or show a project first") (do)))))
@@ -470,16 +651,31 @@
                input
                (sel c"stringByTrimmingCharactersInSet:")
                [(ptr i8)]
-               (msg (ptr i8) (class c"NSCharacterSet") (sel c"whitespaceAndNewlineCharacterSet") []))
+               (msg (ptr i8)
+                    (class c"NSCharacterSet")
+                    (sel c"whitespaceAndNewlineCharacterSet")
+                    []))
         (mut invalid-directory) false]
     (if (= (msg u64 text (sel c"length") []) 0)
         (palette/prompt! id c"Please enter a nonempty value" c"")
         (do
-          (cond (= id 15) (do (add-project-view! (projects/new-project! model text)) (do))
-                (= id 16) (do (storage/put! (record (.selected s)) c"name" text) (do))
+          (cond (= id 15)
+                  (do
+                    (add-project-view! (projects/new-project! model text))
+                    (do))
+                (= id 16)
+                  (do (storage/put! (record (.selected s)) c"name" text) (do))
                 (= id 18)
-                  (let [path (msg (ptr i8) text (sel c"stringByExpandingTildeInPath") [])
-                        manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+                  (let [path
+                          (msg (ptr i8)
+                               text
+                               (sel c"stringByExpandingTildeInPath")
+                               [])
+                        manager
+                          (msg (ptr i8)
+                               (class c"NSFileManager")
+                               (sel c"defaultManager")
+                               [])
                         directory (p/alloc-stack i8)]
                     (if (and (!= (msg i8
                                       manager
@@ -490,33 +686,44 @@
                                  (p/cast i8 0))
                              (!= (load directory) (p/cast i8 0)))
                         (do
-                          (storage/put! (record (.selected s)) c"directory" path)
+                          (storage/put! (record (.selected s))
+                                        c"directory"
+                                        path)
                           (release (.directory (current)))
-                          (store! (field (current) directory) (msg (ptr i8) path (sel c"retain") []))
+                          (store! (field (current) directory)
+                                  (msg (ptr i8) path (sel c"retain") []))
                           (do))
                         (do (store! invalid-directory true) (do))))
                 (= id 20) (projects/new-profile! model text)
-                (= id 21) (do (storage/put! (projects/profile model) c"name" text) (do))
+                (= id 21)
+                  (do (storage/put! (projects/profile model) c"name" text) (do))
                 :else (do))
           (sync-selection!)
           (when (load invalid-directory)
-            (palette/prompt! 18 c"Directory does not exist; enter a directory" (utf8 text)))))))
+            (palette/prompt! 18
+                             c"Directory does not exist; enter a directory"
+                             (utf8 text)))))))
 
 (defn handle! [(event (ptr i8))] (-> bool)
   (let [s (shell)
         kind (msg i64 event (sel c"type") [])
         flags (msg u64 event (sel c"modifierFlags") [])
-        key (if (or (= kind 10) (= kind 11)) (msg u16 event (sel c"keyCode") []) (p/cast u16 0))
+        key
+          (if (or (= kind 10) (= kind 11))
+              (msg u16 event (sel c"keyCode") [])
+              (p/cast u16 0))
         command (!= (& flags 1048576) (p/cast u64 0))]
     (do
       ;; Space belongs to the keyboard, so releases must reach every project,
       ;; including when the user switches projects or enters the cube.
       (if (and (or (= kind 10) (= kind 11)) (= key (p/cast u16 49)))
-          (for [i 0 (count)] (store! (field (project i) space-held) (= kind 10)))
+          (for [i 0 (count)]
+            (store! (field (project i) space-held) (= kind 10)))
           0)
       (cond (and (= kind 10)
                  (and command
-                      (and (!= (& flags 131072) (p/cast u64 0)) (= key (p/cast u16 35)))))
+                      (and (!= (& flags 131072) (p/cast u64 0))
+                           (= key (p/cast u16 35)))))
               (do
                 (if (palette/open?)
                     (palette/dismiss!)
@@ -530,27 +737,45 @@
             (palette/open?) (palette/handle! event)
             (sidebar/handle! event) true
             (timings/owns-event? event) false
-            (and (>= (.selected s) 0) (not (.overview s)) (canvas/handle! (current) event)) true
+            (and (>= (.selected s) 0)
+                 (not (.overview s))
+                 (canvas/handle! (current) event))
+              true
             (= kind 10)
               (let [action (actions/key-action key flags)]
-                (cond (and command (= key (p/cast u16 12))) (do (store! (field s running) false) true)
+                (cond (and command (= key (p/cast u16 12)))
+                        (do (store! (field s running) false) true)
                       (>= action 0) (do (invoke! action) true)
                       (.overview s)
                         (do
                           (cond (= key (p/cast u16 53)) (select! (.origin s))
                                 (= key (p/cast u16 36)) (select! (.selected s))
-                                (or (= key (p/cast u16 123)) (= key (p/cast u16 124)))
+                                (or (= key (p/cast u16 123))
+                                    (= key (p/cast u16 124)))
                                   (do
                                     (store! (field s selected)
-                                            (visible-index (+ (.selected s) (if (= key (p/cast u16 124)) 1 -1))
-                                                           (if (= key (p/cast u16 124)) 1 -1)))
-                                    (store! (field s angle) (- 0.0 (workspace/face-angle (.selected s) (count))))
+                                            (visible-index (+ (.selected s)
+                                                              (if (= key
+                                                                     (p/cast u16
+                                                                             124))
+                                                                  1
+                                                                  -1))
+                                                           (if (= key
+                                                                  (p/cast u16
+                                                                          124))
+                                                               1
+                                                               -1)))
+                                    (store! (field s angle)
+                                            (- 0.0
+                                               (workspace/face-angle (.selected s)
+                                                                     (count))))
                                     (pose! (.duration (.config s))))
                                 :else (do))
                           true)
                       :else false))
             (and (.overview s) (= kind 11)) true
-            (and (.overview s) (or (= kind 1) (= kind 2) (= kind 6) (= kind 22)))
+            (and (.overview s)
+                 (or (= kind 1) (= kind 2) (= kind 6) (= kind 22)))
               (let [pt (msg Point event (sel c"locationInWindow") [])]
                 (if (> (.x pt) (sidebar/width))
                     (do
@@ -562,7 +787,9 @@
                                 (do))
                             (= kind 6)
                               (do
-                                (store! (field s angle) (+ (.drag-angle s) (/ (- (.x pt) (.drag-x s)) 240.0)))
+                                (store! (field s angle)
+                                        (+ (.drag-angle s)
+                                           (/ (- (.x pt) (.drag-x s)) 240.0)))
                                 (pose! 0.0))
                             (= kind 2)
                               (do
@@ -574,15 +801,22 @@
                                                           (class c"NSNumber")
                                                           (sel c"numberWithDouble:")
                                                           [f64]
-                                                          (/ (- 0.0 (.angle s)) 1.5707963267948966))
+                                                          (/ (- 0.0 (.angle s))
+                                                             1.5707963267948966))
                                                      (sel c"doubleValue")
                                                      []))]
-                                  (store! (field s selected) (workspace/wrap nearest (count))))
+                                  (store! (field s selected)
+                                          (workspace/wrap nearest (count))))
                                 (pose! 0.0))
                             (= kind 22)
                               (do
                                 (store! (field s angle)
-                                        (+ (.angle s) (* (msg f64 event (sel c"scrollingDeltaY") []) 0.025)))
+                                        (+ (.angle s)
+                                           (* (msg f64
+                                                   event
+                                                   (sel c"scrollingDeltaY")
+                                                   [])
+                                              0.025)))
                                 (pose! 0.0))
                             :else (do))
                       true)
@@ -593,21 +827,32 @@
   (let [version (storage/value saved c"version")
         (mut ok)
           (or (= (p/cast i64 saved) 0)
-              (and (p/fcmp-eq version 1.0) (storage/kind? (projects/list saved) c"NSArray"))
+              (and (p/fcmp-eq version 1.0)
+                   (storage/kind? (projects/list saved) c"NSArray"))
               (and (p/fcmp-eq version 2.0) (projects/valid? saved)))]
     (do
       (for [i 0 (storage/count (projects/list saved))]
         (let [entry (storage/at (projects/list saved) i)
-              layout (if (p/fcmp-eq version 1.0) entry (storage/get entry c"layout"))]
-          (if (and (!= (p/cast i64 layout) 0) (not (canvas/restorable? layout))) (store! ok false) 0)))
+              layout
+                (if (p/fcmp-eq version 1.0) entry (storage/get entry c"layout"))]
+          (if (and (!= (p/cast i64 layout) 0) (not (canvas/restorable? layout)))
+              (store! ok false)
+              0)))
       (load ok))))
 
 (defn setup! [] (-> bool)
   (let [s (shell)
-        app (msg (ptr i8) (controls/quiet-class c"NSApplication" c"JimApplication") (sel c"sharedApplication") [])
+        app
+          (msg (ptr i8)
+               (controls/quiet-class c"NSApplication" c"JimApplication")
+               (sel c"sharedApplication")
+               [])
         window
           (msg (ptr i8)
-               (msg (ptr i8) (controls/quiet-class c"NSWindow" c"JimWindow") (sel c"alloc") [])
+               (msg (ptr i8)
+                    (controls/quiet-class c"NSWindow" c"JimWindow")
+                    (sel c"alloc")
+                    [])
                (sel c"initWithContentRect:styleMask:backing:defer:")
                [Rect u64 u64 i8]
                (rect 160.0 120.0 1320.0 860.0)
@@ -620,7 +865,11 @@
     (if (not (saved-valid? saved))
         (let [alert (new c"NSAlert")]
           (do
-            (msg i64 alert (sel c"setMessageText:") [(ptr i8)] (ns c"Saved projects could not be loaded"))
+            (msg i64
+                 alert
+                 (sel c"setMessageText:")
+                 [(ptr i8)]
+                 (ns c"Saved projects could not be loaded"))
             (msg i64
                  alert
                  (sel c"setInformativeText:")
@@ -639,7 +888,11 @@
           (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns c"Jim · Coil"))
           (msg i64 window (sel c"setReleasedWhenClosed:") [i8] (p/cast i8 0))
           (msg i64 window (sel c"setMinSize:") [Size] (Size :w 900.0 :h 580.0))
-          (msg i64 window (sel c"setAcceptsMouseMovedEvents:") [i8] (p/cast i8 1))
+          (msg i64
+               window
+               (sel c"setAcceptsMouseMovedEvents:")
+               [i8]
+               (p/cast i8 1))
           (msg i64
                window
                (sel c"setAppearance:")
@@ -651,13 +904,22 @@
                     (ns c"NSAppearanceNameDarkAqua")))
           (msg i64 root (sel c"setWantsLayer:") [i8] (p/cast i8 1))
           (background! root 0.045 0.057 0.078)
-          (set! (.model s) (msg (ptr i8) (projects/restore saved) (sel c"retain") []))
-          (set! (.projects s) (al/al-new [ProjectView] (alloc/malloc-allocator)))
+          (set! (.model s)
+                (msg (ptr i8) (projects/restore saved) (sel c"retain") []))
+          (set! (.projects s)
+                (al/al-new [ProjectView] (alloc/malloc-allocator)))
           (set! (actions/model) (.model s))
           (sidebar/setup! root (.model s))
           (set! (.stage s) (view root (rect 224.0 40.0 1096.0 820.0)))
-          (set! (.cube s) (layer-view (.stage s) (rect 32.0 32.0 1032.0 736.0) c"CATransformLayer"))
-          (msg i64 (layer (.stage s)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+          (set! (.cube s)
+                (layer-view (.stage s)
+                            (rect 32.0 32.0 1032.0 736.0)
+                            c"CATransformLayer"))
+          (msg i64
+               (layer (.stage s))
+               (sel c"setMasksToBounds:")
+               [i8]
+               (p/cast i8 1))
           ;; Jim Editor keeps the canvas edge clear. Operational status is
           ;; logged instead of creating a persistent hint strip in the UI.
           (set! (.status s) (nil))
@@ -672,21 +934,35 @@
               (let [(mut ok) true]
                 (do
                   (for [i 0 (storage/count (projects/list (.model s)))]
-                    (if (not (add-project-view! (storage/at (projects/list (.model s)) i))) (store! ok false) 0))
+                    (if (not (add-project-view! (storage/at (projects/list (.model s))
+                                                            i)))
+                        (store! ok false)
+                        0))
                   (sync-selection!)
                   (load ok))))))))
 
 (defn main [] (-> i64)
   (let [pool (new c"NSAutoreleasePool")]
     (do
-      (let [bundle (msg (ptr i8) (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") []) (sel c"bundlePath") [])]
-        (if (!= (msg i8 bundle (sel c"hasSuffix:") [(ptr i8)] (ns c".app")) (p/cast i8 0))
+      (let [bundle
+              (msg (ptr i8)
+                   (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
+                   (sel c"bundlePath")
+                   [])]
+        (if (!= (msg i8 bundle (sel c"hasSuffix:") [(ptr i8)] (ns c".app"))
+                (p/cast i8 0))
             (msg i8
-                 (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+                 (msg (ptr i8)
+                      (class c"NSFileManager")
+                      (sel c"defaultManager")
+                      [])
                  (sel c"changeCurrentDirectoryPath:")
                  [(ptr i8)]
                  (msg (ptr i8)
-                      (msg (ptr i8) bundle (sel c"stringByDeletingLastPathComponent") [])
+                      (msg (ptr i8)
+                           bundle
+                           (sel c"stringByDeletingLastPathComponent")
+                           [])
                       (sel c"stringByDeletingLastPathComponent")
                       []))
             (p/cast i8 0)))
@@ -695,7 +971,9 @@
           (do (printf c"Jim: Ghostty initialization failed.\n") 1)
           (let [s (shell)]
             (do
-              (while (and (.running s) (!= (msg i8 (.window s) (sel c"isVisible") []) (p/cast i8 0)))
+              (while (and (.running s)
+                          (!= (msg i8 (.window s) (sel c"isVisible") [])
+                              (p/cast i8 0)))
                 (let [frame-pool (new c"NSAutoreleasePool")
                       event
                         (msg (ptr i8)
@@ -703,18 +981,32 @@
                              (sel c"nextEventMatchingMask:untilDate:inMode:dequeue:")
                              [u64 (ptr i8) (ptr i8) i8]
                              (p/cast u64 -1)
-                             (msg (ptr i8) (class c"NSDate") (sel c"dateWithTimeIntervalSinceNow:") [f64] 0.2)
+                             (msg (ptr i8)
+                                  (class c"NSDate")
+                                  (sel c"dateWithTimeIntervalSinceNow:")
+                                  [f64]
+                                  0.2)
                              (ns c"kCFRunLoopDefaultMode")
                              (p/cast i8 1))]
                   (let [input-start (timings/now)]
                     (do
                       (if (!= (p/cast i64 event) 0)
-                          (if (not (handle! event)) (msg i64 (.app s) (sel c"sendEvent:") [(ptr i8)] event) 0)
+                          (if (not (handle! event))
+                              (msg i64
+                                   (.app s)
+                                   (sel c"sendEvent:")
+                                   [(ptr i8)]
+                                   event)
+                              0)
                           0)
-                      (let [action (palette/take-action!)] (if (>= action 0) (invoke! action) (do)))
-                      (let [action (sidebar/take-action!)] (if (!= action -1) (invoke! action) (do)))
-                      (let [action (palette/take-submission!)] (if (>= action 0) (submit! action (palette/text)) (do)))
-                      (timings/record! 0 (* 1000.0 (- (timings/now) input-start)))
+                      (let [action (palette/take-action!)]
+                        (if (>= action 0) (invoke! action) (do)))
+                      (let [action (sidebar/take-action!)]
+                        (if (!= action -1) (invoke! action) (do)))
+                      (let [action (palette/take-submission!)]
+                        (if (>= action 0) (submit! action (palette/text)) (do)))
+                      (timings/record! 0
+                                       (* 1000.0 (- (timings/now) input-start)))
                       (let [start (timings/now)]
                         (do
                           (maintenance!)

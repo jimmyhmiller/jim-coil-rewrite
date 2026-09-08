@@ -4,8 +4,12 @@ entry = "src/main.coil"
 source-roots = ["src", "tests"]
 exclude = ["src/session/server.coil"]
 
+[dependencies]
+paper = { path = "../paper-test/lib/paper" }
+layout = { path = "../paper-test/lib/layout" }
+
 [link]
-frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers"]
+frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers", "ImageIO", "AVFoundation"]
 libs = ["objc", "c++"]
 flags = ["build/ghostty/lib/libghostty-internal.a"]
 

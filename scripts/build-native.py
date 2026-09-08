@@ -6,5 +6,6 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 
 (ROOT / 'build').mkdir(exist_ok=True)
-subprocess.run(['coil', 'build'], cwd=ROOT / 'src/session', check=True)
+subprocess.run(['coil', 'build', '-o', str(ROOT / 'build/jim-session-next')],
+               cwd=ROOT / 'src/session', check=True)
 (ROOT / 'build/jim-session-next').replace(ROOT / 'build/jim-session')

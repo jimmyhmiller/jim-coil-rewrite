@@ -13,7 +13,10 @@
         existing
         (let [cls (objc_allocateClassPair (class parent) name 0)]
           (do
-            (method! cls c"noResponderFor:" (p/cast (ptr i8) (p/fnptr-of unhandled)) c"v@::")
+            (method! cls
+                     c"noResponderFor:"
+                     (p/cast (ptr i8) (p/fnptr-of unhandled))
+                     c"v@::")
             (objc_registerClassPair cls)
             cls)))))
 
@@ -27,7 +30,8 @@
   (p/cast (ptr i8) (p/alloc-static i8)))
 
 (defn flag [(view (ptr i8)) (key (ptr i8))] (-> bool)
-  (!= (msg i8 (objc_getAssociatedObject view key) (sel c"boolValue") []) (p/cast i8 0)))
+  (!= (msg i8 (objc_getAssociatedObject view key) (sel c"boolValue") [])
+      (p/cast i8 0)))
 
 (defn flag! [(view (ptr i8)) (key (ptr i8)) (value bool)] (-> void)
   (do
@@ -46,7 +50,11 @@
         selected (flag view (selected-key))]
     (do
       (transaction! 0.0)
-      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (msg i64
+           (class c"CATransaction")
+           (sel c"setDisableActions:")
+           [i8]
+           (p/cast i8 1))
       (if (flag view (transparent-key))
           (msg i64
                (layer view)
@@ -69,8 +77,15 @@
 (defn hover [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
   (let [target (msg (ptr i8) self (sel c"target") [])]
     (do
-      (if (not (flag self (hover-key))) (do (flag! self (hover-key) true) (paint! self)) (do))
-      (if (!= (msg i8 target (sel c"respondsToSelector:") [(ptr i8)] (sel c"hovered:")) (p/cast i8 0))
+      (if (not (flag self (hover-key)))
+          (do (flag! self (hover-key) true) (paint! self))
+          (do))
+      (if (!= (msg i8
+                   target
+                   (sel c"respondsToSelector:")
+                   [(ptr i8)]
+                   (sel c"hovered:"))
+              (p/cast i8 0))
           (msg i64 target (sel c"hovered:") [(ptr i8)] self)
           0)
       (do))))
@@ -80,7 +95,12 @@
     (do
       (flag! self (hover-key) false)
       (paint! self)
-      (if (!= (msg i8 target (sel c"respondsToSelector:") [(ptr i8)] (sel c"unhovered:")) (p/cast i8 0))
+      (if (!= (msg i8
+                   target
+                   (sel c"respondsToSelector:")
+                   [(ptr i8)]
+                   (sel c"unhovered:"))
+              (p/cast i8 0))
           (msg i64 target (sel c"unhovered:") [(ptr i8)] self)
           0)
       (do))))
@@ -89,11 +109,21 @@
   (let [existing (class c"JimHoverButton")]
     (if (!= (p/cast i64 existing) 0)
         existing
-        (let [cls (objc_allocateClassPair (class c"NSButton") c"JimHoverButton" 0)]
+        (let [cls
+                (objc_allocateClassPair (class c"NSButton") c"JimHoverButton" 0)]
           (do
-            (method! cls c"mouseEntered:" (p/cast (ptr i8) (p/fnptr-of hover)) c"v@:@")
-            (method! cls c"mouseMoved:" (p/cast (ptr i8) (p/fnptr-of hover)) c"v@:@")
-            (method! cls c"mouseExited:" (p/cast (ptr i8) (p/fnptr-of exit)) c"v@:@")
+            (method! cls
+                     c"mouseEntered:"
+                     (p/cast (ptr i8) (p/fnptr-of hover))
+                     c"v@:@")
+            (method! cls
+                     c"mouseMoved:"
+                     (p/cast (ptr i8) (p/fnptr-of hover))
+                     c"v@:@")
+            (method! cls
+                     c"mouseExited:"
+                     (p/cast (ptr i8) (p/fnptr-of exit))
+                     c"v@:@")
             (objc_registerClassPair cls)
             cls)))))
 

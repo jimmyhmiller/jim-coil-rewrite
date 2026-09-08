@@ -12,7 +12,8 @@
 (deftest palette-search-ranks-consecutive-word-starts
          (assert (> (actions/score (ns c"term") (ns c"Terminal: New terminal"))
                     (actions/score (ns c"term") (ns c"the earlier room"))))
-         (assert (= (actions/score (ns c"xyz") (ns c"Terminal: New terminal")) -1))
+         (assert (= (actions/score (ns c"xyz") (ns c"Terminal: New terminal"))
+                    -1))
          (assert (= (actions/score (ns c"") (ns c"anything")) 0)))
 
 (deftest palette-search-supports-case-and-keywords
@@ -29,7 +30,8 @@
          (assert (= (actions/key-action (p/cast u16 6) (p/cast u64 1179648)) 7)))
 
 (deftest exact-fps-keyword-outranks-scattered-letters
-         (assert (> (actions/match-score (ns c"fps") 10) (actions/match-score (ns c"fps") 4))))
+         (assert (> (actions/match-score (ns c"fps") 10)
+                    (actions/match-score (ns c"fps") 4))))
 
 (deftest palette-selection-is-consumed-exactly-once
          (let [state (palette/state)]

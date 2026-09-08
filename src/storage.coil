@@ -18,31 +18,48 @@
   (msg (ptr i8) (class c"NSNumber") (sel c"numberWithDouble:") [f64] value))
 
 (defn kind? [(value (ptr i8)) (name (ptr i8))] (-> bool)
-  (!= (msg i8 value (sel c"isKindOfClass:") [(ptr i8)] (class name)) (p/cast i8 0)))
+  (!= (msg i8 value (sel c"isKindOfClass:") [(ptr i8)] (class name))
+      (p/cast i8 0)))
 
 (defn get [(dict (ptr i8)) (key (ptr i8))] (-> (ptr i8))
-  (if (kind? dict c"NSDictionary") (msg (ptr i8) dict (sel c"objectForKey:") [(ptr i8)] (ns key)) (nil)))
+  (if (kind? dict c"NSDictionary")
+      (msg (ptr i8) dict (sel c"objectForKey:") [(ptr i8)] (ns key))
+      (nil)))
 
 (defn numeric? [(dict (ptr i8)) (key (ptr i8))] (-> bool)
   (kind? (get dict key) c"NSNumber"))
 
 (defn value [(dict (ptr i8)) (key (ptr i8))] (-> f64)
-  (let [v (get dict key)] (if (kind? v c"NSNumber") (msg f64 v (sel c"doubleValue") []) 0.0)))
+  (let [v (get dict key)]
+    (if (kind? v c"NSNumber") (msg f64 v (sel c"doubleValue") []) 0.0)))
 
 (defn count [(arr (ptr i8))] (-> i64)
   (if (kind? arr c"NSArray") (msg i64 arr (sel c"count") []) 0))
 
 (defn at [(arr (ptr i8)) (index i64)] (-> (ptr i8))
-  (if (and (>= index 0) (< index (count arr))) (msg (ptr i8) arr (sel c"objectAtIndex:") [i64] index) (nil)))
+  (if (and (>= index 0) (< index (count arr)))
+      (msg (ptr i8) arr (sel c"objectAtIndex:") [i64] index)
+      (nil)))
 
 (defn path [] (-> (ptr i8))
-  (msg (ptr i8) (ns c"~/Library/Application Support/JimCoil/layout.json") (sel c"stringByExpandingTildeInPath") []))
+  (msg (ptr i8)
+       (ns c"~/Library/Application Support/JimCoil/layout.json")
+       (sel c"stringByExpandingTildeInPath")
+       []))
 
 (defn read [] (-> (ptr i8))
-  (let [data (msg (ptr i8) (class c"NSData") (sel c"dataWithContentsOfFile:") [(ptr i8)] (path))]
+  (let [data
+          (msg (ptr i8)
+               (class c"NSData")
+               (sel c"dataWithContentsOfFile:")
+               [(ptr i8)]
+               (path))]
     (if (= (p/cast i64 data) 0)
         (if (!= (msg i8
-                     (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+                     (msg (ptr i8)
+                          (class c"NSFileManager")
+                          (sel c"defaultManager")
+                          [])
                      (sel c"fileExistsAtPath:")
                      [(ptr i8)]
                      (path))
@@ -61,7 +78,8 @@
           (if (= (p/cast i64 result) 0) (dictionary) result)))))
 
 (defn write! [(snapshot (ptr i8))] (-> bool)
-  (let [manager (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+  (let [manager
+          (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
         file (path)
         data
           (msg (ptr i8)
@@ -80,4 +98,10 @@
            (p/cast i8 1)
            (nil)
            (nil))
-      (!= (msg i8 data (sel c"writeToFile:atomically:") [(ptr i8) i8] file (p/cast i8 1)) (p/cast i8 0)))))
+      (!= (msg i8
+               data
+               (sel c"writeToFile:atomically:")
+               [(ptr i8) i8]
+               file
+               (p/cast i8 1))
+          (p/cast i8 0)))))

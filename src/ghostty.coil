@@ -39,21 +39,27 @@
    (write (ptr i8))
    (close (ptr i8))])
 
-(static-assert (= (p/sizeof SurfaceConfig) 88) "Ghostty surface config ABI size")
+(static-assert (= (p/sizeof SurfaceConfig) 88)
+               "Ghostty surface config ABI size")
 
-(static-assert (= (p/alignof SurfaceConfig) 8) "Ghostty surface config ABI alignment")
+(static-assert (= (p/alignof SurfaceConfig) 8)
+               "Ghostty surface config ABI alignment")
 
-(static-assert (= (p/offsetof SurfaceConfig platform-tag) 0) "Ghostty platform tag offset")
+(static-assert (= (p/offsetof SurfaceConfig platform-tag) 0)
+               "Ghostty platform tag offset")
 
-(static-assert (= (p/offsetof SurfaceConfig view) 8) "Ghostty platform payload offset")
+(static-assert (= (p/offsetof SurfaceConfig view) 8)
+               "Ghostty platform payload offset")
 
-(static-assert (= (p/offsetof SurfaceConfig userdata) 16) "Ghostty userdata offset")
+(static-assert (= (p/offsetof SurfaceConfig userdata) 16)
+               "Ghostty userdata offset")
 
 (static-assert (= (p/offsetof SurfaceConfig scale) 24) "Ghostty scale offset")
 
 (static-assert (= (p/offsetof SurfaceConfig cwd) 40) "Ghostty cwd offset")
 
-(static-assert (= (p/offsetof SurfaceConfig context) 84) "Ghostty context offset")
+(static-assert (= (p/offsetof SurfaceConfig context) 84)
+               "Ghostty context offset")
 
 (static-assert (= (p/sizeof Key) 32) "Ghostty key ABI size")
 
@@ -63,7 +69,8 @@
 
 (static-assert (= (p/sizeof Runtime) 64) "Ghostty runtime ABI size")
 
-(static-assert (= (p/offsetof Runtime wakeup) 16) "Ghostty wakeup callback offset")
+(static-assert (= (p/offsetof Runtime wakeup) 16)
+               "Ghostty wakeup callback offset")
 
 (static-assert (= (p/sizeof Target) 16) "Ghostty target ABI size")
 
@@ -117,24 +124,41 @@
 
 (extern ghostty_surface_mouse_scroll :cc c [(ptr i8) f64 f64 i32] (-> void))
 
-(extern ghostty_surface_ime_point :cc c [(ptr i8) (ptr f64) (ptr f64) (ptr f64) (ptr f64)] (-> void))
+(extern ghostty_surface_ime_point
+        :cc
+        c
+        [(ptr i8) (ptr f64) (ptr f64) (ptr f64) (ptr f64)]
+        (-> void))
 
 (extern ghostty_surface_binding_action :cc c [(ptr i8) (ptr i8) u64] (-> bool))
 
-(extern ghostty_surface_complete_clipboard_request :cc c [(ptr i8) (ptr i8) (ptr i8) bool] (-> void))
+(extern ghostty_surface_complete_clipboard_request
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr i8) bool]
+        (-> void))
 
 (extern ghostty_surface_process_exited :cc c [(ptr i8)] (-> bool))
 
 (extern ghostty_surface_userdata :cc c [(ptr i8)] (-> (ptr i8)))
 
-(extern ghostty_surface_new_session :cc c [(ptr i8) (ptr SurfaceConfig) i32] (-> (ptr i8)))
+(extern ghostty_surface_new_session
+        :cc
+        c
+        [(ptr i8) (ptr SurfaceConfig) i32]
+        (-> (ptr i8)))
 
 (defstruct TextPoint [(tag i32) (coord i32) (x u32) (y u32)])
 
 (defstruct TextSelection [(top TextPoint) (bottom TextPoint) (rectangle bool)])
 
-(defstruct Text [(x f64) (y f64) (offset u32) (length u32) (text (ptr i8)) (size u64)])
+(defstruct Text
+  [(x f64) (y f64) (offset u32) (length u32) (text (ptr i8)) (size u64)])
 
-(extern ghostty_surface_read_text :cc c [(ptr i8) TextSelection (ptr Text)] (-> bool))
+(extern ghostty_surface_read_text
+        :cc
+        c
+        [(ptr i8) TextSelection (ptr Text)]
+        (-> bool))
 
 (extern ghostty_surface_free_text :cc c [(ptr i8) (ptr Text)] (-> void))

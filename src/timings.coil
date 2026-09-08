@@ -30,7 +30,10 @@
 
 (defn owns-event? [(event (ptr i8))] (-> bool)
   (let [kind (msg i64 event (sel c"type") [])]
-    (if (and (visible?) (or (and (>= kind 1) (<= kind 7)) (= kind 22) (and (>= kind 25) (<= kind 30))))
+    (if (and (visible?)
+             (or (and (>= kind 1) (<= kind 7))
+                 (= kind 22)
+                 (and (>= kind 25) (<= kind 30))))
         (let [pt
                 (msg Point
                      (.view (state))
@@ -38,7 +41,8 @@
                      [Point (ptr i8)]
                      (msg Point event (sel c"locationInWindow") [])
                      (nil))]
-          (and (and (>= (.x pt) 0.0) (< (.x pt) 640.0)) (and (>= (.y pt) 0.0) (< (.y pt) 450.0))))
+          (and (and (>= (.x pt) 0.0) (< (.x pt) 640.0))
+               (and (>= (.y pt) 0.0) (< (.y pt) 450.0))))
         false)))
 
 (defn now [] (-> f64)
@@ -50,9 +54,12 @@
         v (field s pending)]
     (if (visible?)
         (cond (= stage 0) (store! (field v input) (+ (.input v) milliseconds))
-              (= stage 1) (store! (field v maintenance) (+ (.maintenance v) milliseconds))
-              (= stage 2) (store! (field v windows) (+ (.windows v) milliseconds))
-              (= stage 3) (store! (field v ghostty) (+ (.ghostty v) milliseconds))
+              (= stage 1)
+                (store! (field v maintenance) (+ (.maintenance v) milliseconds))
+              (= stage 2)
+                (store! (field v windows) (+ (.windows v) milliseconds))
+              (= stage 3)
+                (store! (field v ghostty) (+ (.ghostty v) milliseconds))
               :else (store! (field v overlay) (+ (.overlay v) milliseconds)))
         (do))))
 
@@ -66,7 +73,11 @@
            formatter
            (sel c"stringFromNumber:")
            [(ptr i8)]
-           (msg (ptr i8) (class c"NSNumber") (sel c"numberWithDouble:") [f64] value)))))
+           (msg (ptr i8)
+                (class c"NSNumber")
+                (sel c"numberWithDouble:")
+                [f64]
+                value)))))
 
 (defn append [(a (ptr i8)) (b (ptr i8))] (-> (ptr i8))
   (msg (ptr i8) a (sel c"stringByAppendingString:") [(ptr i8)] b))
@@ -88,7 +99,11 @@
         ceiling (if (> (.maximum summary) 33.34) (.maximum summary) 33.34)]
     (do
       (transaction! 0.0)
-      (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (p/cast i8 1))
+      (msg i64
+           (class c"CATransaction")
+           (sel c"setDisableActions:")
+           [i8]
+           (p/cast i8 1))
       (for [i 0 120]
         (let [at (% (+ (.next h) i) 120)
               sample (load (p/index (field h samples) at))
@@ -96,12 +111,22 @@
               x (+ 20.0 (* (p/cast f64 i) 5.0))
               (mut y) 80.0]
           (do
-            (msg i64 bar (sel c"setFrame:") [Rect] (rect x 230.0 4.0 (* 95.0 (/ (.interval sample) ceiling))))
+            (msg i64
+                 bar
+                 (sel c"setFrame:")
+                 [Rect]
+                 (rect x 230.0 4.0 (* 95.0 (/ (.interval sample) ceiling))))
             (for [j 0 5]
               (let [segment (load (p/index (field s segments) (+ (* i 5) j)))
-                    height (* 95.0 (clamp (/ (stage-value sample j) ceiling) 0.0 1.0))]
+                    height
+                      (* 95.0
+                         (clamp (/ (stage-value sample j) ceiling) 0.0 1.0))]
                 (do
-                  (msg i64 segment (sel c"setFrame:") [Rect] (rect x (load y) 4.0 height))
+                  (msg i64
+                       segment
+                       (sel c"setFrame:")
+                       [Rect]
+                       (rect x (load y) 4.0 height))
                   (store! y (+ (load y) height))))))))
       (commit!)
       (if (>= time (.next-label s))
@@ -116,7 +141,9 @@
                  (.detail s)
                  (sel c"setStringValue:")
                  [(ptr i8)]
-                 (append (append (pair c"Interval  avg " (.mean summary) c" ms    p95 ")
+                 (append (append (pair c"Interval  avg "
+                                       (.mean summary)
+                                       c" ms    p95 ")
                                  (pair c"" (.p95 summary) c" ms    max "))
                          (append (pair c"" (.maximum summary) c" ms    late ")
                                  (number (p/cast f64 (.late summary))))))
@@ -124,10 +151,17 @@
                  (.stages s)
                  (sel c"setStringValue:")
                  [(ptr i8)]
-                 (append (append (pair c"CPU ms / callback: input " (.input summary) c"   maintenance ")
+                 (append (append (pair c"CPU ms / callback: input "
+                                       (.input summary)
+                                       c"   maintenance ")
                                  (pair c"" (.maintenance summary) c"   AppKit "))
-                         (append (pair c"" (.windows summary) c"   Ghostty tick ")
-                                 (append (pair c"" (.ghostty summary) c"   overlay ") (number (.overlay summary))))))
+                         (append (pair c""
+                                       (.windows summary)
+                                       c"   Ghostty tick ")
+                                 (append (pair c""
+                                               (.ghostty summary)
+                                               c"   overlay ")
+                                         (number (.overlay summary))))))
             (msg i64
                  (.scale-label s)
                  (sel c"setStringValue:")
@@ -141,7 +175,10 @@
 (defn display [(self (ptr i8)) (cmd (ptr i8)) (link (ptr i8))] (-> void)
   (let [s (state)
         time (now)
-        budget (* 1000.0 (- (msg f64 link (sel c"targetTimestamp") []) (msg f64 link (sel c"timestamp") [])))]
+        budget
+          (* 1000.0
+             (- (msg f64 link (sel c"targetTimestamp") [])
+                (msg f64 link (sel c"timestamp") [])))]
     (if (visible?)
         (do
           (if (> (.last s) 0.0)
@@ -162,7 +199,10 @@
           (set! (.last s) time)
           (paint! time)
           (record! 4 (* 1000.0 (- (now) time))))
-        (do (msg i64 link (sel c"setPaused:") [i8] (p/cast i8 1)) (set! (.last s) 0.0) (do)))))
+        (do
+          (msg i64 link (sel c"setPaused:") [i8] (p/cast i8 1))
+          (set! (.last s) 0.0)
+          (do)))))
 
 (defn toggle! [] (-> void)
   (let [s (state)]
@@ -196,7 +236,11 @@
 (defn new-layer [(parent (ptr i8)) (r f64) (g f64) (b f64)] (-> (ptr i8))
   (let [l (msg (ptr i8) (class c"CALayer") (sel c"layer") [])]
     (do
-      (msg i64 l (sel c"setBackgroundColor:") [(ptr i8)] (msg (ptr i8) (color r g b 1.0) (sel c"CGColor") []))
+      (msg i64
+           l
+           (sel c"setBackgroundColor:")
+           [(ptr i8)]
+           (msg (ptr i8) (color r g b 1.0) (sel c"CGColor") []))
       (msg i64 (layer parent) (sel c"addSublayer:") [(ptr i8)] l)
       l)))
 
@@ -208,7 +252,9 @@
         cls (objc_allocateClassPair (class c"NSObject") c"JimFrameTimings" 0)
         content (msg (ptr i8) owner (sel c"contentView") [])
         bounds (msg Rect content (sel c"bounds") [])
-        root (view content (rect (- (.w bounds) 656.0) (- (.h bounds) 466.0) 640.0 450.0))]
+        root
+          (view content
+                (rect (- (.w bounds) 656.0) (- (.h bounds) 466.0) 640.0 450.0))]
     (do
       (set! (.view s) root)
       (set! (.owner s) owner)
@@ -222,16 +268,27 @@
            [(ptr i8)]
            (msg (ptr i8) (color 0.3 0.4 0.5 1.0) (sel c"CGColor") []))
       (background! root 0.055 0.07 0.095)
-      (set! (.headline s) (label root c"Waiting for display callbacks…" (rect 20.0 408.0 560.0 26.0) 19.0 false))
-      (set! (.detail s) (label root c"" (rect 20.0 376.0 600.0 24.0) 12.0 false))
-      (label root c"Display callback interval" (rect 20.0 337.0 600.0 22.0) 12.0 true)
+      (set! (.headline s)
+            (label root
+                   c"Waiting for display callbacks…"
+                   (rect 20.0 408.0 560.0 26.0)
+                   19.0
+                   false))
+      (set! (.detail s)
+            (label root c"" (rect 20.0 376.0 600.0 24.0) 12.0 false))
+      (label root
+             c"Display callback interval"
+             (rect 20.0 337.0 600.0 22.0)
+             12.0
+             true)
       (label root
              c"Shell CPU: input · maintenance · AppKit · Ghostty tick · overlay"
              (rect 20.0 191.0 600.0 24.0)
              12.0
              true)
       (set! (.stages s) (label root c"" (rect 20.0 52.0 610.0 24.0) 10.0 false))
-      (set! (.scale-label s) (label root c"" (rect 20.0 28.0 610.0 24.0) 10.0 true))
+      (set! (.scale-label s)
+            (label root c"" (rect 20.0 28.0 610.0 24.0) 10.0 true))
       (label root
              c"Display cadence ≠ rendered FPS. Ghostty render-thread / GPU timings are not exposed."
              (rect 20.0 6.0 615.0 20.0)
@@ -243,9 +300,21 @@
           (for [j 0 5]
             (store! (p/index (field s segments) (+ (* i 5) j))
                     (new-layer root
-                               (cond (= j 0) 0.4 (= j 1) 0.98 (= j 2) 0.6 (= j 3) 0.72 :else 0.5)
-                               (cond (= j 0) 0.78 (= j 1) 0.7 (= j 2) 0.85 (= j 3) 0.5 :else 0.55)
-                               (cond (= j 0) 0.96 (= j 1) 0.35 (= j 2) 0.5 (= j 3) 0.95 :else 0.6))))))
+                               (cond (= j 0) 0.4
+                                     (= j 1) 0.98
+                                     (= j 2) 0.6
+                                     (= j 3) 0.72
+                                     :else 0.5)
+                               (cond (= j 0) 0.78
+                                     (= j 1) 0.7
+                                     (= j 2) 0.85
+                                     (= j 3) 0.5
+                                     :else 0.55)
+                               (cond (= j 0) 0.96
+                                     (= j 1) 0.35
+                                     (= j 2) 0.5
+                                     (= j 3) 0.95
+                                     :else 0.6))))))
       (method! cls c"display:" (p/cast (ptr i8) (p/fnptr-of display)) c"v@:@")
       (method! cls c"close:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
@@ -261,7 +330,11 @@
         (do
           (frame! close (rect 596.0 407.0 28.0 28.0))
           (msg i64 close (sel c"setBordered:") [i8] (p/cast i8 0))
-          (msg i64 close (sel c"setAccessibilityLabel:") [(ptr i8)] (ns c"Close frame timings"))
+          (msg i64
+               close
+               (sel c"setAccessibilityLabel:")
+               [(ptr i8)]
+               (ns c"Close frame timings"))
           (msg i64 root (sel c"addSubview:") [(ptr i8)] close)))
       (store! (field s link)
               (msg (ptr i8)

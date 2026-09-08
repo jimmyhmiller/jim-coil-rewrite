@@ -4,7 +4,7 @@ entry = "server.coil"
 source-roots = ["."]
 
 [build]
-out = "../../../../build/jim-session-next"
+out = "../../build/jim-session-next"
 optimization = 2
 
 [link]

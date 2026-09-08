@@ -1,0 +1,48 @@
+(module jim.atelier-model)
+(import "coil.primitive" :as p)
+
+;;; The desktop is a bounded composition. Dragging never loses a slip offscreen.
+(defn bounded [(value f64) (low f64) (high f64)] (-> f64)
+  (if (< value low) low (if (> value high) high value)))
+
+(defstruct Slip [(x f64) (y f64) (visible bool)])
+
+(defstruct Desk
+  [(page i64)
+   (stock i64)
+   (note-page i64)
+   (notes (ptr i8))
+   (terminal Slip)
+   (memo Slip)
+   (specimen Slip)
+   (drag i64)
+   (grab-x f64)
+   (grab-y f64)
+   (saved bool)])
+
+(defn state [] (-> (ptr Desk))
+  (p/alloc-static Desk))
+
+(defn reset-positions! [] (-> void)
+  (set! (.terminal (state))
+        (Slip
+          :x 64.0
+          :y 210.0
+          :visible true))
+  (set! (.memo (state))
+        (Slip
+          :x 844.0
+          :y 180.0
+          :visible true))
+  (set! (.specimen (state))
+        (Slip
+          :x 856.0
+          :y 458.0
+          :visible true)))
+
+(defn move! [(slip (mut Slip)) (x f64) (y f64) (w f64) (h f64)] (-> void)
+  (set! (.x slip) (bounded x 30.0 (- 1250.0 w)))
+  (set! (.y slip) (bounded y 160.0 (- 744.0 h))))
+
+(defn petals [(value i64)] (-> i64)
+  (if (< value 3) 3 (if (> value 24) 24 value)))

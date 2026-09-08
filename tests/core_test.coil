@@ -14,7 +14,11 @@
          (assert (= (workspace/wrap -9 4) 3)))
 
 (deftest front-workspace-exactly-matches-flat-plane
-         (let [face (CATransform3DTranslate (workspace/face-transform 0 4 1000.0) 0.0 0.0 500.0)
+         (let [face
+                 (CATransform3DTranslate (workspace/face-transform 0 4 1000.0)
+                                         0.0
+                                         0.0
+                                         500.0)
                root (workspace/root-transform 0.0 false 1000.0)]
            (assert (near? (+ (.m43 face) (.m43 root)) 0.0))
            (assert (near? (.m11 face) 1.0))
@@ -37,7 +41,8 @@
            (assert (reload/load-config! c"build/shell-test.dylib" config))
            (assert (near? (.duration config) 0.42))
            (assert (near? (.sidebar config) 224.0))
-           (assert (not (reload/load-config! c"build/no-such-image.dylib" config)))
+           (assert (not (reload/load-config! c"build/no-such-image.dylib"
+                                             config)))
            (assert (near? (.sidebar config) 224.0))))
 
 (deftest invalid-hot-load-values-are-rejected
@@ -50,7 +55,12 @@
 
 (deftest native-index-formatting-uses-the-real-integer
          (let [pool (new c"NSAutoreleasePool")]
-           (assert (= (strcmp (utf8 (indexed-string c"Terminal " 2 c"")) c"Terminal 2") (p/cast i32 0)))
-           (assert (= (strcmp (utf8 (indexed-string c"build/config-" 12 c".dylib")) c"build/config-12.dylib")
+           (assert (= (strcmp (utf8 (indexed-string c"Terminal " 2 c""))
+                              c"Terminal 2")
+                      (p/cast i32 0)))
+           (assert (= (strcmp (utf8 (indexed-string c"build/config-"
+                                                    12
+                                                    c".dylib"))
+                              c"build/config-12.dylib")
                       (p/cast i32 0)))
            (release pool)))

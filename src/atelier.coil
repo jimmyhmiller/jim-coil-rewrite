@@ -1,0 +1,555 @@
+(module jim.atelier)
+(import "paper.platform" :as host)
+(import "paper.lighting" :as light)
+(import "jim.atelier-ui" :as ui)
+(import "jim.atelier-model" :as model)
+(import "jim.atelier-plugin" :as plugin)
+(import "jim.atelier-host" :as app-host)
+(import "paper.ffi" :as ffi)
+(import "jim.native" :use *)
+(import "jim.storage" :as storage)
+(import "jim.sessions" :as sessions)
+(import "jim.terminal" :as terminal)
+(import "jim.ghostty" :as g)
+(import "coil.primitive" :as p)
+
+(defstruct Runtime
+  [(preferences (ptr i8))
+   (terminal (ptr terminal/Terminal))
+   (session-id (ptr i8))
+   (started bool)
+   (failed bool)
+   (attached bool)
+   (was-visible bool)
+   (last-w f64)
+   (last-h f64)
+   (last-x f64)
+   (last-y f64)
+   (pointer-captured bool)])
+
+(defn runtime [] (-> (ptr Runtime))
+  (p/alloc-static Runtime))
+
+(defn snapshot? [] (-> bool)
+  (.headless (host/host)))
+
+(defn prefs [] (-> (ptr i8))
+  (.preferences (runtime)))
+
+(defn preference [(key (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (prefs) (sel c"objectForKey:") [(ptr i8)] (ns key)))
+
+(defn pref! [(key (ptr i8)) (value (ptr i8))] (-> void)
+  (when (not (snapshot?))
+    (msg i64
+         (prefs)
+         (sel c"setObject:forKey:")
+         [(ptr i8) (ptr i8)]
+         value
+         (ns key))))
+
+(defn save! [] (-> void)
+  (let [s (model/state)]
+    (pref! c"notes" (.notes s))
+    (pref! c"specimen" (storage/number (p/cast f64 (.value (plugin/state)))))
+    (pref! c"stock" (storage/number (p/cast f64 (.stock s))))
+    (let [positions (storage/array)]
+      (storage/add! positions (storage/number (.x (.terminal s))))
+      (storage/add! positions (storage/number (.y (.terminal s))))
+      (storage/add! positions (storage/number (.x (.memo s))))
+      (storage/add! positions (storage/number (.y (.memo s))))
+      (storage/add! positions (storage/number (.x (.specimen s))))
+      (storage/add! positions (storage/number (.y (.specimen s))))
+      (pref! c"positions" positions))))
+
+(defn initialize! [(page i64)] (-> void)
+  (let [s (model/state)
+        rt (runtime)]
+    (model/reset-positions!)
+    (set! (.page s) (if (and (>= page 0) (<= page 3)) page 0))
+    (set! (.notes s) (msg (ptr i8) (storage/array) (sel c"retain") []))
+    (set! (ui/lighting) (light/lighting 0.16 -0.24 780.0 0.56 0.7))
+    (plugin/initialize!)
+    (host/paper_tick_interval 0.2)
+    (when (not (snapshot?))
+      (set! (.preferences rt)
+            (msg (ptr i8)
+                 (msg (ptr i8) (class c"NSUserDefaults") (sel c"alloc") [])
+                 (sel c"initWithSuiteName:")
+                 [(ptr i8)]
+                 (ns (if (= (getenv c"JIM_ATELIER_PREFERENCES") (nil))
+                         c"dev.jim.atelier"
+                         (getenv c"JIM_ATELIER_PREFERENCES")))))
+      (let [notes (preference c"notes")
+            stock (preference c"stock")
+            positions (preference c"positions")]
+        (when (storage/kind? (preference c"specimen") c"NSNumber")
+          (let [value
+                  (msg i64 (preference c"specimen") (sel c"integerValue") [])]
+            (when (and (>= value 3) (<= value 24))
+              (set! (.value (plugin/state)) value))))
+        (for [i 0 (storage/count notes)]
+          (when (storage/kind? (storage/at notes i) c"NSString")
+            (storage/add! (.notes s) (storage/at notes i))))
+        (when (storage/kind? stock c"NSNumber")
+          (let [v (msg i64 stock (sel c"integerValue") [])]
+            (when (and (>= v 0) (< v 6)) (set! (.stock s) v))))
+        (when (= (storage/count positions) 6)
+          (let [(mut valid) true]
+            (for [i 0 6]
+              (when (not (storage/kind? (storage/at positions i) c"NSNumber"))
+                (set! valid false)))
+            (when (load valid)
+              (model/move! (mut (.terminal s))
+                           (msg f64
+                                (storage/at positions 0)
+                                (sel c"doubleValue")
+                                [])
+                           (msg f64
+                                (storage/at positions 1)
+                                (sel c"doubleValue")
+                                [])
+                           744.0
+                           424.0)
+              (model/move! (mut (.memo s))
+                           (msg f64
+                                (storage/at positions 2)
+                                (sel c"doubleValue")
+                                [])
+                           (msg f64
+                                (storage/at positions 3)
+                                (sel c"doubleValue")
+                                [])
+                           326.0
+                           226.0)
+              (model/move! (mut (.specimen s))
+                           (msg f64
+                                (storage/at positions 4)
+                                (sel c"doubleValue")
+                                [])
+                           (msg f64
+                                (storage/at positions 5)
+                                (sel c"doubleValue")
+                                [])
+                           310.0
+                           240.0)
+              0))))
+      (let [id (preference c"session-id")]
+        (when (and (storage/kind? id c"NSString") (sessions/valid-id? id))
+          (set! (.session-id rt) (msg (ptr i8) id (sel c"copy") [])))))))
+
+(defn terminal-visible? [] (-> bool)
+  (and (= (.page (model/state)) 0)
+       (.visible (.terminal (model/state)))
+       (not (.open (ui/lighting)))))
+
+(defn native-terminal-bounds [] (-> Rect)
+  (let [r (ui/terminal-bounds)
+        h (host/host)
+        sx (/ (.window-w h) 1280.0)
+        sy (/ (.window-h h) 800.0)]
+    (rect (* (.x r) sx)
+          (* (- 800.0 (+ (.y r) (.h r))) sy)
+          (* (.w r) sx)
+          (* (.h r) sy))))
+
+(defn attach! [] (-> void)
+  (let [rt (runtime)]
+    (when (and (not (snapshot?))
+               (!= (.window (host/host)) (nil))
+               (not (.attached rt)))
+      (when (not (.started rt))
+        (set! (.started rt) (!= (terminal/start!) (nil))))
+      (when (.started rt)
+        (when (= (.session-id rt) (nil))
+          (set! (.session-id rt)
+                (msg (ptr i8) (sessions/identifier) (sel c"copy") []))
+          (pref! c"session-id" (.session-id rt))
+          0)
+        (let [cwd
+                (msg (ptr i8)
+                     (msg (ptr i8)
+                          (class c"NSFileManager")
+                          (sel c"defaultManager")
+                          [])
+                     (sel c"currentDirectoryPath")
+                     [])
+              t
+                (terminal/create! (.view (host/host))
+                                  (native-terminal-bounds)
+                                  (utf8 cwd)
+                                  (.session-id rt))]
+          (if (= (.surface t) (nil))
+              (do (terminal/free! t) (set! (.failed rt) true))
+              (do
+                (set! (.terminal rt) t)
+                (set! (.attached rt) true)
+                (set! (.failed rt) false)
+                (g/ghostty_surface_set_focus (.surface t) true)
+                (msg bool
+                     (.window (host/host))
+                     (sel c"makeFirstResponder:")
+                     [(ptr i8)]
+                     (.view t))
+                0)))))))
+
+(defn layout-terminal! [] (-> void)
+  (let [rt (runtime)]
+    (when (.attached rt)
+      (let [t (.terminal rt)
+            visible (terminal-visible?)
+            r (native-terminal-bounds)]
+        (when (or (p/fcmp-ne (.w r) (.last-w rt))
+                  (p/fcmp-ne (.h r) (.last-h rt))
+                  (p/fcmp-ne (.x r) (.last-x rt))
+                  (p/fcmp-ne (.y r) (.last-y rt)))
+          (terminal/resize! t
+                            r
+                            (msg f64
+                                 (.window (host/host))
+                                 (sel c"backingScaleFactor")
+                                 []))
+          (set! (.last-w rt) (.w r))
+          (set! (.last-h rt) (.h r))
+          (set! (.last-x rt) (.x r))
+          (set! (.last-y rt) (.y r)))
+        (msg i64 (.view t) (sel c"setHidden:") [bool] (not visible))
+        (when (!= visible (.was-visible rt))
+          (g/ghostty_surface_set_occlusion (.surface t) visible)
+          (g/ghostty_surface_set_focus (.surface t) visible)
+          (when visible
+            (msg bool
+                 (.window (host/host))
+                 (sel c"makeFirstResponder:")
+                 [(ptr i8)]
+                 (.view t))
+            0)
+          (set! (.was-visible rt) visible))
+        (mask-terminal!)))))
+
+(defn over-slip? [(slip model/Slip) (x f64) (y f64) (w f64) (h f64)] (-> bool)
+  (and (.visible slip)
+       (>= x (.x slip))
+       (< x (+ (.x slip) w))
+       (>= y (.y slip))
+       (< y (+ (.y slip) h))))
+
+(defn covered? [(x f64) (y f64)] (-> bool)
+  (or (over-slip? (.memo (model/state)) x y 326.0 226.0)
+      (over-slip? (.specimen (model/state)) x y 310.0 240.0)))
+
+;;; Apply the same card occlusion to the native terminal and its hit testing.
+;;; Rectangles are combined with a nonzero winding rule, so overlapping covers
+;;; remain covered rather than XOR-ing back into visible terminal pixels.
+(defn mask-terminal! [] (-> void)
+  (let [rt (runtime)
+        bounds (native-terminal-bounds)
+        path (ffi/CGPathCreateMutable)
+        sx (/ (.window-w (host/host)) 1280.0)
+        sy (/ (.window-h (host/host)) 800.0)
+        mask (msg (ptr i8) (class c"CAShapeLayer") (sel c"layer") [])]
+    (ffi/CGPathAddRoundedRect path
+                              (p/cast (ptr ffi/CGAffine) 0)
+                              (ffi/cgrect 0.0 0.0 (.w bounds) (.h bounds))
+                              0.0
+                              0.0)
+    (for [i 0 2]
+      (let [slip (if (= i 0) (.memo (model/state)) (.specimen (model/state)))
+            w (if (= i 0) 326.0 310.0)
+            h (if (= i 0) 226.0 240.0)
+            x (- (* (.x slip) sx) (.x bounds))
+            y (- (* (- 800.0 (+ (.y slip) h)) sy) (.y bounds))]
+        (when (.visible slip)
+          (ffi/CGPathMoveToPoint path (p/cast (ptr ffi/CGAffine) 0) x y)
+          (ffi/CGPathAddLineToPoint path
+                                    (p/cast (ptr ffi/CGAffine) 0)
+                                    x
+                                    (+ y (* h sy)))
+          (ffi/CGPathAddLineToPoint path
+                                    (p/cast (ptr ffi/CGAffine) 0)
+                                    (+ x (* w sx))
+                                    (+ y (* h sy)))
+          (ffi/CGPathAddLineToPoint path
+                                    (p/cast (ptr ffi/CGAffine) 0)
+                                    (+ x (* w sx))
+                                    y)
+          (ffi/CGPathCloseSubpath path)
+          0)))
+    (let [a (.memo (model/state))
+          b (.specimen (model/state))
+          left (if (> (.x a) (.x b)) (.x a) (.x b))
+          top (if (> (.y a) (.y b)) (.y a) (.y b))
+          right
+            (if (< (+ (.x a) 326.0) (+ (.x b) 310.0))
+                (+ (.x a) 326.0)
+                (+ (.x b) 310.0))
+          bottom
+            (if (< (+ (.y a) 226.0) (+ (.y b) 240.0))
+                (+ (.y a) 226.0)
+                (+ (.y b) 240.0))]
+      (when (and (.visible a) (.visible b) (> right left) (> bottom top))
+        (ffi/CGPathAddRoundedRect path
+                                  (p/cast (ptr ffi/CGAffine) 0)
+                                  (ffi/cgrect (- (* left sx) (.x bounds))
+                                              (- (* (- 800.0 bottom) sy)
+                                                 (.y bounds))
+                                              (* (- right left) sx)
+                                              (* (- bottom top) sy))
+                                  0.0
+                                  0.0)
+        0))
+    (msg i64 mask (sel c"setPath:") [(ptr i8)] path)
+    (msg i64 (layer (.view (.terminal rt))) (sel c"setMask:") [(ptr i8)] mask)
+    (ffi/CGPathRelease path)))
+
+;;; Native child responders get first refusal before Paper keyboard navigation.
+(defn native-event [(ev (ptr i8))] (-> bool)
+  (let [rt (runtime)
+        kind (msg i64 ev (sel c"type") [])
+        window (.window (host/host))]
+    (if (or (not (.attached rt))
+            (not (terminal-visible?))
+            (!= (msg (ptr i8) ev (sel c"window") []) window))
+        false
+        (let [t (.terminal rt)]
+          (cond (and (or (= kind 10) (= kind 11) (= kind 12))
+                     (= (msg (ptr i8) window (sel c"firstResponder") [])
+                        (.view t)))
+                  (let [key (msg u16 ev (sel c"keyCode") [])
+                        flags (msg i64 ev (sel c"modifierFlags") [])]
+                    (if (and (= kind 10)
+                             (= key (p/cast u16 12))
+                             (!= (& flags 1048576) 0))
+                        (msg i64 window (sel c"close") [])
+                        (msg i64
+                             (.app (host/host))
+                             (sel c"sendEvent:")
+                             [(ptr i8)]
+                             ev))
+                    true)
+                (or (and (>= kind 1) (<= kind 7))
+                    (= kind 22)
+                    (and (>= kind 25) (<= kind 27)))
+                  (let [pt (msg Point ev (sel c"locationInWindow") [])
+                        x (* (/ (.x pt) (.window-w (host/host))) 1280.0)
+                        y (* (- 1.0 (/ (.y pt) (.window-h (host/host)))) 800.0)
+                        r (ui/terminal-bounds)
+                        inside
+                          (and (>= x (.x r))
+                               (< x (+ (.x r) (.w r)))
+                               (>= y (.y r))
+                               (< y (+ (.y r) (.h r))))]
+                    (cond (and inside
+                               (covered? x y)
+                               (not (.pointer-captured rt)))
+                            (do
+                              (case kind 1
+                                    (host/pointer-event ev 1) 6
+                                    (host/pointer-event ev 2) 2
+                                    (do
+                                      (host/pointer-event ev 3)
+                                      (host/dispatch 8 0 0.0 0.0))
+                                      0)
+                              true)
+                          (and (= (.drag (model/state)) 0)
+                               (or (.pointer-captured rt)
+                                   (and inside (not (covered? x y)))))
+                            (do
+                              (when (or (= kind 1) (= kind 3) (= kind 25))
+                                (set! (.pointer-captured rt) true)
+                                (set! (.focus (host/host)) 0))
+                              (case kind 1
+                                    (terminal/mouse-down (.view t) (nil) ev) 3
+                                    (terminal/mouse-down (.view t) (nil) ev) 25
+                                    (terminal/mouse-down (.view t) (nil) ev) 2
+                                    (terminal/mouse-up (.view t) (nil) ev) 4
+                                    (terminal/mouse-up (.view t) (nil) ev) 26
+                                    (terminal/mouse-up (.view t) (nil) ev) 22
+                                    (terminal/scroll (.view t) (nil) ev)
+                                      (terminal/mouse-move (.view t) (nil) ev))
+                              (when (or (= kind 2) (= kind 4) (= kind 26))
+                                (set! (.pointer-captured rt) false))
+                              true)
+                          :else false))
+                :else false)))))
+
+(defn draw [] (-> i64)
+  (ui/draw (and (.attached (runtime)) (terminal-visible?)) (.failed (runtime)))
+  (layout-terminal!)
+  0)
+
+(defn open-file! [(path (ptr i8))] (-> void)
+  (let [workspace
+          (msg (ptr i8) (class c"NSWorkspace") (sel c"sharedWorkspace") [])
+        manager
+          (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+        absolute
+          (msg (ptr i8)
+               (msg (ptr i8) manager (sel c"currentDirectoryPath") [])
+               (sel c"stringByAppendingPathComponent:")
+               [(ptr i8)]
+               (ns path))]
+    (when (not (msg bool workspace (sel c"openFile:") [(ptr i8)] absolute))
+      (msg bool
+           workspace
+           (sel c"openFile:withApplication:")
+           [(ptr i8) (ptr i8)]
+           absolute
+           (ns c"TextEdit"))
+      0)))
+
+(defn activate! [(id i64)] (-> void)
+  (let [s (model/state)]
+    (cond (and (>= id 10) (<= id 13)) (set! (.page s) (- id 10))
+          (= id 14) (set! (.page s) 1)
+          (= id 15) (set! (.page s) 3)
+          (or (= id 40) (= id 45))
+            (do (set! (.visible (.terminal s)) true) (attach!) 0)
+          (= id 41) (set! (.visible (.terminal s)) false)
+          (= id 46) (set! (.visible (.memo s)) false)
+          (= id 47) (set! (.visible (.specimen s)) false)
+          (= id 42) (set! (.visible (.memo s)) true)
+          (= id 43) (set! (.visible (.specimen s)) true)
+          (= id 44) (do (model/reset-positions!) 0)
+          (= id 50)
+            (let [text (ns (host/paper_input_value 500))
+                  trimmed
+                    (msg (ptr i8)
+                         text
+                         (sel c"stringByTrimmingCharactersInSet:")
+                         [(ptr i8)]
+                         (msg (ptr i8)
+                              (class c"NSCharacterSet")
+                              (sel c"whitespaceAndNewlineCharacterSet")
+                              []))]
+              (when (> (msg u64 trimmed (sel c"length") []) 0)
+                (storage/add! (.notes s) trimmed)
+                (set! (.note-page s) (/ (- (storage/count (.notes s)) 1) 3))
+                (host/paper_input_clear 500)
+                (set! (.saved s) true)))
+          (= id 51)
+            (when (> (.note-page s) 0)
+              (set! (.note-page s) (- (.note-page s) 1)))
+          (= id 52)
+            (when (< (* (+ (.note-page s) 1) 3) (storage/count (.notes s)))
+              (set! (.note-page s) (+ (.note-page s) 1)))
+          (and (>= id 60) (<= id 65)) (set! (.stock s) (- id 60))
+          (= id 70) (do (open-file! c"plugins/rosette.coil") 0)
+          (= id 71) (do (plugin/launch!) 0)
+          (= id 72) (do (plugin/pause!) 0)
+          (= id 73) (do (open-file! c"build/atelier-plugin.log") 0)
+          :else 0)
+    (when (and (= (.page s) 3) (= (.phase (plugin/state)) 0))
+      (plugin/launch!)
+      0)
+    (save!)
+    (host/paper_redraw)
+    (do)))
+
+(defn drag-slip! [(kind i64) (id i64) (x f64) (y f64)] (-> void)
+  (let [s (model/state)
+        slip
+          (case id 100 (field s terminal) 101 (field s memo) (field s specimen))]
+    (when (= kind 1)
+      (set! (.drag s) id)
+      (set! (.grab-x s) (- x (.x slip)))
+      (set! (.grab-y s) (- y (.y slip))))
+    (when (and (= kind 2) (= (.drag s) id))
+      (model/move! (mut (p/index slip 0))
+                   (- x (.grab-x s))
+                   (- y (.grab-y s))
+                   (case id 100 744.0 101 326.0 310.0)
+                   (case id 100 424.0 101 226.0 240.0))
+      (host/paper_redraw))))
+
+(defn event [(kind i64) (id i64) (x f64) (y f64)] (-> i64)
+  (cond (= kind 0) (do (initialize! id) 0)
+        (= kind 6)
+          (do
+            (when (and (!= (.session-id (runtime)) (nil))
+                       (not (.attached (runtime)))
+                       (not (.failed (runtime))))
+              (attach!)
+              (host/paper_redraw))
+            (when (plugin/poll!) (save!) (host/paper_redraw))
+            (when (and (= (.page (model/state)) 3)
+                       (not (.paused (plugin/state)))
+                       (p/fcmp-ne (plugin/modified) (.stamp (plugin/state))))
+              (plugin/launch!)
+              (host/paper_redraw))
+            (let [manager
+                    (msg (ptr i8)
+                         (class c"NSFileManager")
+                         (sel c"defaultManager")
+                         [])]
+              (when (msg bool
+                         manager
+                         (sel c"fileExistsAtPath:")
+                         [(ptr i8)]
+                         (ns c"build/atelier-quit-request"))
+                (msg i64 (.window (host/host)) (sel c"close") [])))
+            (when (light/handle (ui/lighting) 900 kind id x y)
+              (host/paper_redraw))
+            0)
+        (light/handle (ui/lighting) 900 kind id x y) (do (layout-terminal!) 0)
+        (and (>= id 100) (<= id 102) (or (= kind 1) (= kind 2)))
+          (do (drag-slip! kind id x y) 0)
+        (= kind 3) (do (set! (.drag (model/state)) 0) (activate! id) 0)
+        (= kind 8) (do (set! (.drag (model/state)) 0) (save!) 0)
+        (= kind 5) (do (set! (.saved (model/state)) false) 0)
+        :else 0)
+  0)
+
+(defn main [] (-> i64)
+  (let [pool (new c"NSAutoreleasePool")
+        root (getenv c"JIM_ATELIER_ROOT")]
+    (when (!= root (nil))
+      (msg bool
+           (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+           (sel c"changeCurrentDirectoryPath:")
+           [(ptr i8)]
+           (ns root))
+      0)
+    (when (= root (nil))
+      (let [bundle
+              (msg (ptr i8)
+                   (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
+                   (sel c"bundlePath")
+                   [])]
+        (when (msg bool bundle (sel c"hasSuffix:") [(ptr i8)] (ns c".app"))
+          (msg bool
+               (msg (ptr i8)
+                    (class c"NSFileManager")
+                    (sel c"defaultManager")
+                    [])
+               (sel c"changeCurrentDirectoryPath:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (msg (ptr i8)
+                         bundle
+                         (sel c"stringByDeletingLastPathComponent")
+                         [])
+                    (sel c"stringByDeletingLastPathComponent")
+                    []))
+          0)))
+    (setenv c"GHOSTTY_RESOURCES_DIR"
+            c"build/ghostty/share/ghostty"
+            (p/cast i32 1))
+    (host/paper_configure c"Jim — Atelier" 1280.0 800.0)
+    (let [result
+            (app-host/run! (p/fnptr-of draw)
+                           (p/fnptr-of event)
+                           (p/fnptr-of native-event))]
+      (save!)
+      (plugin/stop!)
+      (when (.attached (runtime)) (terminal/free! (.terminal (runtime))) 0)
+      (when (.started (runtime)) (terminal/stop!) 0)
+      (release pool)
+      result)))
+
+(defn redraw [] (-> i64)
+  (host/paper_redraw))
+
+(export-c [draw :as "jim_atelier_draw"]
+          [event :as "jim_atelier_event"]
+          [native-event :as "jim_atelier_native_event"])

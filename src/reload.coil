@@ -78,14 +78,30 @@
                                 (and (bounded? (.canvas-g c) 0.0 1.0)
                                      (and (bounded? (.canvas-b c) 0.0 1.0)
                                           (and (bounded? (.rail-r c) 0.0 1.0)
-                                               (and (bounded? (.rail-g c) 0.0 1.0)
-                                                    (and (bounded? (.rail-b c) 0.0 1.0)
-                                                         (and (bounded? (.pane-r c) 0.0 1.0)
-                                                              (and (bounded? (.pane-g c) 0.0 1.0)
-                                                                   (and (bounded? (.pane-b c) 0.0 1.0)
-                                                                        (and (bounded? (.ink-r c) 0.0 1.0)
-                                                                             (and (bounded? (.ink-g c) 0.0 1.0)
-                                                                                  (and (bounded? (.ink-b c) 0.0 1.0)
+                                               (and (bounded? (.rail-g c)
+                                                              0.0
+                                                              1.0)
+                                                    (and (bounded? (.rail-b c)
+                                                                   0.0
+                                                                   1.0)
+                                                         (and (bounded? (.pane-r c)
+                                                                        0.0
+                                                                        1.0)
+                                                              (and (bounded? (.pane-g c)
+                                                                             0.0
+                                                                             1.0)
+                                                                   (and (bounded? (.pane-b c)
+                                                                                  0.0
+                                                                                  1.0)
+                                                                        (and (bounded? (.ink-r c)
+                                                                                       0.0
+                                                                                       1.0)
+                                                                             (and (bounded? (.ink-g c)
+                                                                                            0.0
+                                                                                            1.0)
+                                                                                  (and (bounded? (.ink-b c)
+                                                                                                 0.0
+                                                                                                 1.0)
                                                                                        (and (bounded? (.muted-r c)
                                                                                                       0.0
                                                                                                       1.0)

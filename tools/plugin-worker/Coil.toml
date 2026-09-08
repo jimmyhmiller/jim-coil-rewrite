@@ -1,0 +1,6 @@
+[package]
+name = "atelier-plugin-worker"
+entry = "main.coil"
+
+[link]
+flags = ["-Wl,-export_dynamic"]

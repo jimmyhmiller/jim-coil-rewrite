@@ -45,7 +45,9 @@
                      (ns c"Project: ")
                      (sel c"stringByAppendingString:")
                      [(ptr i8)]
-                     (storage/get (storage/at (projects/list (load (model))) (- id 28)) c"name")))))
+                     (storage/get (storage/at (projects/list (load (model)))
+                                              (- id 28))
+                                  c"name")))))
 
 (defn shortcut [(id i64)] (-> (ptr i8))
   (cond (= id 0) c"⌘T"
@@ -92,13 +94,18 @@
                     hc (msg u16 h (sel c"characterAtIndex:") [u64] at)
                     prev
                       (if (> at (p/cast u64 0))
-                          (msg u16 h (sel c"characterAtIndex:") [u64] (- at (p/cast u64 1)))
+                          (msg u16
+                               h
+                               (sel c"characterAtIndex:")
+                               [u64]
+                               (- at (p/cast u64 1)))
                           (p/cast u16 32))]
                 (do
                   (store! hi (+ at (p/cast u64 1)))
                   (if (= ch hc)
                       (do
-                        (store! result (+ (load result) (+ 1 (load consecutive))))
+                        (store! result
+                                (+ (load result) (+ 1 (load consecutive))))
                         (if (or (= at (p/cast u64 0))
                                 (= prev (p/cast u16 32))
                                 (= prev (p/cast u16 95))
@@ -114,14 +121,21 @@
       (if (load valid) (load result) -1))))
 
 (defn match-score [(query (ptr i8)) (id i64)] (-> i64)
-  (let [hay (msg (ptr i8) (ns (title id)) (sel c"stringByAppendingString:") [(ptr i8)] (ns (keywords id)))
+  (let [hay
+          (msg (ptr i8)
+               (ns (title id))
+               (sel c"stringByAppendingString:")
+               [(ptr i8)]
+               (ns (keywords id)))
         base
           (if (and (>= id 28)
                    (projects/hidden? (projects/profile (load (model)))
-                                     (projects/id (storage/at (projects/list (load (model))) (- id 28)))))
+                                     (projects/id (storage/at (projects/list (load (model)))
+                                                              (- id 28)))))
               -1
               (score query hay))
-        exact (msg Range hay (sel c"rangeOfString:options:") [(ptr i8) u64] query 1)]
+        exact
+          (msg Range hay (sel c"rangeOfString:options:") [(ptr i8) u64] query 1)]
     (if (and (>= base 0)
              (and (> (msg u64 query (sel c"length") []) (p/cast u64 0))
                   (> (.length exact) (p/cast u64 0))))
@@ -140,6 +154,7 @@
               (and shift (= key (p/cast u16 6))) 7
               (and shift (= key (p/cast u16 42))) 8
               (= key (p/cast u16 15)) 9
-              (and (>= key (p/cast u16 18)) (<= key (p/cast u16 21))) (+ 11 (- (p/cast i64 key) 18))
+              (and (>= key (p/cast u16 18)) (<= key (p/cast u16 21)))
+                (+ 11 (- (p/cast i64 key) 18))
               :else -1)
         -1)))

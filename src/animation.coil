@@ -39,7 +39,8 @@
 
 (defstruct AnimationSample [(value f32) (cycle i64) (finished bool)])
 
-(defstruct SpringConfig [(stiffness f64) (damping f64) (mass f64) (epsilon f64)])
+(defstruct SpringConfig
+  [(stiffness f64) (damping f64) (mass f64) (epsilon f64)])
 
 (defstruct Spring
   [(value f64) (velocity f64) (target f64) (config SpringConfig) (active bool)])
@@ -156,7 +157,8 @@
               local
                 (if finished
                     1.0
-                    (/ (- elapsed (* (primitive/cast f64 raw-cycle) duration)) duration))
+                    (/ (- elapsed (* (primitive/cast f64 raw-cycle) duration))
+                       duration))
               directed
                 (if (and (.autoreverse animation) (= (% cycle 2) 1))
                     (- 1.0 local)
@@ -206,7 +208,10 @@
 (defn spring-step! [(spring (mut Spring)) (delta-seconds f64)] (-> f64)
   (if (not (.active spring))
       (.value spring)
-      (let [(mut remaining) (cond (< delta-seconds 0.0) 0.0 (> delta-seconds 0.1) 0.1 :else delta-seconds)
+      (let [(mut remaining)
+              (cond (< delta-seconds 0.0) 0.0
+                    (> delta-seconds 0.1) 0.1
+                    :else delta-seconds)
             config (.config spring)]
         (do
           (while (> (load remaining) 0.0000001)
@@ -220,7 +225,8 @@
                        (* (.damping config) (.velocity spring)))
                   acceleration (/ force (.mass config))]
               (do
-                (set! (.velocity spring) (+ (.velocity spring) (* acceleration step)))
+                (set! (.velocity spring)
+                      (+ (.velocity spring) (* acceleration step)))
                 (set! (.value spring)
                       (+ (.value spring) (* (.velocity spring) step)))
                 (set! remaining (- (load remaining) step)))))
