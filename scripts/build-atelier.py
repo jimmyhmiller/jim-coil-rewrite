@@ -14,7 +14,7 @@ def run(args, cwd=ROOT):
 def main():
     if not (ROOT.parent / 'paper-test/lib/paper/Coil.toml').is_file():
         raise SystemExit('The neighboring paper-test library is required (read-only dependency).')
-    run(['python3', 'scripts/build-native.py'])
+    run(['coil', 'build'])  # the package build produces build/jim-session
     run(['coil', 'build', '-o', '../../build/atelier-plugin-worker'], ROOT / 'tools/plugin-worker')
     run(['coil', 'build', 'src/atelier.coil', '-o', 'build/jim-atelier-next'])
     (APP / 'Contents/MacOS').mkdir(parents=True, exist_ok=True)

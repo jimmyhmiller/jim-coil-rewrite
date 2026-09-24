@@ -33,10 +33,15 @@ extension. On a fresh checkout:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
-python3 scripts/prepare-ghostty.py
 python3 scripts/run.py
 ```
 
+Pinned Ghostty is a Coil native dependency (`scripts/ghostty/link-flags.py`),
+so every `coil build`, `coil run`, and `coil test` rebuilds its libraries when
+the pin, patch, backend extension, or Zig version changes.
+`scripts/prepare-ghostty.py` does the same step on its own. The terminal session
+service is the package's `session` executable artifact: a bare `coil build` or
+`coil run` also produces `build/jim-session`, linked against the Ghostty VT library.
 `GHOSTTY_SOURCE=/path/to/pinned/ghostty` can reuse an existing source checkout.
 The build checks its embedding header against the pinned header. The development
 app is `build/JimCoil.app`; it resolves this checkout's configuration and resources.

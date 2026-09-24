@@ -11,7 +11,18 @@ layout = { path = "../paper-test/lib/layout" }
 [link]
 frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers", "ImageIO", "AVFoundation"]
 libs = ["objc", "c++"]
-flags = ["build/ghostty/lib/libghostty-internal.a"]
+
+[native-dependencies]
+ghostty = { flags-command = "scripts/ghostty/link-flags.py internal" }
+ghostty-vt = { flags-command = "scripts/ghostty/link-flags.py vt" }
+
+# Jim's private terminal session service, launched by src/sessions.coil.
+[artifacts.session]
+kind = "executable"
+entry = "src/session/server.coil"
+out = "build/jim-session"
+optimization = 2
+native-dependencies = ["ghostty-vt"]
 
 [test]
 roots = ["tests"]

@@ -87,6 +87,8 @@ unparented document views remain owned until NSScrollView takes ownership.
 
 The dependency extension is reproducible through
 `scripts/ghostty/session-backend.py`; it only patches the project-local pinned
-Ghostty source. `prepare-ghostty.py` builds both the embedded renderer and headless
-VT library. The separately compiled configuration has its own Coil package so it
+Ghostty source. `scripts/ghostty/pinned.py` builds both the embedded renderer and headless
+VT library on demand, as the package's `ghostty` and `ghostty-vt` native
+dependencies; the session service is the `session` executable artifact and links only
+the VT library. The separately compiled configuration has its own Coil package so it
 cannot load another copy of Ghostty into the process.

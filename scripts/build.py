@@ -7,11 +7,8 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'build/JimCoil.app'
-if not (ROOT / 'build/ghostty/lib/libghostty-internal.a').is_file():
-    raise SystemExit('Run scripts/prepare-ghostty.py first.')
 (APP / 'Contents/MacOS').mkdir(parents=True, exist_ok=True)
-subprocess.run(['python3', 'scripts/build-native.py'], cwd=ROOT, check=True)
-subprocess.run(['coil', 'build', '-o', 'build/jim-next'], cwd=ROOT, check=True)
+subprocess.run(['coil', 'build', '-o', 'build/jim-next'], cwd=ROOT, check=True)  # also builds build/jim-session
 # Rename a completed executable atomically; never truncate a running image.
 (ROOT / 'build/jim-next').replace(APP / 'Contents/MacOS/jim-coil')
 with (APP / 'Contents/Info.plist').open('wb') as f:
