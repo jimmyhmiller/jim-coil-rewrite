@@ -1,4 +1,0 @@
-; An Atelier specimen plugin. Save this file while the workshop is open.
-; Return 3–24 petals. The host owns all rendering and validates the result.
-(defn specimen [] (-> i64)
-  12)

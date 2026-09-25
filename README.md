@@ -1,26 +1,5 @@
 # Jim in Coil
 
-## Jim Atelier — Paper redesign
-
-The new [Atelier](docs/atelier.md) is a working native Paper exploration: a felt
-desk with movable slips and a persistent Ghostty shell, a saved field notebook,
-a six-material cabinet, and an isolated Coil JIT specimen workshop.
-
-```sh
-python3 scripts/build-atelier.py
-open 'build/Jim Atelier.app'
-```
-
-It uses the neighboring `paper-test` libraries as read-only dependencies. The
-existing Jim shell below remains available, with its projects, profiles, and
-canvas controls. Atelier currently has one desktop and one terminal; it does
-not migrate the existing shell's layout. Its notes and settings use the separate
-`dev.jim.atelier` preferences domain. Start with the four tabs across the top.
-
-Visual tour and findings: [Atelier project pad](pad://jim-coil-rewrite-atelier).
-
-## Existing shell
-
 A native macOS shell for the Jim rewrite: Ghostty terminal panes on independent
 project canvases, live Coil theme settings, and a composited workspace cube.
 
