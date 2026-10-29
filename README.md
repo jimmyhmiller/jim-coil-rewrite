@@ -28,6 +28,31 @@ The build uses the existing `TerminalBevy Local Signing` identity; set
 `JIM_SIGN_IDENTITY` to choose another installed identity. Signing preserves the
 app identity across rebuilds. macOS may ask for Documents-folder access at first launch.
 
+### Release
+
+`python3 scripts/release.py` builds a self-contained `build/dist/JimCoil.app`
+and `build/dist/JimCoil-<commit>-macos-arm64.zip` from a clean tree. It runs
+on an Apple silicon Mac without this checkout, Coil, or Homebrew's LLVM:
+
+- `Contents/Frameworks` holds libLLVM and the libraries it needs.
+- `Contents/Resources/coil` holds the Coil toolchain that built Jim, copied
+  byte for byte. Widgets compile with it, and theme reloads build with it, which
+  needs Xcode's command line tools.
+- `Contents/Resources/root` holds what Jim reads at run time: a manifest for
+  widget imports, `src/`, `widgets/`, `config/`, `jim-session`, and Ghostty's
+  resources.
+
+The release never writes into its bundle. On first launch, and whenever the
+release changes, it copies its root to
+`~/Library/Application Support/JimCoil/root` and works there
+(`src/runtime.coil`). Widgets and `config/` in that copy are yours to edit, so
+a newer release adds only the files they lack. Layouts and terminal sessions
+are shared with the development app. The release has its own bundle
+identifier, so macOS asks for its permissions separately. It is signed ad hoc
+(set `JIM_RELEASE_SIGN_IDENTITY` to choose an identity) and not notarized: on
+another Mac, clear the download's quarantine first with
+`xattr -dr com.apple.quarantine JimCoil.app`.
+
 ## Controls
 
 Canvas controls follow the original Jim handler:

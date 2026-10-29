@@ -21,6 +21,7 @@
 (import "coil.args" :as args)
 (import "coil.math" :use [Float])
 (import "jim.sky" :as sky)
+(import "jim.runtime" :as runtime)
 
 ;;; FACE holds the project in 3D: its PLATE, the solid wall of the cube that
 ;;; carries the background, and the canvas, whose panes float off the plate
@@ -599,7 +600,8 @@
                                 (+ (.generation s) 1)
                                 c".dylib")
               argv (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
-              error (p/alloc-stack (ptr i8))]
+              error (p/alloc-stack (ptr i8))
+              bundled (runtime/toolchain)]
           (do
             (set! error (nil))
             (set! (.generation s) (+ (.generation s) 1))
@@ -611,8 +613,34 @@
                       (class c"NSURL")
                       (sel c"fileURLWithPath:")
                       [(ptr i8)]
-                      (ns c"/usr/bin/env")))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"coil"))
+                      (ns (if (= (p/cast i64 bundled) 0)
+                              c"/usr/bin/env"
+                              bundled))))
+            ; A release builds with its own toolchain; a development build with
+            ; the one on PATH.
+            (if (= (p/cast i64 bundled) 0)
+                (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"coil"))
+                ; The release's compiler links LLVM where Homebrew keeps it;
+                ; dyld falls back to the bundle's copy where that is missing.
+                (let [env
+                        (msg (ptr i8)
+                             (msg (ptr i8)
+                                  (msg (ptr i8)
+                                       (class c"NSProcessInfo")
+                                       (sel c"processInfo")
+                                       [])
+                                  (sel c"environment")
+                                  [])
+                             (sel c"mutableCopy")
+                             [])]
+                  (msg i64
+                       env
+                       (sel c"setObject:forKey:")
+                       [(ptr i8) (ptr i8)]
+                       (runtime/frameworks)
+                       (ns c"DYLD_FALLBACK_LIBRARY_PATH"))
+                  (msg i64 task (sel c"setEnvironment:") [(ptr i8)] env)
+                  (release env)))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"build"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"shell.coil"))
             (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"--shared"))
@@ -1371,6 +1399,17 @@
       0)
     (do)))
 
+;;; A release works in its own copy of its files; a development build in this
+;;; checkout, where main has already moved.
+(defn prepared! [] (-> bool)
+  (or (not (runtime/release?)) (runtime/enter-release!)))
+
+(defn start! [] (-> bool)
+  (setenv c"GHOSTTY_RESOURCES_DIR" c"build/ghostty/share/ghostty" 1)
+  (adopt-login-path!)
+  (widget-view/prewarm!)
+  (setup!))
+
 (defn main [] (-> i64)
   (let [pool (new c"NSAutoreleasePool")]
     (do
@@ -1379,8 +1418,9 @@
                    (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
                    (sel c"bundlePath")
                    [])]
-        (if (!= (msg i8 bundle (sel c"hasSuffix:") [(ptr i8)] (ns c".app"))
-                (: 0 i8))
+        (if (and (not (runtime/release?))
+                 (!= (msg i8 bundle (sel c"hasSuffix:") [(ptr i8)] (ns c".app"))
+                     (: 0 i8)))
             (msg i8
                  (msg (ptr i8)
                       (class c"NSFileManager")
@@ -1396,78 +1436,87 @@
                       (sel c"stringByDeletingLastPathComponent")
                       []))
             (: 0 i8)))
-      (setenv c"GHOSTTY_RESOURCES_DIR" c"build/ghostty/share/ghostty" 1)
-      (adopt-login-path!)
-      (widget-view/prewarm!)
-      (if (not (setup!))
-          (do (printf c"Jim: Ghostty initialization failed.\n") 1)
-          (let [s (shell)]
-            (do
-              (while (and (.running s)
-                          (!= (msg i8 (.window s) (sel c"isVisible") [])
-                              (: 0 i8)))
-                (let [frame-pool (new c"NSAutoreleasePool")
-                      event
-                        (msg (ptr i8)
-                             (.app s)
-                             (sel c"nextEventMatchingMask:untilDate:inMode:dequeue:")
-                             [u64 (ptr i8) (ptr i8) i8]
-                             (p/cast u64 -1)
-                             (msg (ptr i8)
-                                  (class c"NSDate")
-                                  (sel c"dateWithTimeIntervalSinceNow:")
-                                  [f64]
-                                  (if (or (widget-view/any-animating?)
-                                          (spinning?)
-                                          (> (.settle-at s) 0.0))
-                                      (/ 1.0 60.0)
-                                      0.2))
-                             (ns c"kCFRunLoopDefaultMode")
-                             (: 1 i8))]
-                  (let [input-start (timings/now)]
-                    (do
-                      (if (!= (p/cast i64 event) 0)
-                          (if (not (handle! event))
-                              (msg i64
-                                   (.app s)
-                                   (sel c"sendEvent:")
-                                   [(ptr i8)]
-                                   event)
+      (cond (not (prepared!))
+              (do
+                (printf c"Jim: could not copy its files to ~/Library/Application Support/JimCoil/root.\n")
+                1)
+            (not (start!))
+              (do (printf c"Jim: Ghostty initialization failed.\n") 1)
+            :else
+              (let [s (shell)]
+                (do
+                  (while (and (.running s)
+                              (!= (msg i8 (.window s) (sel c"isVisible") [])
+                                  (: 0 i8)))
+                    (let [frame-pool (new c"NSAutoreleasePool")
+                          event
+                            (msg (ptr i8)
+                                 (.app s)
+                                 (sel c"nextEventMatchingMask:untilDate:inMode:dequeue:")
+                                 [u64 (ptr i8) (ptr i8) i8]
+                                 (p/cast u64 -1)
+                                 (msg (ptr i8)
+                                      (class c"NSDate")
+                                      (sel c"dateWithTimeIntervalSinceNow:")
+                                      [f64]
+                                      (if (or (widget-view/any-animating?)
+                                              (spinning?)
+                                              (> (.settle-at s) 0.0))
+                                          (/ 1.0 60.0)
+                                          0.2))
+                                 (ns c"kCFRunLoopDefaultMode")
+                                 (: 1 i8))]
+                      (let [input-start (timings/now)]
+                        (do
+                          (if (!= (p/cast i64 event) 0)
+                              (if (not (handle! event))
+                                  (msg i64
+                                       (.app s)
+                                       (sel c"sendEvent:")
+                                       [(ptr i8)]
+                                       event)
+                                  0)
                               0)
-                          0)
-                      (let [action (palette/take-action!)]
-                        (if (>= action 0) (invoke! action) (do)))
-                      (let [action (sidebar/take-action!)]
-                        (if (!= action -1) (invoke! action) (do)))
-                      (let [action (palette/take-submission!)]
-                        (if (>= action 0) (submit! action (palette/text)) (do)))
-                      (timings/record! 0
-                                       (* 1000.0 (- (timings/now) input-start)))
-                      (let [start (timings/now)]
-                        (do
-                          (maintenance!)
-                          (timings/record! 1 (* 1000.0 (- (timings/now) start)))))
-                      (let [start (timings/now)]
-                        (do
-                          (msg i64 (.app s) (sel c"updateWindows") [])
-                          (timings/record! 2 (* 1000.0 (- (timings/now) start)))))
-                      (release frame-pool)))))
-              (if (!= (p/cast i64 (.task s)) 0)
-                  (do
-                    (msg i64 (.task s) (sel c"terminate") [])
-                    (msg i64 (.task s) (sel c"waitUntilExit") [])
-                    (release (.task s))
-                    (release (.output s)))
-                  0)
-              (save-layout!)
-              (palette/free!)
-              (timings/free!)
-              (sidebar/free!)
-              (for [i 0 (count)] (canvas/free! (project i)))
-              (free! (mut (.projects s)))
-              (release (.model s))
-              (terminal/stop!)
-              (msg i64 (.window s) (sel c"close") [])
-              (release (.window s))
-              (release pool)
-              0))))))
+                          (let [action (palette/take-action!)]
+                            (if (>= action 0) (invoke! action) (do)))
+                          (let [action (sidebar/take-action!)]
+                            (if (!= action -1) (invoke! action) (do)))
+                          (let [action (palette/take-submission!)]
+                            (if (>= action 0)
+                                (submit! action (palette/text))
+                                (do)))
+                          (timings/record! 0
+                                           (* 1000.0
+                                              (- (timings/now) input-start)))
+                          (let [start (timings/now)]
+                            (do
+                              (maintenance!)
+                              (timings/record! 1
+                                               (* 1000.0
+                                                  (- (timings/now) start)))))
+                          (let [start (timings/now)]
+                            (do
+                              (msg i64 (.app s) (sel c"updateWindows") [])
+                              (timings/record! 2
+                                               (* 1000.0
+                                                  (- (timings/now) start)))))
+                          (release frame-pool)))))
+                  (if (!= (p/cast i64 (.task s)) 0)
+                      (do
+                        (msg i64 (.task s) (sel c"terminate") [])
+                        (msg i64 (.task s) (sel c"waitUntilExit") [])
+                        (release (.task s))
+                        (release (.output s)))
+                      0)
+                  (save-layout!)
+                  (palette/free!)
+                  (timings/free!)
+                  (sidebar/free!)
+                  (for [i 0 (count)] (canvas/free! (project i)))
+                  (free! (mut (.projects s)))
+                  (release (.model s))
+                  (terminal/stop!)
+                  (msg i64 (.window s) (sel c"close") [])
+                  (release (.window s))
+                  (release pool)
+                  0))))))

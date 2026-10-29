@@ -10,6 +10,7 @@
 (import "coil.sync" :as sync)
 (import "jim.widget-api" :as api)
 (import "jim.services" :as services)
+(import "jim.runtime" :as runtime)
 
 ;;; Hot-reloaded Coil widgets.
 ;;;
@@ -100,6 +101,14 @@
 
 (defn toolchain [] (-> (slice u8))
   (build-toolchain toolchain))
+
+;;; The toolchain widgets compile with: a release's own, otherwise the one that
+;;; built Jim.
+(defn session-toolchain [] (-> (slice u8))
+  (let [bundled (runtime/toolchain)]
+    (if (= (p/cast i64 bundled) 0)
+        (toolchain)
+        (slice::new (p/cast (ptr u8) bundled) (p/cast i64 (strlen bundled))))))
 
 (defstruct Stat
   [(head (array u8 48)) (mtime-sec i64) (mtime-nsec i64) (tail (array u8 80))])
@@ -291,7 +300,7 @@
 (defn acquire [(optimize bool)] (-> jit/JitSession)
   (let [options
           (jit/JitOptions
-            :toolchain (toolchain)
+            :toolchain (session-toolchain)
             :backend (if optimize (jit/Llvm) (jit/Native))
             :opt-level (if optimize 2 0))
         (mut session)
@@ -301,7 +310,7 @@
                  (println "widgets: optimized JIT unavailable ({s}); using the default backend"
                           (jit/jit-options-error-message problem))
                  (jit/jit-session-new-with-toolchain (compiler-allocator)
-                                                     (toolchain))))
+                                                     (session-toolchain))))
         loaded (jit/jit-session-load-project! (mut session))]
     (when (!= loaded 0)
       (println "widgets: the JIT session could not load Coil.toml ({}); project imports will not resolve"

@@ -1,0 +1,184 @@
+(module jim.runtime)
+(import "coil.cc" :as cc)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+;;; Where Jim runs from. A development build runs in this checkout: the bundle
+;;; is build/JimCoil.app, and Jim works two levels above it. A release bundle
+;;; (scripts/release.py) carries the files Jim reads at run time in
+;;; Contents/Resources/root, and its own Coil toolchain in
+;;; Contents/Resources/coil, so it runs on a Mac without the checkout, Coil or
+;;; Homebrew's LLVM.
+;;;
+;;; A release never writes into its bundle. It works in a copy of the root under
+;;; Application Support, refreshed whenever the release changes. The widgets and
+;;; the shell configuration in that copy are the user's to edit, so a newer
+;;; release adds the files they lack and leaves the others alone.
+(extern strdup :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(defn files [] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") []))
+
+(defn exists? [(path (ptr i8))] (-> bool)
+  (!= (msg i8 (files) (sel c"fileExistsAtPath:") [(ptr i8)] path) (: 0 i8)))
+
+(defn join [(dir (ptr i8)) (name (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       dir
+       (sel c"stringByAppendingPathComponent:")
+       [(ptr i8)]
+       (ns name)))
+
+;;; The bundle's resource NAME, or nil when it has none.
+(defn resource [(name (ptr i8))] (-> (ptr i8))
+  (let [path
+          (join (msg (ptr i8)
+                     (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
+                     (sel c"resourcePath")
+                     [])
+                name)]
+    (if (exists? path) path (nil))))
+
+;;; The bundle's Frameworks, where a release keeps the libraries its toolchain
+;;; links.
+(defn frameworks [] (-> (ptr i8))
+  (msg (ptr i8)
+       (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
+       (sel c"privateFrameworksPath")
+       []))
+
+;;; The release's own `coil`, as a C string that lives as long as Jim, or null
+;;; in a development build.
+(defn toolchain [] (-> (ptr i8))
+  (let [cell (p/alloc-static (ptr i8))
+        known (p/alloc-static bool)]
+    (when (not (load known))
+      (let [path (resource c"coil/bin/coil")]
+        (set! cell
+              (if (= (p/cast i64 path) 0)
+                  (p/cast (ptr i8) 0)
+                  (strdup (utf8 path))))
+        (set! known true)))
+    (load cell)))
+
+(defn copy! [(from (ptr i8)) (to (ptr i8))] (-> bool)
+  (!= (msg i8
+           (files)
+           (sel c"copyItemAtPath:toPath:error:")
+           [(ptr i8) (ptr i8) (ptr i8)]
+           from
+           to
+           (nil))
+      (: 0 i8)))
+
+(defn remove! [(path (ptr i8))] (-> void)
+  (msg i8
+       (files)
+       (sel c"removeItemAtPath:error:")
+       [(ptr i8) (ptr i8)]
+       path
+       (nil))
+  (do))
+
+(defn make-dir! [(path (ptr i8))] (-> bool)
+  (!= (msg i8
+           (files)
+           (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+           [(ptr i8) i8 (ptr i8) (ptr i8)]
+           path
+           (: 1 i8)
+           (nil)
+           (nil))
+      (: 0 i8)))
+
+;;; Replace NAME in HOME with the release's.
+(defn replace! [(root (ptr i8)) (home (ptr i8)) (name (ptr i8))] (-> bool)
+  (remove! (join home name))
+  (copy! (join root name) (join home name)))
+
+;;; Copy into HOME's directory NAME each of the release's files it lacks.
+(defn fill! [(root (ptr i8)) (home (ptr i8)) (name (ptr i8))] (-> bool)
+  (let [from (join root name)
+        to (join home name)
+        entries
+          (msg (ptr i8)
+               (files)
+               (sel c"contentsOfDirectoryAtPath:error:")
+               [(ptr i8) (ptr i8)]
+               from
+               (nil))
+        (mut ok) (make-dir! to)]
+    (for [i 0 (p/cast i64 (msg u64 entries (sel c"count") []))]
+      (let [entry
+              (msg (ptr i8)
+                   entries
+                   (sel c"objectAtIndex:")
+                   [u64]
+                   (p/cast u64 i))
+            target
+              (msg (ptr i8)
+                   to
+                   (sel c"stringByAppendingPathComponent:")
+                   [(ptr i8)]
+                   entry)]
+        (when (not (exists? target))
+          (when (not (copy! (msg (ptr i8)
+                                 from
+                                 (sel c"stringByAppendingPathComponent:")
+                                 [(ptr i8)]
+                                 entry)
+                            target))
+            (set! ok false)))))
+    (load ok)))
+
+(defn read-text [(path (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       (class c"NSString")
+       (sel c"stringWithContentsOfFile:encoding:error:")
+       [(ptr i8) u64 (ptr i8)]
+       path
+       (: 4 u64)
+       (nil)))
+
+;;; Whether Jim runs from a release bundle.
+(defn release? [] (-> bool)
+  (!= (p/cast i64 (resource c"root")) 0))
+
+;;; Work in the release's copy of its root, refreshing it if the release
+;;; changed. False when the copy cannot be made.
+(defn enter-release! [] (-> bool)
+  (let [root (resource c"root")]
+    (if (= (p/cast i64 root) 0)
+        false
+        (let [home
+                (msg (ptr i8)
+                     (ns c"~/Library/Application Support/JimCoil/root")
+                     (sel c"stringByExpandingTildeInPath")
+                     [])
+              stamp (join home c".release")
+              release (read-text (join root c".release"))
+              seen (read-text stamp)
+              current
+                (and (!= (p/cast i64 seen) 0)
+                     (!= (msg i8
+                              seen
+                              (sel c"isEqualToString:")
+                              [(ptr i8)]
+                              release)
+                         (: 0 i8)))
+              ready
+                (or current
+                    (and (make-dir! home)
+                         (replace! root home c"Coil.toml")
+                         (replace! root home c"src")
+                         (replace! root home c"build")
+                         (fill! root home c"widgets")
+                         (fill! root home c"config")
+                         (replace! root home c".release")))]
+          (and ready
+               (!= (msg i8
+                        (files)
+                        (sel c"changeCurrentDirectoryPath:")
+                        [(ptr i8)]
+                        home)
+                   (: 0 i8)))))))
