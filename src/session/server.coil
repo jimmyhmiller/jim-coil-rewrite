@@ -1,4 +1,5 @@
 (module jim.session.server)
+(import "coil.cc" :as cc)
 (import "jim.session.transport" :as transport)
 (import "coil.alloc" :as alloc)
 (import "coil.os" :as os)
@@ -133,122 +134,122 @@
    (color-scheme i32)
    (cwd (array i8 1024))])
 
-(static-assert (= (p/sizeof SockaddrUn) 106) "Darwin sockaddr_un ABI size")
+(static-assert (= (sizeof SockaddrUn) 106) "Darwin sockaddr_un ABI size")
 
-(static-assert (= (p/sizeof PollFd) 8) "Darwin pollfd ABI size")
+(static-assert (= (sizeof PollFd) 8) "Darwin pollfd ABI size")
 
-(static-assert (= (p/sizeof Winsize) 8) "Darwin winsize ABI size")
+(static-assert (= (sizeof Winsize) 8) "Darwin winsize ABI size")
 
-(static-assert (= (p/sizeof GhosttyColor) 3) "Ghostty RGB ABI size")
+(static-assert (= (sizeof GhosttyColor) 3) "Ghostty RGB ABI size")
 
-(static-assert (= (p/sizeof GhosttyTerminalOptions) 16)
+(static-assert (= (sizeof GhosttyTerminalOptions) 16)
                "Ghostty terminal options ABI size")
 
-(extern socket :cc c [i32 i32 i32] (-> i32))
+(extern socket :cc (cc/C) [i32 i32 i32] (-> i32))
 
-(extern bind :cc c [i32 (ptr i8) u32] (-> i32))
+(extern bind :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
 
-(extern listen :cc c [i32 i32] (-> i32))
+(extern listen :cc (cc/C) [i32 i32] (-> i32))
 
-(extern accept :cc c [i32 (ptr i8) (ptr u32)] (-> i32))
+(extern accept :cc (cc/C) [i32 (ptr i8) (ptr u32)] (-> i32))
 
-(extern setsockopt :cc c [i32 i32 i32 (ptr i8) u32] (-> i32))
+(extern setsockopt :cc (cc/C) [i32 i32 i32 (ptr i8) u32] (-> i32))
 
-(extern getpeereid :cc c [i32 (ptr u32) (ptr u32)] (-> i32))
+(extern getpeereid :cc (cc/C) [i32 (ptr u32) (ptr u32)] (-> i32))
 
-(extern getuid :cc c [] (-> u32))
+(extern getuid :cc (cc/C) [] (-> u32))
 
-(extern recv :cc c [i32 (ptr i8) isize i32] (-> isize))
+(extern recv :cc (cc/C) [i32 (ptr i8) isize i32] (-> isize))
 
-(extern send :cc c [i32 (ptr i8) isize i32] (-> isize))
+(extern send :cc (cc/C) [i32 (ptr i8) isize i32] (-> isize))
 
-(extern read :cc c [i32 (ptr i8) isize] (-> isize))
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
-(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
-(extern pread :cc c [i32 (ptr i8) isize i64] (-> isize))
+(extern pread :cc (cc/C) [i32 (ptr i8) isize i64] (-> isize))
 
-(extern pwrite :cc c [i32 (ptr i8) isize i64] (-> isize))
+(extern pwrite :cc (cc/C) [i32 (ptr i8) isize i64] (-> isize))
 
-(extern close :cc c [i32] (-> i32))
+(extern close :cc (cc/C) [i32] (-> i32))
 
-(extern open :cc c [(ptr i8) i32 ...] (-> i32))
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
 
-(extern unlink :cc c [(ptr i8)] (-> i32))
+(extern unlink :cc (cc/C) [(ptr i8)] (-> i32))
 
-(extern fcntl :cc c [i32 i32 ...] (-> i32))
+(extern fcntl :cc (cc/C) [i32 i32 ...] (-> i32))
 
-(extern flock :cc c [i32 i32] (-> i32))
+(extern flock :cc (cc/C) [i32 i32] (-> i32))
 
-(extern poll :cc c [(ptr PollFd) u64 i32] (-> i32))
+(extern poll :cc (cc/C) [(ptr PollFd) u64 i32] (-> i32))
 
-(extern ioctl :cc c [i32 u64 ...] (-> i32))
+(extern ioctl :cc (cc/C) [i32 u64 ...] (-> i32))
 
-(extern lstat :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern lstat :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
 
-(extern fork :cc c [] (-> i32))
+(extern fork :cc (cc/C) [] (-> i32))
 
-(extern forkpty :cc c [(ptr i32) (ptr i8) (ptr i8) (ptr Winsize)] (-> i32))
+(extern forkpty :cc (cc/C) [(ptr i32) (ptr i8) (ptr i8) (ptr Winsize)] (-> i32))
 
-(extern setsid :cc c [] (-> i32))
+(extern setsid :cc (cc/C) [] (-> i32))
 
-(extern dup2 :cc c [i32 i32] (-> i32))
+(extern dup2 :cc (cc/C) [i32 i32] (-> i32))
 
-(extern umask :cc c [u16] (-> u16))
+(extern umask :cc (cc/C) [u16] (-> u16))
 
-(extern signal :cc c [i32 (ptr i8)] (-> (ptr i8)))
+(extern signal :cc (cc/C) [i32 (ptr i8)] (-> (ptr i8)))
 
-(extern kill :cc c [i32 i32] (-> i32))
+(extern kill :cc (cc/C) [i32 i32] (-> i32))
 
-(extern waitpid :cc c [i32 (ptr i32) i32] (-> i32))
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
 
-(extern tcgetpgrp :cc c [i32] (-> i32))
+(extern tcgetpgrp :cc (cc/C) [i32] (-> i32))
 
-(extern nanosleep :cc c [(ptr Timespec) (ptr Timespec)] (-> i32))
+(extern nanosleep :cc (cc/C) [(ptr Timespec) (ptr Timespec)] (-> i32))
 
-(extern chdir :cc c [(ptr i8)] (-> i32))
+(extern chdir :cc (cc/C) [(ptr i8)] (-> i32))
 
-(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+(extern setenv :cc (cc/C) [(ptr i8) (ptr i8) i32] (-> i32))
 
-(extern execvp :cc c [(ptr i8) (ptr (ptr i8))] (-> i32))
+(extern execvp :cc (cc/C) [(ptr i8) (ptr (ptr i8))] (-> i32))
 
-(extern execl :cc c [(ptr i8) (ptr i8) ...] (-> i32))
+(extern execl :cc (cc/C) [(ptr i8) (ptr i8) ...] (-> i32))
 
-(extern _exit :cc c [i32] (-> void))
+(extern _exit :cc (cc/C) [i32] (-> void))
 
-(extern getpwuid :cc c [u32] (-> (ptr Passwd)))
+(extern getpwuid :cc (cc/C) [u32] (-> (ptr Passwd)))
 
-(extern strlen :cc c [(ptr i8)] (-> isize))
+(extern strlen :cc (cc/C) [(ptr i8)] (-> isize))
 
-(extern strcmp :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern strcmp :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
 
-(extern memcpy :cc c [(ptr i8) (ptr i8) isize] (-> (ptr i8)))
+(extern memcpy :cc (cc/C) [(ptr i8) (ptr i8) isize] (-> (ptr i8)))
 
-(extern memmove :cc c [(ptr i8) (ptr i8) isize] (-> (ptr i8)))
+(extern memmove :cc (cc/C) [(ptr i8) (ptr i8) isize] (-> (ptr i8)))
 
-(extern memset :cc c [(ptr i8) i32 isize] (-> (ptr i8)))
+(extern memset :cc (cc/C) [(ptr i8) i32 isize] (-> (ptr i8)))
 
-(extern tmpfile :cc c [] (-> (ptr i8)))
+(extern tmpfile :cc (cc/C) [] (-> (ptr i8)))
 
-(extern fileno :cc c [(ptr i8)] (-> i32))
+(extern fileno :cc (cc/C) [(ptr i8)] (-> i32))
 
-(extern fclose :cc c [(ptr i8)] (-> i32))
+(extern fclose :cc (cc/C) [(ptr i8)] (-> i32))
 
-(extern proc_pidinfo :cc c [i32 i32 u64 (ptr i8) i32] (-> i32))
+(extern proc_pidinfo :cc (cc/C) [i32 i32 u64 (ptr i8) i32] (-> i32))
 
 (extern ghostty_terminal_new
         :cc
-        c
+        (cc/C)
         [(ptr i8) (ptr (ptr i8)) GhosttyTerminalOptions]
         (-> i32))
 
-(extern ghostty_terminal_set :cc c [(ptr i8) i32 (ptr i8)] (-> i32))
+(extern ghostty_terminal_set :cc (cc/C) [(ptr i8) i32 (ptr i8)] (-> i32))
 
-(extern ghostty_terminal_resize :cc c [(ptr i8) u16 u16 u16 u16] (-> i32))
+(extern ghostty_terminal_resize :cc (cc/C) [(ptr i8) u16 u16 u16 u16] (-> i32))
 
-(extern ghostty_terminal_vt_write :cc c [(ptr i8) (ptr i8) u64] (-> void))
+(extern ghostty_terminal_vt_write :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> void))
 
-(extern ghostty_terminal_free :cc c [(ptr i8)] (-> void))
+(extern ghostty_terminal_free :cc (cc/C) [(ptr i8)] (-> void))
 
 (defn bytes [(array (ptr i8))] (-> (ptr i8))
   array)
@@ -259,7 +260,7 @@
 
 (defn disconnect-client [(s (ptr Session))] (-> i64)
   (if (>= (.client s) 0) (close (.client s)) 0)
-  (set! (.client s) (p/cast i32 -1))
+  (set! (.client s) (: -1 i32))
   (set! (.rx-len s) 0)
   (set! (.tx-at s) 0)
   (set! (.tx-len s) 0)
@@ -267,28 +268,28 @@
   0)
 
 (defn put-byte! [(base (ptr i8)) (offset i64) (value u8)] (-> i64)
-  (set! (p/index base offset) (p/cast i8 value))
+  (set! (index base offset) (p/cast i8 value))
   0)
 
 (defn byte-at [(base (ptr i8)) (offset i64)] (-> u8)
-  (p/cast u8 (load (p/index base offset))))
+  (p/cast u8 (load (index base offset))))
 
 (defn put-u32-be! [(base (ptr i8)) (offset i64) (value u32)] (-> i64)
-  (put-byte! base offset (p/cast u8 (>> value (p/cast u32 24))))
-  (put-byte! base (+ offset 1) (p/cast u8 (>> value (p/cast u32 16))))
-  (put-byte! base (+ offset 2) (p/cast u8 (>> value (p/cast u32 8))))
+  (put-byte! base offset (p/cast u8 (>> value (: 24 u32))))
+  (put-byte! base (+ offset 1) (p/cast u8 (>> value (: 16 u32))))
+  (put-byte! base (+ offset 2) (p/cast u8 (>> value (: 8 u32))))
   (put-byte! base (+ offset 3) (p/cast u8 value))
   0)
 
 (defn u16-be [(base (ptr i8)) (offset i64)] (-> u16)
-  (| (<< (p/cast u16 (byte-at base offset)) (p/cast u16 8))
+  (| (<< (p/cast u16 (byte-at base offset)) (: 8 u16))
      (p/cast u16 (byte-at base (+ offset 1)))))
 
 (defn u32-be [(base (ptr i8)) (offset i64)] (-> u32)
-  (| (| (<< (p/cast u32 (byte-at base offset)) (p/cast u32 24))
-        (<< (p/cast u32 (byte-at base (+ offset 1))) (p/cast u32 16)))
-     (| (<< (p/cast u32 (byte-at base (+ offset 2))) (p/cast u32 8))
-        (p/cast u32 (byte-at base (+ offset 3))))))
+  (| (<< (p/cast u32 (byte-at base offset)) (: 24 u32))
+     (<< (p/cast u32 (byte-at base (+ offset 1))) (: 16 u32))
+     (<< (p/cast u32 (byte-at base (+ offset 2))) (: 8 u32))
+     (p/cast u32 (byte-at base (+ offset 3)))))
 
 (defn write-header [(out (ptr i8)) (kind u32) (length i64)] (-> i64)
   (put-u32-be! out 0 (p/cast u32 transport/MAGIC))
@@ -296,30 +297,32 @@
   (put-u32-be! out 8 (p/cast u32 length))
   0)
 
-(defn append-frame [(s (ptr Session)) (kind u32) (data (ptr i8)) (length i64)] (-> bool)
-  (let [frame (p/alloc-stack (array i8 65548))
-        out (p/cast (ptr i8) frame)]
+(defn append-frame [(s (ptr Session)) (kind u32) (data (ptr i8)) (length i64)]
+  (-> bool)
+  (let [(mut frame) (zeroed (array i8 65548))
+        out (p/cast (ptr i8) (mut frame))]
     (write-header out kind length)
-    (memcpy (p/index out 12) data (p/cast isize length))
+    (memcpy (index out 12) data (p/cast isize length))
     (let [(mut at) 0]
-      (block :done
-               (loop (if (>= (load at) (+ length 12))
-                         (break true)
-                         (let [n
-                                 (pwrite (.journal s)
-                                         (p/index out (load at))
-                                         (p/cast isize
-                                                 (- (+ length 12) (load at)))
-                                         (+ (.end s) (load at)))]
-                           (if (and (< n 0) (= (os/os-errno) EINTR))
-                               0
-                               (if (<= n 0)
-                                   (do
-                                     (set! (.failed s) true)
-                                     (return-from :done false))
-                                   (set! at (+ (load at) (p/cast i64 n)))))))
-                 (set! (.end s) (+ (+ (.end s) length) 12))
-                 true)))))
+      (block
+        :done
+          (loop (if (>= (load at) (+ length 12))
+                    (break true)
+                    (let [n
+                            (pwrite (.journal s)
+                                    (index out (load at))
+                                    (p/cast isize
+                                            (- (+ length 12) (load at)))
+                                    (+ (.end s) (load at)))]
+                      (if (and (< n 0) (= (os/errno) EINTR))
+                          0
+                          (if (<= n 0)
+                              (do
+                                (set! (.failed s) true)
+                                (return-from :done false))
+                              (set! at (+ (load at) (p/cast i64 n)))))))
+            (set! (.end s) (+ (+ (.end s) length) 12))
+            true)))))
 
 (defn queue-input [(s (ptr Session)) (data (ptr i8)) (length i64)] (-> i64)
   (if (.exited s)
@@ -327,8 +330,8 @@
       (do
         (if (!= (.input-at s) 0)
             (do
-              (memmove (p/index (field s input) 0)
-                       (p/index (field s input) (.input-at s))
+              (memmove (index (field s input) 0)
+                       (index (field s input) (.input-at s))
                        (p/cast isize (- (.input-len s) (.input-at s))))
               (set! (.input-len s) (- (.input-len s) (.input-at s)))
               (set! (.input-at s) 0))
@@ -336,7 +339,7 @@
         (if (> length (- INPUT-CAPACITY (.input-len s)))
             (set! (.failed s) true)
             (do
-              (memcpy (p/index (field s input) (.input-len s))
+              (memcpy (index (field s input) (.input-len s))
                       data
                       (p/cast isize length))
               (set! (.input-len s) (+ (.input-len s) length))))
@@ -351,13 +354,13 @@
 (defn terminal-attributes [(terminal (ptr i8))
                            (userdata (ptr i8))
                            (out (ptr GhosttyAttributes))] (-> bool)
-  (set! out (p/zeroed GhosttyAttributes))
-  (set! (.conformance (.primary out)) (p/cast u16 62))
-  (set! (p/index (p/field (p/field out primary) features) 0) (p/cast u16 22))
-  (set! (p/index (p/field (p/field out primary) features) 1) (p/cast u16 52))
-  (set! (.count (.primary out)) (p/cast u64 2))
-  (set! (.device-type (.secondary out)) (p/cast u16 1))
-  (set! (.firmware-version (.secondary out)) (p/cast u16 10))
+  (set! out (zeroed GhosttyAttributes))
+  (set! (.conformance (.primary out)) (: 62 u16))
+  (set! (index (p/field (p/field out primary) features) 0) (: 22 u16))
+  (set! (index (p/field (p/field out primary) features) 1) (: 52 u16))
+  (set! (.count (.primary out)) (: 2 u64))
+  (set! (.device-type (.secondary out)) (: 1 u16))
+  (set! (.firmware-version (.secondary out)) (: 10 u16))
   true)
 
 (defn terminal-color-scheme [(terminal (ptr i8)) (userdata (ptr i8))] (-> i32)
@@ -374,30 +377,30 @@
             (mut i) 0]
         (loop (if (>= (load i) 259)
                   (break)
-                  (let [color (p/index colors (load i))]
+                  (let [color (index colors (load i))]
                     (set! (.r color) (byte-at data (* (load i) 3)))
                     (set! (.g color) (byte-at data (+ (* (load i) 3) 1)))
                     (set! (.b color) (byte-at data (+ (* (load i) 3) 2)))
                     (set! i (+ (load i) 1)))))
         (ghostty_terminal_set (.terminal s)
                               11
-                              (p/cast (ptr i8) (p/index colors 0)))
+                              (p/cast (ptr i8) (index colors 0)))
         (ghostty_terminal_set (.terminal s)
                               12
-                              (p/cast (ptr i8) (p/index colors 1)))
+                              (p/cast (ptr i8) (index colors 1)))
         (ghostty_terminal_set (.terminal s)
                               13
-                              (p/cast (ptr i8) (p/index colors 2)))
+                              (p/cast (ptr i8) (index colors 2)))
         (ghostty_terminal_set (.terminal s)
                               14
-                              (p/cast (ptr i8) (p/index colors 3)))
-        (let [background (p/index colors 1)
+                              (p/cast (ptr i8) (index colors 3)))
+        (let [background (index colors 1)
               luminance
                 (+ (+ (* (p/cast i64 (.r background)) 299)
                       (* (p/cast i64 (.g background)) 587))
                    (* (p/cast i64 (.b background)) 114))]
           (set! (.color-scheme s)
-                (if (< luminance 128000) (p/cast i32 1) (p/cast i32 0))))
+                (if (< luminance 128000) (: 1 i32) (: 0 i32))))
         0)))
 
 (defn resize-session [(s (ptr Session)) (data (ptr i8)) (length i64)] (-> i64)
@@ -407,10 +410,10 @@
             rows (u16-be data 2)
             width (u16-be data 4)
             height (u16-be data 6)]
-        (if (or (< cols (p/cast u16 1))
-                (< rows (p/cast u16 1))
-                (> cols (p/cast u16 1000))
-                (> rows (p/cast u16 1000)))
+        (if (or (< cols (: 1 u16))
+                (< rows (: 1 u16))
+                (> cols (: 1000 u16))
+                (> rows (: 1000 u16)))
             0
             (if (not (append-frame s
                                    (p/cast u32 transport/JIM-RESIZE)
@@ -422,32 +425,32 @@
                                                  rows
                                                  (p/cast u16 (/ width cols))
                                                  (p/cast u16 (/ height rows)))
-                        (p/cast i32 0))
+                        (: 0 i32))
                     (do (set! (.failed s) true) 0)
-                    (let [size (p/alloc-stack Winsize)]
-                      (set! size
-                            (Winsize
-                              :rows rows
-                              :cols cols
-                              :width width
-                              :height height))
+                    (let [(mut size)
+                            (: (Winsize
+                                 :rows rows
+                                 :cols cols
+                                 :width width
+                                 :height height)
+                               Winsize)]
                       (if (and (not (.exited s))
                                (< (ioctl (.pty s)
                                          (p/cast u64 TIOCSWINSZ)
-                                         (p/cast (ptr i8) size))
+                                         (p/cast (ptr i8) (mut size)))
                                   0))
                           (set! (.failed s) true)
                           0))))))))
 
 (defn url-safe? [(value u8)] (-> bool)
-  (or (and (>= value (p/cast u8 97)) (<= value (p/cast u8 122)))
-      (and (>= value (p/cast u8 65)) (<= value (p/cast u8 90)))
-      (and (>= value (p/cast u8 48)) (<= value (p/cast u8 57)))
-      (= value (p/cast u8 47))
-      (= value (p/cast u8 45))
-      (= value (p/cast u8 95))
-      (= value (p/cast u8 46))
-      (= value (p/cast u8 126))))
+  (or (and (>= value (: 97 u8)) (<= value (: 122 u8)))
+      (and (>= value (: 65 u8)) (<= value (: 90 u8)))
+      (and (>= value (: 48 u8)) (<= value (: 57 u8)))
+      (= value (: 47 u8))
+      (= value (: 45 u8))
+      (= value (: 95 u8))
+      (= value (: 46 u8))
+      (= value (: 126 u8))))
 
 (defn update-directory [(s (ptr Session))] (-> i64)
   (if (.exited s)
@@ -456,25 +459,25 @@
             foreground (tcgetpgrp (.pty s))]
         (if (or (<= foreground 0)
                 (!= (proc_pidinfo foreground 9 0 (p/cast (ptr i8) info) 2352)
-                    (p/cast i32 2352)))
+                    (: 2352 i32)))
             0
-            (let [cwd (p/cast (ptr i8) (p/index info 152))]
-              (if (or (= (byte-at cwd 0) (p/cast u8 0))
-                      (= (strcmp cwd (p/index (field s cwd) 0)) 0))
+            (let [cwd (p/cast (ptr i8) (index info 152))]
+              (if (or (= (byte-at cwd 0) (: 0 u8))
+                      (= (strcmp cwd (index (field s cwd) 0)) 0))
                   0
                   (let [length (p/cast i64 (strlen cwd))]
                     (if (>= length PATH-CAPACITY)
                         0
-                        (let [url (p/alloc-stack (array i8 3136))
-                              out (p/cast (ptr i8) url)
+                        (let [(mut url) (zeroed (array i8 3136))
+                              out (p/cast (ptr i8) (mut url))
                               prefix c"file://localhost"
                               (mut source-at) 0
                               (mut out-at) 16
                               hex c"0123456789ABCDEF"]
-                          (memset (p/index (field s cwd) 0)
+                          (memset (index (field s cwd) 0)
                                   0
                                   (p/cast isize PATH-CAPACITY))
-                          (memcpy (p/index (field s cwd) 0)
+                          (memcpy (index (field s cwd) 0)
                                   cwd
                                   (p/cast isize length))
                           (memcpy out prefix (p/cast isize 16))
@@ -488,21 +491,21 @@
                                           (do
                                             (put-byte! out
                                                        (load out-at)
-                                                       (p/cast u8 37))
+                                                       (: 37 u8))
                                             (put-byte! out
                                                        (+ (load out-at) 1)
                                                        (byte-at hex
                                                                 (p/cast i64
                                                                         (>> value
-                                                                            (p/cast u8
-                                                                                    4)))))
+                                                                            (: 4
+                                                                               u8)))))
                                             (put-byte! out
                                                        (+ (load out-at) 2)
                                                        (byte-at hex
                                                                 (p/cast i64
                                                                         (& value
-                                                                           (p/cast u8
-                                                                                   15)))))
+                                                                           (: 15
+                                                                              u8)))))
                                             (set! out-at (+ (load out-at) 3))))
                                       (set! source-at (+ (load source-at) 1)))))
                           (if (append-frame s
@@ -519,22 +522,22 @@
         (set! (.tx-at s) 0)
         (set! (.tx-len s) 0)
         (if (and (not (.ready s)) (= (.cursor s) (.replay-end s)))
-            (let [out (p/index (field s tx) 0)]
+            (let [out (index (field s tx) 0)]
               (write-header out (p/cast u32 transport/JIM-READY) 1)
-              (put-byte! out 12 (p/cast u8 1))
+              (put-byte! out 12 (: 1 u8))
               (set! (.tx-len s) 13)
               (set! (.ready s) true)
               0)
             (if (>= (.cursor s) (.end s))
                 0
-                (let [out (p/index (field s tx) 0)]
+                (let [out (index (field s tx) 0)]
                   (if (!= (pread (.journal s) out (p/cast isize 12) (.cursor s))
                           12)
                       (set! (.failed s) true)
                       (let [length (p/cast i64 (u32-be out 8))]
                         (if (or (> length transport/MAX-PAYLOAD)
                                 (!= (pread (.journal s)
-                                           (p/index out 12)
+                                           (index out 12)
                                            (p/cast isize length)
                                            (+ (.cursor s) 12))
                                     (p/cast isize length)))
@@ -548,35 +551,35 @@
   (if (.exited s)
       0
       (let [foreground (tcgetpgrp (.pty s))]
-        (if (> foreground 0) (kill (- (p/cast i32 0) foreground) SIGHUP) 0)
+        (if (> foreground 0) (kill (- (: 0 i32) foreground) SIGHUP) 0)
         (kill (.child s) SIGHUP)
         (let [(mut attempts) 0
-              status (p/alloc-stack i32)
-              delay (p/alloc-stack Timespec)]
-          (set! delay (Timespec :seconds 0 :nanoseconds 10000000))
+              (mut status) (zeroed i32)
+              (mut delay)
+                (: (Timespec :seconds 0 :nanoseconds 10000000) Timespec)]
           (block :reaped
-                 (loop (if (>= (load attempts) 50)
-                           (break)
-                           (let [result (waitpid (.child s) status WNOHANG)]
-                             (if (or (= result (.child s))
-                                     (and (< result 0) (= (os/os-errno) ECHILD)))
-                                 (do
-                                   (set! (.exited s) true)
-                                   (return-from :reaped 0))
-                                 (do
-                                   (nanosleep delay (p/cast (ptr Timespec) 0))
-                                   (set! attempts (+ (load attempts) 1)))))))
-                 (if (> foreground 0)
-                     (kill (- (p/cast i32 0) foreground) SIGKILL)
-                     0)
-                 (kill (- (p/cast i32 0) (.child s)) SIGKILL)
-                 (kill (.child s) SIGKILL)
-                 (loop (if (or (>= (waitpid (.child s) status 0) 0)
-                               (!= (os/os-errno) EINTR))
-                           (break)
-                           0))
-                 (set! (.exited s) true)
-                 0)))))
+            (loop (if (>= (load attempts) 50)
+                      (break)
+                      (let [result (waitpid (.child s) (mut status) WNOHANG)]
+                        (if (or (= result (.child s))
+                                (and (< result 0) (= (os/errno) ECHILD)))
+                            (do
+                              (set! (.exited s) true)
+                              (return-from :reaped 0))
+                            (do
+                              (nanosleep (mut delay) (p/cast (ptr Timespec) 0))
+                              (set! attempts (+ (load attempts) 1)))))))
+            (if (> foreground 0)
+                (kill (- (: 0 i32) foreground) SIGKILL)
+                0)
+            (kill (- (: 0 i32) (.child s)) SIGKILL)
+            (kill (.child s) SIGKILL)
+            (loop (if (or (>= (waitpid (.child s) (mut status) 0) 0)
+                          (!= (os/errno) EINTR))
+                      (break)
+                      0))
+            (set! (.exited s) true)
+            0)))))
 
 (defn accept-client [(s (ptr Session)) (listener i32)] (-> i64)
   (let [fd (accept listener (p/cast (ptr i8) 0) (p/cast (ptr u32) 0))]
@@ -589,41 +592,42 @@
                             (& flags (p/inot (p/cast i32 O-NONBLOCK))))
                      0))
               (do (close fd) 0)
-              (let [uid (p/alloc-stack u32)
-                    gid (p/alloc-stack u32)]
-                (if (or (< (getpeereid fd uid gid) 0) (!= (load uid) (getuid)))
+              (let [(mut uid) (zeroed u32)
+                    (mut gid) (zeroed u32)]
+                (if (or (< (getpeereid fd (mut uid) (mut gid)) 0)
+                        (!= uid (getuid)))
                     (do (close fd) 0)
-                    (let [timeout (p/alloc-stack Timeval)
-                          yes (p/alloc-stack i32)
-                          data (p/alloc-stack (array i8 65536))
-                          kind (p/alloc-stack u32)]
-                      (set! timeout
-                            (Timeval
-                              :seconds 0
-                              :microseconds 100000
-                              :padding 0))
+                    (let [(mut timeout)
+                            (: (Timeval
+                                 :seconds 0
+                                 :microseconds 100000
+                                 :padding 0)
+                               Timeval)
+                          (mut yes) (zeroed i32)
+                          (mut data) (zeroed (array i8 65536))
+                          (mut kind) (zeroed u32)]
                       (setsockopt fd
                                   SOL-SOCKET
                                   SO-RCVTIMEO
-                                  (p/cast (ptr i8) timeout)
-                                  (p/cast u32 16))
+                                  (p/cast (ptr i8) (mut timeout))
+                                  (: 16 u32))
                       (set! yes 1)
                       (setsockopt fd
                                   SOL-SOCKET
                                   SO-NOSIGPIPE
-                                  (p/cast (ptr i8) yes)
-                                  (p/cast u32 4))
+                                  (p/cast (ptr i8) (mut yes))
+                                  (: 4 u32))
                       (let [length
                               (transport/session-receive fd
-                                                         kind
-                                                         (p/cast (ptr i8) data)
+                                                         (mut kind)
+                                                         (p/cast (ptr i8)
+                                                                 (mut data))
                                                          65536)]
                         (if (and (= length 0)
-                                 (= (load kind) (p/cast u32 transport/JIM-KILL)))
+                                 (= kind (p/cast u32 transport/JIM-KILL)))
                             (do (close fd) (set! (.stopping s) true) 0)
-                            (if (or (!= (load kind)
-                                        (p/cast u32 transport/JIM-ATTACH))
-                                    (!= length (p/cast i32 8)))
+                            (if (or (!= kind (p/cast u32 transport/JIM-ATTACH))
+                                    (!= length (: 8 i32)))
                                 (do (close fd) 0)
                                 (do
                                   (disconnect-client s)
@@ -634,105 +638,109 @@
                                   (setsockopt fd
                                               SOL-SOCKET
                                               SO-RCVTIMEO
-                                              (p/cast (ptr i8) timeout)
-                                              (p/cast u32 16))
+                                              (p/cast (ptr i8) (mut timeout))
+                                              (: 16 u32))
                                   (if (set-nonblocking fd)
                                       (resize-session s
-                                                      (p/cast (ptr i8) data)
+                                                      (p/cast (ptr i8)
+                                                              (mut data))
                                                       8)
                                       (disconnect-client s))))))))))))))
 
 (defn receive-input [(s (ptr Session))] (-> i64)
-  (let [base (p/index (field s rx) 0)
+  (let [base (index (field s rx) 0)
         n
           (recv (.client s)
-                (p/index base (.rx-len s))
+                (index base (.rx-len s))
                 (p/cast isize (- FRAME-CAPACITY (.rx-len s)))
                 0)]
-    (if (and (< n 0) (or (= (os/os-errno) EAGAIN) (= (os/os-errno) EINTR)))
+    (if (and (< n 0) (or (= (os/errno) EAGAIN) (= (os/errno) EINTR)))
         0
         (if (<= n 0)
             (disconnect-client s)
             (do
               (set! (.rx-len s) (+ (.rx-len s) (p/cast i64 n)))
               (block :frames
-                     (loop (if (< (.rx-len s) 12)
-                               (break)
-                               (let [kind (u32-be base 4)
-                                     length (p/cast i64 (u32-be base 8))]
-                                 (if (or (!= (u32-be base 0)
-                                             (p/cast u32 transport/MAGIC))
-                                         (> length transport/MAX-PAYLOAD))
-                                     (do
-                                       (disconnect-client s)
-                                       (return-from :frames 0))
-                                     (if (< (.rx-len s) (+ length 12))
-                                         (break)
-                                         (do
-                                           (if (= kind
-                                                  (p/cast u32
-                                                          transport/JIM-INPUT))
-                                               (queue-input s
-                                                            (p/index base 12)
-                                                            length)
-                                               (if (= kind
-                                                      (p/cast u32
-                                                              transport/JIM-COLORS))
-                                                   (configure-colors s
-                                                                     (p/index base
-                                                                              12)
-                                                                     length)
-                                                   (if (= kind
-                                                          (p/cast u32
-                                                                  transport/JIM-RESIZE))
-                                                       (resize-session s
-                                                                       (p/index base
-                                                                                12)
-                                                                       length)
-                                                       (do
-                                                         (disconnect-client s)
-                                                         (return-from :frames 0)))))
-                                           (memmove base
-                                                    (p/index base (+ length 12))
-                                                    (p/cast isize
-                                                            (- (- (.rx-len s)
+                (loop (if (< (.rx-len s) 12)
+                          (break)
+                          (let [kind (u32-be base 4)
+                                length (p/cast i64 (u32-be base 8))]
+                            (if (or (!= (u32-be base 0)
+                                        (p/cast u32 transport/MAGIC))
+                                    (> length transport/MAX-PAYLOAD))
+                                (do
+                                  (disconnect-client s)
+                                  (return-from :frames 0))
+                                (if (< (.rx-len s) (+ length 12))
+                                    (break)
+                                    (do
+                                      (if (= kind
+                                             (p/cast u32
+                                                     transport/JIM-INPUT))
+                                          (queue-input s
+                                                       (index base 12)
+                                                       length)
+                                          (if (= kind
+                                                 (p/cast u32
+                                                         transport/JIM-COLORS))
+                                              (configure-colors s
+                                                                (index base 12)
+                                                                length)
+                                              (if (= kind
+                                                     (p/cast u32
+                                                             transport/JIM-RESIZE))
+                                                  (resize-session s
+                                                                  (index base
+                                                                         12)
                                                                   length)
-                                                               12)))
-                                           (set! (.rx-len s)
-                                                 (- (- (.rx-len s) length) 12))))))))
-                     0))))))
+                                                  (do
+                                                    (disconnect-client s)
+                                                    (return-from :frames 0)))))
+                                      (memmove base
+                                               (index base (+ length 12))
+                                               (p/cast isize
+                                                       (- (- (.rx-len s)
+                                                             length)
+                                                          12)))
+                                      (set! (.rx-len s)
+                                            (- (- (.rx-len s) length) 12))))))))
+                0))))))
 
 (defn private-directory? [(path (ptr i8))] (-> bool)
   (let [length (p/cast i64 (strlen path))]
     (if (or (= length 0) (>= length PATH-CAPACITY))
         false
-        (let [directory (p/alloc-stack (array i8 1024))
-              out (p/cast (ptr i8) directory)
-              (mut slash) (p/cast i64 -1)
+        (let [(mut directory) (zeroed (array i8 1024))
+              out (p/cast (ptr i8) (mut directory))
+              (mut slash) -1
               (mut i) 0]
           (memcpy out path (p/cast isize (+ length 1)))
           (loop (if (>= (load i) length)
                     (break)
                     (do
-                      (if (= (byte-at out (load i)) (p/cast u8 47))
+                      (if (= (byte-at out (load i)) (: 47 u8))
                           (set! slash (load i))
                           0)
                       (set! i (+ (load i) 1)))))
           (if (<= (load slash) 0)
               false
-              (let [status (p/alloc-stack (array i8 144))]
-                (put-byte! out (load slash) (p/cast u8 0))
-                (if (< (lstat out (p/cast (ptr i8) status)) 0)
+              (let [(mut status) (zeroed (array i8 144))]
+                (put-byte! out (load slash) (: 0 u8))
+                (if (< (lstat out (p/cast (ptr i8) (mut status))) 0)
                     false
                     (let [mode
                             (load (p/cast (ptr u16)
-                                          (p/index (p/cast (ptr i8) status) 4)))
+                                          (index (p/cast (ptr i8)
+                                                         (mut status))
+                                                 4)))
                           uid
                             (load (p/cast (ptr u32)
-                                          (p/index (p/cast (ptr i8) status) 16)))]
-                      (and (= (& mode (p/cast u16 61440)) (p/cast u16 16384))
+                                          (index (p/cast (ptr i8)
+                                                         (mut status))
+                                                 16)))]
+                      (and (= (& mode (: 61440 u16)) (: 16384 u16))
                            (= uid (getuid))
-                           (= (& mode (p/cast u16 63)) (p/cast u16 0)))))))))))
+                           (= (& mode (: 63 u16)) (: 0 u16)))))))))))
 
 (defn child-main [(argc i32)
                   (argv (ptr (ptr i8)))
@@ -743,27 +751,27 @@
   (close lock)
   (close journal)
   (signal SIGPIPE (p/cast (ptr i8) 0))
-  (if (< (chdir (load (p/index argv 2))) 0) (do (_exit 1) 0) 0)
+  (if (< (chdir (load (index argv 2))) 0) (do (_exit 1) 0) 0)
   (setenv c"TERM" c"xterm-ghostty" 1)
   (setenv c"TERM_PROGRAM" c"ghostty" 1)
   (setenv c"COLORTERM" c"truecolor" 1)
-  (let [resources (load (p/index argv 3))
+  (let [resources (load (index argv 3))
         resource-length (p/cast i64 (strlen resources))
-        terminfo (p/alloc-stack (array i8 1024))
-        out (p/cast (ptr i8) terminfo)
+        (mut terminfo) (zeroed (array i8 1024))
+        out (p/cast (ptr i8) (mut terminfo))
         suffix c"/../terminfo"]
     (if (>= (+ resource-length 13) PATH-CAPACITY) (do (_exit 1) 0) 0)
     (memcpy out resources (p/cast isize resource-length))
-    (memcpy (p/index out resource-length) suffix (p/cast isize 14))
+    (memcpy (index out resource-length) suffix (p/cast isize 14))
     (setenv c"TERMINFO" out 1)
     (setenv c"GHOSTTY_RESOURCES_DIR" resources 1)
     (if (> argc 4)
-        (do (execvp (load (p/index argv 4)) (p/index argv 4)) (_exit 127))
+        (do (execvp (load (index argv 4)) (index argv 4)) (_exit 127))
         (let [password (getpwuid (getuid))
               shell
                 (if (and (!= password (p/cast (ptr Passwd) 0))
                          (!= (.shell password) (p/cast (ptr i8) 0))
-                         (!= (byte-at (.shell password) 0) (p/cast u8 0)))
+                         (!= (byte-at (.shell password) 0) (: 0 u8)))
                     (.shell password)
                     c"/bin/zsh")]
           (execl shell shell c"-l" (p/cast (ptr i8) 0))
@@ -772,7 +780,7 @@
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (if (< argc 4)
       2
-      (let [socket-path (load (p/index argv 1))]
+      (let [socket-path (load (index argv 1))]
         (if (not (private-directory? socket-path))
             1
             (let [path-length (p/cast i64 (strlen socket-path))]
@@ -781,10 +789,10 @@
                   (let [address (p/alloc-stack SockaddrUn)
                         lock-path (p/alloc-stack (array i8 1024))
                         lock-bytes (p/cast (ptr i8) lock-path)]
-                    (set! address (p/zeroed SockaddrUn))
-                    (set! (.length address) (p/cast u8 106))
+                    (set! address (zeroed SockaddrUn))
+                    (set! (.length address) (: 106 u8))
                     (set! (.family address) (p/cast u8 AF-UNIX))
-                    (memcpy (p/cast (ptr i8) (p/index (field address path) 0))
+                    (memcpy (p/cast (ptr i8) (index (field address path) 0))
                             socket-path
                             (p/cast isize (+ path-length 1)))
                     (if (>= (+ path-length 6) PATH-CAPACITY)
@@ -793,14 +801,13 @@
                           (memcpy lock-bytes
                                   socket-path
                                   (p/cast isize path-length))
-                          (memcpy (p/index lock-bytes path-length)
+                          (memcpy (index lock-bytes path-length)
                                   c".lock"
                                   (p/cast isize 6))
                           (let [(mut lock)
                                   (open lock-bytes
                                         (p/cast i32
-                                                (| (| O-CREAT O-RDWR)
-                                                   O-NOFOLLOW))
+                                                (| O-CREAT O-RDWR O-NOFOLLOW))
                                         384)]
                             (if (and (>= (load lock) 0) (<= (load lock) 2))
                                 (let [moved
@@ -838,7 +845,7 @@
                                                   (close null-fd)
                                                   0))
                                             (signal SIGPIPE (p/cast (ptr i8) 1))
-                                            (umask (p/cast u16 63))
+                                            (umask (: 63 u16))
                                             (let [listener
                                                     (socket AF-UNIX
                                                             SOCK-STREAM
@@ -850,8 +857,7 @@
                                                     (if (or (< (bind listener
                                                                      (p/cast (ptr i8)
                                                                              address)
-                                                                     (p/cast u32
-                                                                             106))
+                                                                     (: 106 u32))
                                                                0)
                                                             (< (listen listener
                                                                        8)
@@ -875,39 +881,39 @@
                                                                     (let [s
                                                                             (p/alloc-static Session)]
                                                                       (set! s
-                                                                            (p/zeroed Session))
+                                                                            (zeroed Session))
                                                                       (set! (.pty s)
-                                                                            (p/cast i32
-                                                                                    -1))
+                                                                            (: -1
+                                                                               i32))
                                                                       (set! (.client s)
-                                                                            (p/cast i32
-                                                                                    -1))
+                                                                            (: -1
+                                                                               i32))
                                                                       (set! (.journal s)
                                                                             (fileno journal-file))
                                                                       (set! (.color-scheme s)
-                                                                            (p/cast i32
-                                                                                    1))
+                                                                            (: 1
+                                                                               i32))
                                                                       (fcntl (.journal s)
                                                                              F-SETFD
                                                                              FD-CLOEXEC)
                                                                       (let [options
                                                                               (GhosttyTerminalOptions
                                                                                 :cols
-                                                                                  (p/cast u16
-                                                                                          80)
+                                                                                  (: 80
+                                                                                     u16)
                                                                                 :rows
-                                                                                  (p/cast u16
-                                                                                          24)
+                                                                                  (: 24
+                                                                                     u16)
                                                                                 :max-scrollback
-                                                                                  (p/cast u64
-                                                                                          10000))]
+                                                                                  (: 10000
+                                                                                     u64))]
                                                                         (if (!= (ghostty_terminal_new (p/cast (ptr i8)
                                                                                                               0)
                                                                                                       (field s
                                                                                                              terminal)
                                                                                                       options)
-                                                                                (p/cast i32
-                                                                                        0))
+                                                                                (: 0
+                                                                                   i32))
                                                                             1
                                                                             (do
                                                                               (ghostty_terminal_set (.terminal s)
@@ -917,31 +923,30 @@
                                                                               (ghostty_terminal_set (.terminal s)
                                                                                                     1
                                                                                                     (p/cast (ptr i8)
-                                                                                                            (p/fnptr-of terminal-reply)))
+                                                                                                            (fnptr-of terminal-reply)))
                                                                               (ghostty_terminal_set (.terminal s)
                                                                                                     8
                                                                                                     (p/cast (ptr i8)
-                                                                                                            (p/fnptr-of terminal-attributes)))
+                                                                                                            (fnptr-of terminal-attributes)))
                                                                               (ghostty_terminal_set (.terminal s)
                                                                                                     7
                                                                                                     (p/cast (ptr i8)
-                                                                                                            (p/fnptr-of terminal-color-scheme)))
-                                                                              (let [initial-size
-                                                                                      (p/alloc-stack Winsize)]
-                                                                                (set! initial-size
-                                                                                      (Winsize
-                                                                                        :rows
-                                                                                          (p/cast u16
-                                                                                                  24)
-                                                                                        :cols
-                                                                                          (p/cast u16
-                                                                                                  80)
-                                                                                        :width
-                                                                                          (p/cast u16
-                                                                                                  0)
-                                                                                        :height
-                                                                                          (p/cast u16
-                                                                                                  0)))
+                                                                                                            (fnptr-of terminal-color-scheme)))
+                                                                              (let [(mut initial-size)
+                                                                                      (: (Winsize
+                                                                                           :rows
+                                                                                             (: 24
+                                                                                                u16)
+                                                                                           :cols
+                                                                                             (: 80
+                                                                                                u16)
+                                                                                           :width
+                                                                                             (: 0
+                                                                                                u16)
+                                                                                           :height
+                                                                                             (: 0
+                                                                                                u16))
+                                                                                         Winsize)]
                                                                                 (set! (.child s)
                                                                                       (forkpty (field s
                                                                                                       pty)
@@ -949,7 +954,7 @@
                                                                                                        0)
                                                                                                (p/cast (ptr i8)
                                                                                                        0)
-                                                                                               initial-size))
+                                                                                               (mut initial-size)))
                                                                                 (if (< (.child s)
                                                                                        0)
                                                                                     1
@@ -975,11 +980,10 @@
                    (lock i32)] (-> i64)
   (if (not (set-nonblocking (.pty s)))
       1
-      (let [initial (p/alloc-stack (array i8 8))
-            initial-bytes (p/cast (ptr i8) initial)]
-        (set! initial (p/zeroed (array i8 8)))
-        (put-byte! initial-bytes 1 (p/cast u8 80))
-        (put-byte! initial-bytes 3 (p/cast u8 24))
+      (let [(mut initial) (: (zeroed (array i8 8)) (array i8 8))
+            initial-bytes (p/cast (ptr i8) (mut initial))]
+        (put-byte! initial-bytes 1 (: 80 u8))
+        (put-byte! initial-bytes 3 (: 24 u8))
         (append-frame s (p/cast u32 transport/JIM-RESIZE) initial-bytes 8)
         (loop (if (or (.failed s) (.stopping s))
                   (break)
@@ -987,14 +991,14 @@
                     (update-directory s)
                     (prepare-output s)
                     (let [fds (p/alloc-stack (array PollFd 3))
-                          listener-fd (p/index fds 0)
-                          pty-fd (p/index fds 1)
-                          client-fd (p/index fds 2)]
+                          listener-fd (index fds 0)
+                          pty-fd (index fds 1)
+                          client-fd (index fds 2)]
                       (set! listener-fd
                             (PollFd
                               :fd listener
                               :events (p/cast i16 POLLIN)
-                              :revents (p/cast i16 0)))
+                              :revents (: 0 i16)))
                       (set! pty-fd
                             (PollFd
                               :fd (.pty s)
@@ -1007,7 +1011,7 @@
                                                       (.input-len s))
                                                    POLLOUT
                                                    0))))
-                              :revents (p/cast i16 0)))
+                              :revents (: 0 i16)))
                       (set! client-fd
                             (PollFd
                               :fd (.client s)
@@ -1022,13 +1026,13 @@
                                            (if (< (.tx-at s) (.tx-len s))
                                                POLLOUT
                                                0)))
-                              :revents (p/cast i16 0)))
+                              :revents (: 0 i16)))
                       (let [selected
                               (poll (p/cast (ptr PollFd) fds)
-                                    (p/cast u64 3)
+                                    (: 3 u64)
                                     200)]
                         (if (< selected 0)
-                            (if (= (os/os-errno) EINTR)
+                            (if (= (os/errno) EINTR)
                                 0
                                 (set! (.failed s) true))
                             (service-ready s
@@ -1058,15 +1062,15 @@
                      (pty-fd (ptr PollFd))
                      (client-fd (ptr PollFd))] (-> i64)
   (if (!= (& (p/cast i32 (.revents listener-fd)) (p/cast i32 POLLIN))
-          (p/cast i32 0))
+          (: 0 i32))
       (accept-client s listener)
       0)
   (if (and (not (.exited s))
            (!= (& (p/cast i32 (.revents pty-fd))
                   (p/cast i32 (| POLLIN POLLHUP)))
-               (p/cast i32 0)))
-      (let [data (p/alloc-stack (array i8 32768))
-            input (p/cast (ptr i8) data)
+               (: 0 i32)))
+      (let [(mut data) (zeroed (array i8 32768))
+            input (p/cast (ptr i8) (mut data))
             n (read (.pty s) input (p/cast isize 32768))]
         (if (> n 0)
             (do
@@ -1081,33 +1085,33 @@
                     0)
                   0)
               0)
-            (if (or (= n 0) (and (< n 0) (= (os/os-errno) EIO)))
-                (let [status (p/alloc-stack i32)
-                      result (waitpid (.child s) status WNOHANG)]
+            (if (or (= n 0) (and (< n 0) (= (os/errno) EIO)))
+                (let [(mut status) (zeroed i32)
+                      result (waitpid (.child s) (mut status) WNOHANG)]
                   (if (= result (.child s))
-                      (let [raw (load status)
+                      (let [raw status
                             code
                               (if (= (& raw 127) 0)
                                   (p/cast u32 (& (>> raw 8) 255))
                                   (p/cast u32 (+ 128 (p/cast i64 (& raw 127)))))
-                            encoded (p/alloc-stack (array i8 4))
-                            out (p/cast (ptr i8) encoded)]
+                            (mut encoded) (zeroed (array i8 4))
+                            out (p/cast (ptr i8) (mut encoded))]
                         (set! (.exited s) true)
                         (put-u32-be! out 0 code)
                         (append-frame s (p/cast u32 transport/JIM-EXITED) out 4)
                         (close (.pty s))
-                        (set! (.pty s) (p/cast i32 -1))
+                        (set! (.pty s) (: -1 i32))
                         0)
                       0))
                 0)))
       0)
   (if (and (not (.exited s))
            (!= (& (p/cast i32 (.revents pty-fd)) (p/cast i32 POLLOUT))
-               (p/cast i32 0)))
-      (let [base (p/index (field s input) 0)
+               (: 0 i32)))
+      (let [base (index (field s input) 0)
             n
               (write (.pty s)
-                     (p/index base (.input-at s))
+                     (index base (.input-at s))
                      (p/cast isize (- (.input-len s) (.input-at s))))]
         (if (> n 0) (set! (.input-at s) (+ (.input-at s) (p/cast i64 n))) 0)
         (if (= (.input-at s) (.input-len s))
@@ -1117,24 +1121,24 @@
   (if (and (>= (.client s) 0) (= (.fd client-fd) (.client s)))
       (do
         (if (!= (& (p/cast i32 (.revents client-fd))
-                   (p/cast i32 (| (| POLLIN POLLHUP) POLLERR)))
-                (p/cast i32 0))
+                   (p/cast i32 (| POLLIN POLLHUP POLLERR)))
+                (: 0 i32))
             (receive-input s)
             0)
         (if (and (>= (.client s) 0)
                  (!= (& (p/cast i32 (.revents client-fd)) (p/cast i32 POLLOUT))
-                     (p/cast i32 0)))
-            (let [base (p/index (field s tx) 0)
+                     (: 0 i32)))
+            (let [base (index (field s tx) 0)
                   n
                     (send (.client s)
-                          (p/index base (.tx-at s))
+                          (index base (.tx-at s))
                           (p/cast isize (- (.tx-len s) (.tx-at s)))
                           0)]
               (if (> n 0)
                   (set! (.tx-at s) (+ (.tx-at s) (p/cast i64 n)))
                   (if (and (< n 0)
-                           (!= (os/os-errno) EAGAIN)
-                           (!= (os/os-errno) EINTR))
+                           (!= (os/errno) EAGAIN)
+                           (!= (os/errno) EINTR))
                       (disconnect-client s)
                       0)))
             0))

@@ -1,9 +1,14 @@
 (module jim.widget-api)
 (import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-eq])
+(import "coil.serde"
+        :use
+        [Serialize Deserialize Serializer Deserializer SerError DeError ser-str
+         de-str de-error-message ser-error-message])
+(import "coil.serde.json" :as json)
 
 ;;; The contract between Jim and hot-reloaded Coil widgets.
 ;;;
@@ -137,10 +142,10 @@
 
 (defn ui-new [(a (dyn Allocator))] (-> Ui)
   (Ui
-    :nodes (al-new [Node] a)
-    :watches (al-new [Watch] a)
-    :bytes (al-new [u8] a)
-    :open (al-new [i64] a)
+    :nodes (ArrayList::new [Node] a)
+    :watches (ArrayList::new [Watch] a)
+    :bytes (ArrayList::new [u8] a)
+    :open (ArrayList::new [i64] a)
     :width 0.0
     :height 0.0
     :scroll-y 0.0
@@ -149,19 +154,20 @@
     :fault 0))
 
 (defn ui-free! [(ui (ptr Ui))] (-> void)
-  (al-free! (mut (.nodes ui)))
-  (al-free! (mut (.watches ui)))
-  (al-free! (mut (.bytes ui)))
-  (al-free! (mut (.open ui)))
+  (free! (mut (.nodes ui)))
+  (free! (mut (.watches ui)))
+  (free! (mut (.bytes ui)))
+  (free! (mut (.open ui)))
   (do))
 
 ;;; Jim sets the viewport before each render: WIDTH×HEIGHT of the pane's
 ;;; content, scrolled down by SCROLL-Y. Widgets may use these to virtualize.
-(defn ui-clear! [(ui (ptr Ui)) (width f64) (height f64) (scroll-y f64)] (-> void)
-  (al-clear! (mut (.nodes ui)))
-  (al-clear! (mut (.watches ui)))
-  (al-clear! (mut (.bytes ui)))
-  (al-clear! (mut (.open ui)))
+(defn ui-clear! [(ui (ptr Ui)) (width f64) (height f64) (scroll-y f64)]
+  (-> void)
+  (clear! (mut (.nodes ui)))
+  (clear! (mut (.watches ui)))
+  (clear! (mut (.bytes ui)))
+  (clear! (mut (.open ui)))
   (set! (.width ui) width)
   (set! (.height ui) height)
   (set! (.scroll-y ui) scroll-y)
@@ -171,10 +177,10 @@
   (do))
 
 (defn node [(ui (ptr Ui)) (index i64)] (-> (ptr Node))
-  (al-elem (field ui nodes) index))
+  (elem (field ui nodes) index))
 
 (defn bytes-at [(ui (ptr Ui)) (at i64) (n i64)] (-> (slice u8))
-  (subslice (al-slice (.bytes ui)) at (+ at n)))
+  (subslice (slice (.bytes ui)) at (+ at n)))
 
 (defn node-text [(ui (ptr Ui)) (n (ptr Node))] (-> (slice u8))
   (bytes-at ui (.text-at n) (.text-len n)))
@@ -197,7 +203,7 @@
 
 (defn copy-bytes! [(ui (ptr Ui)) (s (slice u8))] (-> i64)
   (let [at (len (.bytes ui))]
-    (al-extend! (mut (.bytes ui)) (slice-data s) (len s))
+    (extend! (mut (.bytes ui)) (data s) (len s))
     at))
 
 (defn blank-node [(kind i64) (parent i64)] (-> Node)
@@ -314,7 +320,8 @@
       (fault! ui FAULT-END-WITHOUT-CONTAINER)
       (do (pop! (mut (.open ui))) (do))))
 
-(defn leaf! [(ui (ptr Ui)) (kind i64) (text (slice u8)) (id (slice u8))] (-> i64)
+(defn leaf! [(ui (ptr Ui)) (kind i64) (text (slice u8)) (id (slice u8))]
+  (-> i64)
   (if (= (len (.open ui)) 0)
       (do (fault! ui FAULT-CHILD-OF-LEAF) NONE)
       (add! ui kind text id)))
@@ -355,20 +362,20 @@
         (mut n) (if negative (- 0 value) value)
         (mut at) 20]
     (loop (set! at (- at 1))
-      (set! (primitive/index digits (load at))
+      (set! (index digits (load at))
             (primitive/cast u8 (+ 48 (% (load n) 10))))
       (set! n (/ (load n) 10))
       (if (= (load n) 0) (break) 0))
     (when negative
       (set! at (- (load at) 1))
-      (set! (primitive/index digits (load at)) (primitive/cast u8 45))
+      (set! (index digits (load at)) (: 45 u8))
       0)
-    (slice-new (primitive/index digits (load at)) (- 20 (load at)))))
+    (slice::new (index digits (load at)) (- 20 (load at)))))
 
 ;;; Append a decimal integer to the text element just added.
 (defn append-i64! [(ui (ptr Ui)) (value i64)] (-> void)
-  (let [digits (primitive/alloc-stack (array u8 20))]
-    (append! ui (decimal (primitive/cast (ptr u8) digits) value))))
+  (let [(mut digits) (zeroed (array u8 20))]
+    (append! ui (decimal (primitive/cast (ptr u8) (mut digits)) value))))
 
 ;;; A push button. Clicking it delivers a CLICK event carrying `id`.
 (defn button! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8))] (-> void)
@@ -376,7 +383,8 @@
   (do))
 
 ;;; A tab or segmented-control button; SELECTED draws it as the active one.
-(defn tab! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8)) (selected bool)] (-> void)
+(defn tab! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8)) (selected bool)]
+  (-> void)
   (let [index (leaf! ui BUTTON label id)]
     (when (and (!= index NONE) selected)
       (set! (.variant (node ui index)) SELECTED)
@@ -384,7 +392,8 @@
     (do)))
 
 ;;; A checkbox. Clicking it delivers a TOGGLE event with the new value.
-(defn toggle! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8)) (checked bool)] (-> void)
+(defn toggle! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8)) (checked bool)]
+  (-> void)
   (let [index (leaf! ui TOGGLE label id)]
     (when (!= index NONE) (set! (.checked (node ui index)) checked) 0)
     (do)))
@@ -482,7 +491,8 @@
       0)
     (node ui (- (len (.nodes ui)) 1))))
 
-(defn pad! [(ui (ptr Ui)) (top f64) (right f64) (bottom f64) (left f64)] (-> void)
+(defn pad! [(ui (ptr Ui)) (top f64) (right f64) (bottom f64) (left f64)]
+  (-> void)
   (let [n (styled ui)]
     (set! (.pad-top n) top)
     (set! (.pad-right n) right)
@@ -490,7 +500,8 @@
     (set! (.pad-left n) left)
     (do)))
 
-(defn margin! [(ui (ptr Ui)) (top f64) (right f64) (bottom f64) (left f64)] (-> void)
+(defn margin! [(ui (ptr Ui)) (top f64) (right f64) (bottom f64) (left f64)]
+  (-> void)
   (let [n (styled ui)]
     (set! (.margin-top n) top)
     (set! (.margin-right n) right)
@@ -578,23 +589,23 @@
 (defstruct Requests [(bytes (ArrayList u8)) (items (ArrayList Request))])
 
 (defn requests-new [(a (dyn Allocator))] (-> Requests)
-  (Requests :bytes (al-new [u8] a) :items (al-new [Request] a)))
+  (Requests :bytes (ArrayList::new [u8] a) :items (ArrayList::new [Request] a)))
 
 (defn requests-free! [(r (ptr Requests))] (-> void)
-  (al-free! (mut (.bytes r)))
-  (al-free! (mut (.items r)))
+  (free! (mut (.bytes r)))
+  (free! (mut (.items r)))
   (do))
 
 (defn requests-clear! [(r (ptr Requests))] (-> void)
-  (al-clear! (mut (.bytes r)))
-  (al-clear! (mut (.items r)))
+  (clear! (mut (.bytes r)))
+  (clear! (mut (.items r)))
   (do))
 
 (defn request-text [(r (ptr Requests)) (item Request)] (-> (slice u8))
-  (subslice (al-slice (.bytes r)) (.at item) (+ (.at item) (.len item))))
+  (subslice (slice (.bytes r)) (.at item) (+ (.at item) (.len item))))
 
 (defn request-text2 [(r (ptr Requests)) (item Request)] (-> (slice u8))
-  (subslice (al-slice (.bytes r)) (.at2 item) (+ (.at2 item) (.len2 item))))
+  (subslice (slice (.bytes r)) (.at2 item) (+ (.at2 item) (.len2 item))))
 
 (defn push-request! [(r (ptr Requests))
                      (kind i64)
@@ -602,8 +613,8 @@
                      (text2 (slice u8))
                      (value f64)] (-> void)
   (let [at (len (.bytes r))]
-    (al-extend! (mut (.bytes r)) (slice-data text) (len text))
-    (al-extend! (mut (.bytes r)) (slice-data text2) (len text2))
+    (extend! (mut (.bytes r)) (data text) (len text))
+    (extend! (mut (.bytes r)) (data text2) (len text2))
     (push! (mut (.items r))
            (Request
              :kind kind
@@ -731,7 +742,7 @@
 ;;; never pulls code out from under a running task.
 (deftrait Host [Self]
   (spawn [(self (ptr Self)) (argv (slice (slice u8))) (cwd (slice u8))]
-         (-> i64))
+    (-> i64))
   (poll [(self (ptr Self)) (process i64) (out (ptr (ArrayList u8)))] (-> i64))
   (release [(self (ptr Self)) (process i64)] (-> void))
   (start-task [(self (ptr Self)) (task (dyn Task))] (-> i64))
@@ -742,32 +753,38 @@
 (deftrait Task [Self]
   (run [(self (ptr Self))] (-> void)))
 
-;;; The snapshot a widget boots from also carries Jim's Host.
+;;; The snapshot a widget boots from also carries Jim's Host. PROBLEM is set
+;;; by refuse!: why this snapshot cannot be saved or booted from.
 (defstruct Snapshot
-  [(bytes (ArrayList u8)) (entries (ArrayList Entry)) (host (dyn Host))])
+  [(bytes (ArrayList u8))
+   (entries (ArrayList Entry))
+   (host (dyn Host))
+   (problem (ArrayList u8))])
 
 (defn snapshot-new [(a (dyn Allocator))] (-> Snapshot)
   (Snapshot
-    :bytes (al-new [u8] a)
-    :entries (al-new [Entry] a)
-    :host (primitive/zeroed (dyn Host))))
+    :bytes (ArrayList::new [u8] a)
+    :entries (ArrayList::new [Entry] a)
+    :host (zeroed (dyn Host))
+    :problem (ArrayList::new [u8] a)))
 
 ;;; Jim's services, for a widget to keep from boot.
 (defn host [(s (ptr Snapshot))] (-> (dyn Host))
   (.host s))
 
 (defn snapshot-free! [(s (ptr Snapshot))] (-> void)
-  (al-free! (mut (.bytes s)))
-  (al-free! (mut (.entries s)))
+  (free! (mut (.bytes s)))
+  (free! (mut (.entries s)))
+  (free! (mut (.problem s)))
   (do))
 
 (defn snapshot-bytes! [(s (ptr Snapshot)) (value (slice u8))] (-> i64)
   (let [at (len (.bytes s))]
-    (al-extend! (mut (.bytes s)) (slice-data value) (len value))
+    (extend! (mut (.bytes s)) (data value) (len value))
     at))
 
 (defn snapshot-slice [(s (ptr Snapshot)) (at i64) (n i64)] (-> (slice u8))
-  (subslice (al-slice (.bytes s)) at (+ at n)))
+  (subslice (slice (.bytes s)) at (+ at n)))
 
 (defn put-entry! [(s (ptr Snapshot))
                   (key (slice u8))
@@ -790,7 +807,8 @@
 (defn put-bool! [(s (ptr Snapshot)) (key (slice u8)) (value bool)] (-> void)
   (put-entry! s key (if value 1 0) ""))
 
-(defn put-text! [(s (ptr Snapshot)) (key (slice u8)) (value (slice u8))] (-> void)
+(defn put-text! [(s (ptr Snapshot)) (key (slice u8)) (value (slice u8))]
+  (-> void)
   (put-entry! s key 0 value))
 
 ;;; The last entry named KEY, so later puts override earlier ones.
@@ -804,19 +822,106 @@
 
 (defn get-i64 [(s (ptr Snapshot)) (key (slice u8)) (default i64)] (-> i64)
   (let [i (find s key)]
-    (if (= i NONE) default (.value (al-elem (field s entries) i)))))
+    (if (= i NONE) default (.value (elem (field s entries) i)))))
 
 (defn get-bool [(s (ptr Snapshot)) (key (slice u8)) (default bool)] (-> bool)
   (let [i (find s key)]
-    (if (= i NONE) default (!= (.value (al-elem (field s entries) i)) 0))))
+    (if (= i NONE) default (!= (.value (elem (field s entries) i)) 0))))
 
 ;;; Borrowed from the snapshot, which is freed after boot: copy what you keep.
-(defn get-text [(s (ptr Snapshot)) (key (slice u8)) (default (slice u8))] (-> (slice u8))
+(defn get-text [(s (ptr Snapshot)) (key (slice u8)) (default (slice u8))]
+  (-> (slice u8))
   (let [i (find s key)]
     (if (= i NONE)
         default
         (let [e (get (.entries s) i)]
           (snapshot-slice s (.text-at e) (.text-len e))))))
+
+;;; Refuse the save or boot in progress. Jim keeps the running version, if
+;;; any, and shows MESSAGE in the pane; a boot that refuses must not store a
+;;; widget. The first refusal is the one shown.
+(defn refuse! [(s (ptr Snapshot)) (message (slice u8))] (-> void)
+  (when (= (len (.problem s)) 0) (problem-push! s message) 0)
+  (do))
+
+(defn problem-push! [(s (ptr Snapshot)) (text (slice u8))] (-> void)
+  (extend! (mut (.problem s)) (data text) (len text))
+  (do))
+
+(defn problem [(s (ptr Snapshot))] (-> (slice u8))
+  (slice (.problem s)))
+
+;;; Widget state, serde style. A widget keeps what should survive reloads and
+;;; restarts in a struct deriving coil.serde's Serialize and Deserialize, and
+;;; Jim stores it as one JSON entry:
+;;;
+;;;   (defstruct State [(n i64) (note (ArrayList u8))])
+;;;   (derive (Serialize (field note (with text-ser text-de)))
+;;;           (Deserialize (field note (with text-ser text-de))
+;;;                        (field n (default 0)))
+;;;           State)
+;;;
+;;; `save` calls `(save-state! s (.state self))`; `boot` matches
+;;; `(load-state [State] saved)`. A field the saved JSON lacks takes its
+;;; `(default …)`, and saved fields the struct no longer has are skipped, so
+;;; adding and removing fields keeps the rest. A field without a default that
+;;; the saved state lacks refuses the reload, naming the field.
+(const STATE-KEY "state")
+
+(defn save-state! [(T Serialize)] [(s (ptr Snapshot)) (value T)] (-> void)
+  (match (json/to-json-str (alloc/malloc-allocator) value)
+    (Ok [text]
+        (put-text! s STATE-KEY text)
+        (alloc/free [u8] (alloc/malloc-allocator) text)
+        (do))
+    (Err [e]
+         (when (= (len (.problem s)) 0)
+           (problem-push! s "the widget state cannot be saved: ")
+           (problem-push! s (ser-error-message (.kind e))))
+         (do))))
+
+;;; What load-state found: no saved state (a first boot, so build the fresh
+;;; state), the decoded state, or saved state that no longer decodes as T. On
+;;; Refused the boot is already refused; return without storing a widget.
+(defsum Restored [T]
+  (Fresh)
+  (Loaded [(state T)])
+  (Refused))
+
+;;; Decoded text borrows the snapshot, which is freed after boot, so give text
+;;; fields `(with text-ser text-de)`, which owns them.
+(defn load-state [(T Deserialize)] [(s (ptr Snapshot))] (-> (Restored T))
+  (let [i (find s STATE-KEY)]
+    (if (= i NONE)
+        (Fresh)
+        (let [e (get (.entries s) i)]
+          (match (json/from-json [T]
+                                 (alloc/malloc-allocator)
+                                 (snapshot-slice s (.text-at e) (.text-len e)))
+            (Ok [value] (Loaded value))
+            (Err [problem]
+                 (when (= (len (.problem s)) 0)
+                   (problem-push! s "the saved state no longer fits: ")
+                   (problem-push! s (de-error-message (.kind problem)))
+                   (when (> (len (.ctx problem)) 0)
+                     (problem-push! s " ")
+                     (problem-push! s (.ctx problem)))
+                   0)
+                 (Refused)))))))
+
+;;; Serde `with` hooks for a text field held as an owned (ArrayList u8): it is
+;;; written as a JSON string and decoded into a fresh malloc-owned list.
+(defn text-ser [(x (ArrayList u8)) (s (dyn Serializer))]
+  (-> (Result i64 SerError))
+  (ser-str s (slice x)))
+
+(defn text-de [(out (ptr (ArrayList u8))) (d (dyn Deserializer))]
+  (-> (Result i64 DeError))
+  (try (let [text (try! (de-str d))
+             (mut owned) (ArrayList::new [u8] (alloc/malloc-allocator))]
+         (extend! (mut owned) (data text) (len text))
+         (set! out (load owned))
+         (Ok 0))))
 
 ;;; A widget is any type implementing this trait. Each widget module defines
 ;;;   (defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void))

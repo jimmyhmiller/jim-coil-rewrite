@@ -9,7 +9,7 @@
 
 ;;; Stable action IDs are shared by shortcuts and the searchable registry.
 ;;; Fixed actions come first; one action per project follows.
-(const FIRST-PROJECT 29)
+(const FIRST-PROJECT 30)
 
 (defn count [] (-> i64)
   (+ FIRST-PROJECT (storage/count (projects/list (load (model))))))
@@ -44,6 +44,7 @@
         (= id 26) c"Project: Delete current project"
         (= id 27) c"Terminal: Reconnect focused terminal"
         (= id 28) c"Widget: Open widget"
+        (= id 29) c"View: Toggle Exposé"
         :else
           (utf8 (msg (ptr i8)
                      (ns c"Project: ")
@@ -67,6 +68,7 @@
         (= id 12) c"⌘2"
         (= id 13) c"⌘3"
         (= id 14) c"⌘4"
+        (= id 29) c"⌘⇧E"
         :else c""))
 
 (defn keywords [(id i64)] (-> (ptr i8))
@@ -76,6 +78,8 @@
         (= id 10) c" fps performance profiler latency frame time"
         (= id 19) c" cwd pwd working current default new terminal"
         (= id 28) c" coil hot reload funct pane new"
+        (= id 29)
+          c" expose overview windows spread grid mission control tile arrange"
         :else c""))
 
 ;;; Original Jim's subsequence score: consecutive and word-start bonuses.
@@ -85,7 +89,7 @@
         h (msg (ptr i8) text (sel c"lowercaseString") [])
         qn (msg u64 q (sel c"length") [])
         hn (msg u64 h (sel c"length") [])
-        (mut hi) (p/cast u64 0)
+        (mut hi) (: 0 u64)
         (mut result) 0
         (mut consecutive) 0
         (mut valid) true]
@@ -98,24 +102,24 @@
               (let [at (load hi)
                     hc (msg u16 h (sel c"characterAtIndex:") [u64] at)
                     prev
-                      (if (> at (p/cast u64 0))
+                      (if (> at (: 0 u64))
                           (msg u16
                                h
                                (sel c"characterAtIndex:")
                                [u64]
-                               (- at (p/cast u64 1)))
-                          (p/cast u16 32))]
+                               (- at (: 1 u64)))
+                          (: 32 u16))]
                 (do
-                  (set! hi (+ at (p/cast u64 1)))
+                  (set! hi (+ at (: 1 u64)))
                   (if (= ch hc)
                       (do
                         (set! result (+ (load result) (+ 1 (load consecutive))))
-                        (if (or (= at (p/cast u64 0))
-                                (= prev (p/cast u16 32))
-                                (= prev (p/cast u16 95))
-                                (= prev (p/cast u16 46))
-                                (= prev (p/cast u16 47))
-                                (= prev (p/cast u16 45)))
+                        (if (or (= at (: 0 u64))
+                                (= prev (: 32 u16))
+                                (= prev (: 95 u16))
+                                (= prev (: 46 u16))
+                                (= prev (: 47 u16))
+                                (= prev (: 45 u16)))
                             (set! result (+ (load result) 4))
                             0)
                         (set! consecutive (+ (load consecutive) 1))
@@ -142,24 +146,25 @@
         exact
           (msg Range hay (sel c"rangeOfString:options:") [(ptr i8) u64] query 1)]
     (if (and (>= base 0)
-             (and (> (msg u64 query (sel c"length") []) (p/cast u64 0))
-                  (> (.length exact) (p/cast u64 0))))
+             (and (> (msg u64 query (sel c"length") []) (: 0 u64))
+                  (> (.length exact) (: 0 u64))))
         (+ base 32)
         base)))
 
 (defn key-action [(key u16) (flags u64)] (-> i64)
-  (let [command (!= (& flags 1048576) (p/cast u64 0))
-        shift (!= (& flags 131072) (p/cast u64 0))]
+  (let [command (!= (& flags 1048576) (: 0 u64))
+        shift (!= (& flags 131072) (: 0 u64))]
     (if command
-        (cond (or (= key (p/cast u16 17)) (= key (p/cast u16 45))) 0
-              (= key (p/cast u16 13)) 1
-              (= key (p/cast u16 29)) (if shift 2 3)
-              (= key (p/cast u16 24)) 5
-              (= key (p/cast u16 27)) 6
-              (and shift (= key (p/cast u16 6))) 7
-              (and shift (= key (p/cast u16 42))) 8
-              (= key (p/cast u16 15)) 9
-              (and (>= key (p/cast u16 18)) (<= key (p/cast u16 21)))
+        (cond (or (= key (: 17 u16)) (= key (: 45 u16))) 0
+              (= key (: 13 u16)) 1
+              (= key (: 29 u16)) (if shift 2 3)
+              (= key (: 24 u16)) 5
+              (= key (: 27 u16)) 6
+              (and shift (= key (: 6 u16))) 7
+              (and shift (= key (: 42 u16))) 8
+              (and shift (= key (: 14 u16))) 29
+              (= key (: 15 u16)) 9
+              (and (>= key (: 18 u16)) (<= key (: 21 u16)))
                 (+ 11 (- (p/cast i64 key) 18))
               :else -1)
         -1)))

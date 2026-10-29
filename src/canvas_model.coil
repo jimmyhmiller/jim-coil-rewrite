@@ -1,8 +1,12 @@
 (module jim.canvas-model)
+(import "coil.cc" :as cc)
 (import "jim.native" :use [Point Rect rect])
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.math" :use [Float])
 (import "coil.primitive" :as p)
 
-(extern exp :cc c [f64] (-> f64))
+(extern exp :cc (cc/C) [f64] (-> f64))
 
 ;;; Canvas coordinates use top-left origin and positive-down y, independently
 ;;; of AppKit's bottom-left coordinates. Jim clamps the camera at the top-left
@@ -21,7 +25,8 @@
   (cond (< x low) low (> x high) high :else x))
 
 (defn screen-to-world [(c Camera) (point Point)] (-> Point)
-  (Point :x (+ (.x c) (/ (.x point) (.zoom c)))
+  (Point
+    :x (+ (.x c) (/ (.x point) (.zoom c)))
     :y (+ (.y c) (/ (.y point) (.zoom c)))))
 
 (defn project [(c Camera) (bounds Rect)] (-> Rect)
@@ -53,7 +58,7 @@
     :top (clamp (/ (.y c) distance) 0.0 1.0)
     :bottom (clamp (/ (- 0.0 (+ (.y c) (/ height (.zoom c)))) distance) 0.0 1.0)))
 
-(extern pow :cc c [f64 f64] (-> f64))
+(extern pow :cc (cc/C) [f64 f64] (-> f64))
 
 (defn clamp-camera [(c Camera)] (-> Camera)
   (Camera
@@ -95,17 +100,199 @@
 
 ;;; Keep the originally grabbed world-space point attached to the cursor,
 ;;; even when the camera moves or zooms without a mouse-motion event.
+;;; BOUNDS moved, if needed, so its origin is not above or left of the world
+;;; origin. The camera never pans past the origin, so a pane there could not be
+;;; reached.
+(defn reachable [(bounds Rect)] (-> Rect)
+  (rect (if (< (.x bounds) 0.0) 0.0 (.x bounds))
+        (if (< (.y bounds) 0.0) 0.0 (.y bounds))
+        (.w bounds)
+        (.h bounds)))
+
+;;; The edges a resize drags, as a set of bits. World y grows downward, so the
+;;; top edge is the pane's smallest y.
+(const EDGE-TOP 1)
+
+(const EDGE-BOTTOM 2)
+
+(const EDGE-LEFT 4)
+
+(const EDGE-RIGHT 8)
+
+;;; The edges within BAND of the pane-local point (X, Y) in a pane of size W×H;
+;;; two at a corner, 0 away from every edge.
+(defn edges-at [(w f64) (h f64) (x f64) (y f64) (band f64)] (-> i64)
+  (+ (if (< y band) EDGE-TOP 0)
+     (if (> y (- h band)) EDGE-BOTTOM 0)
+     (if (< x band) EDGE-LEFT 0)
+     (if (> x (- w band)) EDGE-RIGHT 0)))
+
+(defn edge? [(edges i64) (edge i64)] (-> bool)
+  (!= (& edges edge) 0))
+
+;;; One axis of a resize: the span from START with length LEN, its near edge
+;;; moved by D when NEAR, its far edge when FAR. The opposite edge stays put,
+;;; the length stays within the pane limits, and the start stays at or past 0.
+(defstruct Span [(start f64) (len f64)])
+
+(defn resized-span [(start f64)
+                    (len f64)
+                    (d f64)
+                    (near bool)
+                    (far bool)
+                    (low f64)] (-> Span)
+  (cond far (Span :start start :len (clamp (+ len d) low 4096.0))
+        near
+          (let [end (+ start len)
+                moved (clamp (- len d) low 4096.0)
+                at (- end moved)]
+            (if (< at 0.0)
+                (Span :start 0.0 :len end)
+                (Span :start at :len moved)))
+        :else (Span :start start :len len)))
+
+;;; BOUNDS after dragging from START-WORLD to POINTER: moved when EDGES is 0,
+;;; otherwise resized by the edges it names.
 (defn dragged-bounds [(camera Camera)
                       (start-world Point)
                       (pointer Point)
                       (bounds Rect)
-                      (resize bool)] (-> Rect)
+                      (edges i64)] (-> Rect)
   (let [world (screen-to-world camera pointer)
         dx (- (.x world) (.x start-world))
         dy (- (.y world) (.y start-world))]
-    (if resize
-        (rect (.x bounds)
-              (.y bounds)
-              (clamp (+ (.w bounds) dx) 320.0 4096.0)
-              (clamp (+ (.h bounds) dy) 180.0 4096.0))
-        (rect (+ (.x bounds) dx) (+ (.y bounds) dy) (.w bounds) (.h bounds)))))
+    (if (= edges 0)
+        (reachable (rect (+ (.x bounds) dx)
+                         (+ (.y bounds) dy)
+                         (.w bounds)
+                         (.h bounds)))
+        (let [across
+                (resized-span (.x bounds)
+                              (.w bounds)
+                              dx
+                              (edge? edges EDGE-LEFT)
+                              (edge? edges EDGE-RIGHT)
+                              320.0)
+              down
+                (resized-span (.y bounds)
+                              (.h bounds)
+                              dy
+                              (edge? edges EDGE-TOP)
+                              (edge? edges EDGE-BOTTOM)
+                              180.0)]
+          (rect (.start across) (.start down) (.len across) (.len down))))))
+
+;;; Exposé, after Jim's: every pane spread into a grid at once, each a
+;;; thumbnail in the cell nearest where it lies on screen.
+(defstruct Grid [(cols i64) (rows i64)])
+
+;;; Exposé's inset from the canvas edges, and the share of each cell left
+;;; around its thumbnail.
+(const EXPOSE-PAD 44.0)
+
+(const EXPOSE-GUTTER 0.14)
+
+;;; A grid for N panes over a W×H region: about sqrt(N) columns, more of them
+;;; as the region grows wider.
+(defn expose-grid [(n i64) (w f64) (h f64)] (-> Grid)
+  (let [aspect (max (/ w (max h 1.0)) 0.01)
+        cols
+          (min (max (p/cast i64 (+ (sqrt (* (p/cast f64 n) aspect)) 0.5)) 1)
+               (max n 1))]
+    (Grid :cols cols :rows (/ (+ n (- cols 1)) cols))))
+
+;;; The cell of GRID nearest a point at fraction (NX, NY) of the panes' span.
+(defn wanted-cell [(grid Grid) (nx f64) (ny f64)] (-> i64)
+  (let [col
+          (p/cast i64
+                  (+ (* (clamp nx 0.0 1.0) (p/cast f64 (- (.cols grid) 1)))
+                     0.5))
+        row
+          (p/cast i64
+                  (+ (* (clamp ny 0.0 1.0) (p/cast f64 (- (.rows grid) 1)))
+                     0.5))]
+    (+ (* (min row (- (.rows grid) 1)) (.cols grid))
+       (min col (- (.cols grid) 1)))))
+
+;;; The free cell of GRID nearest CELL, the earliest by row then column when
+;;; several are as near.
+(defn nearest-free [(grid Grid) (taken (al/ArrayList bool)) (cell i64)] (-> i64)
+  (if (not (get taken cell))
+      cell
+      (let [cols (.cols grid)
+            want-row (p/cast f64 (/ cell cols))
+            want-col (p/cast f64 (% cell cols))
+            (mut best) -1
+            (mut best-d) 0.0]
+        (for [i 0 (* cols (.rows grid))]
+          (when (not (get taken i))
+            (let [dr (- (p/cast f64 (/ i cols)) want-row)
+                  dc (- (p/cast f64 (% i cols)) want-col)
+                  d (+ (* dr dr) (* dc dc))]
+              (when (or (< (load best) 0) (< d (load best-d)))
+                (set! best i)
+                (set! best-d d)))))
+        (when (< (load best) 0)
+          (panic "expose: the grid has fewer cells than panes"))
+        (load best))))
+
+;;; The grid cell of each pane whose on-screen center is in CENTERS. Each
+;;; wants the cell matching where it lies among the others, top-left to
+;;; top-left; a pane whose cell is taken gets the nearest free one. Panes
+;;; claim cells by the cell they want, then by order, so one layout always
+;;; gives the same grid.
+(defn expose-cells [(centers (slice Point)) (grid Grid)] (-> (al/ArrayList i64))
+  (let [a (alloc/malloc-allocator)
+        n (len centers)
+        (mut cells) (al/ArrayList::new [i64] a)
+        (mut wanted) (al/ArrayList::new [i64] a)
+        (mut taken) (al/ArrayList::new [bool] a)
+        (mut low-x) 0.0
+        (mut low-y) 0.0
+        (mut high-x) 0.0
+        (mut high-y) 0.0]
+    (for [i 0 n]
+      (let [c (get centers i)]
+        (when (or (= i 0) (< (.x c) (load low-x))) (set! low-x (.x c)))
+        (when (or (= i 0) (< (.y c) (load low-y))) (set! low-y (.y c)))
+        (when (or (= i 0) (> (.x c) (load high-x))) (set! high-x (.x c)))
+        (when (or (= i 0) (> (.y c) (load high-y))) (set! high-y (.y c)))))
+    (for [i 0 n]
+      (let [c (get centers i)]
+        (push! (mut cells) -1)
+        (push! (mut wanted)
+               (wanted-cell grid
+                            (/ (- (.x c) (load low-x))
+                               (max (- (load high-x) (load low-x)) 1.0))
+                            (/ (- (.y c) (load low-y))
+                               (max (- (load high-y) (load low-y)) 1.0))))))
+    (for [i 0 (* (.cols grid) (.rows grid))]
+      (push! (mut taken) false))
+    (for [k 0 n]
+      (let [(mut next) -1]
+        (for [i 0 n]
+          (when (and (< (get cells i) 0)
+                     (or (< (load next) 0)
+                         (< (get wanted i) (get wanted (load next)))))
+            (set! next i)))
+        (let [cell (nearest-free grid taken (get wanted (load next)))]
+          (set! (mut taken) cell true)
+          (set! (mut cells) (load next) cell))))
+    (free! (mut wanted))
+    (free! (mut taken))
+    cells))
+
+;;; Where Exposé shows a pane of on-screen size W×H in CELL of GRID over
+;;; REGION: centered in the cell, shrunk to fit inside its gutter, and never
+;;; grown.
+(defn expose-slot [(grid Grid) (region Rect) (cell i64) (w f64) (h f64)]
+  (-> Rect)
+  (let [cell-w (/ (.w region) (p/cast f64 (.cols grid)))
+        cell-h (/ (.h region) (p/cast f64 (.rows grid)))
+        cx (+ (.x region) (* cell-w (+ (p/cast f64 (% cell (.cols grid))) 0.5)))
+        cy (+ (.y region) (* cell-h (+ (p/cast f64 (/ cell (.cols grid))) 0.5)))
+        k
+          (min (min (/ (* cell-w (- 1.0 EXPOSE-GUTTER)) (max w 1.0))
+                    (/ (* cell-h (- 1.0 EXPOSE-GUTTER)) (max h 1.0)))
+               1.0)]
+    (rect (- cx (* 0.5 w k)) (- cy (* 0.5 h k)) (* w k) (* h k))))

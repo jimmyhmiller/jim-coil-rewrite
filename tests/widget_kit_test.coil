@@ -1,9 +1,7 @@
 (module jim.widget-kit-test)
-(import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-eq])
 (import "jim.widget-kit.text" :as text)
 (import "jim.widget-kit.json" :as json)
 (import "jim.widget-kit.diff" :as d)
@@ -25,111 +23,111 @@ Binary files a/img.png and b/img.png differ
 ")
 
 (deftest unified-diff-parses-files-hunks-and-line-numbers
-         (let [(mut m) (d/model-new)]
-           (d/parse-unified! (mut m) (sample))
-           (assert (= (d/file-count (mut m)) 2))
-           (let [f (d/file (mut m) 0)]
-             (assert (= (d/path (mut m) f) "src/a.rs"))
-             (assert (= (.adds f) 2))
-             (assert (= (.dels f) 1))
-             (assert (= (.hunks-len f) 1))
-             (assert (= (.lines-len f) 6))
-             (let [del (d/line (mut m) (+ (.lines-at f) 2))
-                   add (d/line (mut m) (+ (.lines-at f) 4))]
-               (assert (= (.tag del) d/DEL))
-               (assert (= (.old del) 2))
-               (assert (= (.tag add) d/ADD))
-               (assert (= (.new add) 3))
-               (assert (= (d/line-text (mut m) add) "    let y = \"s\";"))))
-           (let [b (d/file (mut m) 1)]
-             (assert (.binary b))
-             (assert (= (d/path (mut m) b) "img.png")))
-           (d/free! (mut m))))
+  (let [(mut m) (d/model-new)]
+    (d/parse-unified! (mut m) (sample))
+    (assert (= (d/file-count (mut m)) 2))
+    (let [f (d/file (mut m) 0)]
+      (assert (= (d/path (mut m) f) "src/a.rs"))
+      (assert (= (.adds f) 2))
+      (assert (= (.dels f) 1))
+      (assert (= (.hunks-len f) 1))
+      (assert (= (.lines-len f) 6))
+      (let [del (d/line (mut m) (+ (.lines-at f) 2))
+            add (d/line (mut m) (+ (.lines-at f) 4))]
+        (assert (= (.tag del) d/DEL))
+        (assert (= (.old del) 2))
+        (assert (= (.tag add) d/ADD))
+        (assert (= (.new add) 3))
+        (assert (= (d/line-text (mut m) add) "    let y = \"s\";"))))
+    (let [b (d/file (mut m) 1)]
+      (assert (.binary b))
+      (assert (= (d/path (mut m) b) "img.png")))
+    (d/free! (mut m))))
 
 (deftest highlighting-marks-keywords-strings-and-comments
-         (let [(mut m) (d/model-new)]
-           (d/parse-unified! (mut m) (sample))
-           (d/highlight-all! (mut m))
-           (let [f (d/file (mut m) 0)
-                 changed (d/line (mut m) (+ (.lines-at f) 3))
-                 (mut kinds) 0]
-             (for [k
-                   (.runs-at changed)
-                   (+ (.runs-at changed) (.runs-len changed))]
-               (let [r (d/run (mut m) k)
-                     t (d/text-at (mut m) (.at r) (.len r))]
-                 (when (and (= (.kind r) hl/KEYWORD) (= t "let"))
-                   (set! kinds (+ (load kinds) 1))
-                   0)
-                 (when (and (= (.kind r) hl/COMMENT) (= t "// changed"))
-                   (set! kinds (+ (load kinds) 10))
-                   0)
-                 (when (and (= (.kind r) hl/NUMBER) (= t "2"))
-                   (set! kinds (+ (load kinds) 100))
-                   0)))
-             (assert (= (load kinds) 111)))
-           (d/free! (mut m))))
+  (let [(mut m) (d/model-new)]
+    (d/parse-unified! (mut m) (sample))
+    (d/highlight-all! (mut m))
+    (let [f (d/file (mut m) 0)
+          changed (d/line (mut m) (+ (.lines-at f) 3))
+          (mut kinds) 0]
+      (for [k
+            (.runs-at changed)
+            (+ (.runs-at changed) (.runs-len changed))]
+        (let [r (d/run (mut m) k)
+              t (d/text-at (mut m) (.at r) (.len r))]
+          (when (and (= (.kind r) hl/KEYWORD) (= t "let"))
+            (set! kinds (+ (load kinds) 1))
+            0)
+          (when (and (= (.kind r) hl/COMMENT) (= t "// changed"))
+            (set! kinds (+ (load kinds) 10))
+            0)
+          (when (and (= (.kind r) hl/NUMBER) (= t "2"))
+            (set! kinds (+ (load kinds) 100))
+            0)))
+      (assert (= (load kinds) 111)))
+    (d/free! (mut m))))
 
 (deftest block-comments-continue-across-lines
-         (let [(mut lx) (hl/lexer "x.c")
-               (mut runs) (al-new [hl/Run] (alloc/malloc-allocator))]
-           (hl/line! (mut lx) "int a; /* start" 0 (mut runs))
-           (assert (.in-block lx))
-           (al-clear! (mut runs))
-           (hl/line! (mut lx) "still */ int b;" 0 (mut runs))
-           (assert (not (.in-block lx)))
-           (assert (= (.kind (al-elem [hl/Run] (mut runs) 0)) hl/COMMENT))
-           (assert (= (.len (al-elem [hl/Run] (mut runs) 0)) 8))
-           (al-free! (mut runs))))
+  (let [(mut lx) (hl/lexer "x.c")
+        (mut runs) (ArrayList::new [hl/Run] (alloc/malloc-allocator))]
+    (hl/line! (mut lx) "int a; /* start" 0 (mut runs))
+    (assert (.in-block lx))
+    (clear! (mut runs))
+    (hl/line! (mut lx) "still */ int b;" 0 (mut runs))
+    (assert (not (.in-block lx)))
+    (assert (= (.kind (elem (mut runs) 0)) hl/COMMENT))
+    (assert (= (.len (elem (mut runs) 0)) 8))
+    (free! (mut runs))))
 
 (deftest json-strings-decode-escapes-and-surrogates
-         (let [(mut r)
-                 (json/parse "{\"ok\":true,\"s\":\"a\\tb \\\"q\\\" \\u00e9 \\ud83d\\ude00\",\"n\":42,\"xs\":[1,2,3]}")
-               (mut out) (al-new [u8] (alloc/malloc-allocator))]
-           (assert (json/ok? (mut r)))
-           (json/field-into! (mut r) (json/root (mut r)) "s" (mut out) "")
-           (assert (= (al-slice out) "a\tb \"q\" é 😀"))
-           (assert (= (json/field-i64 (mut r) (json/root (mut r)) "n" 0) 42))
-           (assert (= (json/count (mut r)
-                                  (json/get (mut r) (json/root (mut r)) "xs"))
-                      3))
-           (assert (= (json/get (mut r) (json/root (mut r)) "missing") -1))
-           (al-free! (mut out))
-           (json/free! (mut r))))
+  (let [(mut r)
+          (json/parse "{\"ok\":true,\"s\":\"a\\tb \\\"q\\\" \\u00e9 \\ud83d\\ude00\",\"n\":42,\"xs\":[1,2,3]}")
+        (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (json/ok? (mut r)))
+    (json/field-into! (mut r) (json/root (mut r)) "s" (mut out) "")
+    (assert (= (slice out) "a\tb \"q\" é 😀"))
+    (assert (= (json/field-i64 (mut r) (json/root (mut r)) "n" 0) 42))
+    (assert (= (json/count (mut r)
+                           (json/get (mut r) (json/root (mut r)) "xs"))
+               3))
+    (assert (= (json/get (mut r) (json/root (mut r)) "missing") -1))
+    (free! (mut out))
+    (json/free! (mut r))))
 
 (deftest jimctl-errors-are-reported
-         (let [(mut r) (json/parse "{\"ok\":false,\"error\":\"stale\"}")
-               (mut out) (al-new [u8] (alloc/malloc-allocator))]
-           (assert (not (json/ok? (mut r))))
-           (json/error-into! (mut r) (mut out))
-           (assert (= (al-slice out) "stale"))
-           (al-free! (mut out))
-           (json/free! (mut r))))
+  (let [(mut r) (json/parse "{\"ok\":false,\"error\":\"stale\"}")
+        (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (not (json/ok? (mut r))))
+    (json/error-into! (mut r) (mut out))
+    (assert (= (slice out) "stale"))
+    (free! (mut out))
+    (json/free! (mut r))))
 
 (deftest text-helpers
-         (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
-           (assert (= (text/basename "a/b/c.rs") "c.rs"))
-           (assert (= (text/dirname "a/b/c.rs") "a/b"))
-           (text/push-padded! (mut out) 42 5)
-           (assert (= (al-slice out) "   42"))
-           (al-clear! (mut out))
-           (text/push-ago! (mut out) 1000 3601000)
-           (assert (= (al-slice out) "1h ago"))
-           (al-clear! (mut out))
-           (text/push-truncated! (mut out) "héllo world" 2)
-           (assert (= (al-slice out) "h…"))
-           (al-free! (mut out))))
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (= (text/basename "a/b/c.rs") "c.rs"))
+    (assert (= (text/dirname "a/b/c.rs") "a/b"))
+    (text/push-padded! (mut out) 42 5)
+    (assert (= (slice out) "   42"))
+    (clear! (mut out))
+    (text/push-ago! (mut out) 1000 3601000)
+    (assert (= (slice out) "1h ago"))
+    (clear! (mut out))
+    (text/push-truncated! (mut out) "héllo world" 2)
+    (assert (= (slice out) "h…"))
+    (free! (mut out))))
 
 (deftest runs-never-span-lines
-         (let [(mut m) (d/model-new)]
-           (d/parse-unified! (mut m)
-                             "--- a/x.md\n+++ b/x.md\n@@ -1,0 +1,2 @@\n+## Widgets\n+A widget\n")
-           (d/highlight-all! (mut m))
-           (let [f (d/file (mut m) 0)]
-             (for [k (.lines-at f) (+ (.lines-at f) (.lines-len f))]
-               (let [l (d/line (mut m) k)]
-                 (for [j (.runs-at l) (+ (.runs-at l) (.runs-len l))]
-                   (let [r (d/run (mut m) j)]
-                     (assert (>= (.at r) (.at l)))
-                     (assert (<= (+ (.at r) (.len r)) (+ (.at l) (.len l)))))))))
-           (d/free! (mut m))))
+  (let [(mut m) (d/model-new)]
+    (d/parse-unified! (mut m)
+                      "--- a/x.md\n+++ b/x.md\n@@ -1,0 +1,2 @@\n+## Widgets\n+A widget\n")
+    (d/highlight-all! (mut m))
+    (let [f (d/file (mut m) 0)]
+      (for [k (.lines-at f) (+ (.lines-at f) (.lines-len f))]
+        (let [l (d/line (mut m) k)]
+          (for [j (.runs-at l) (+ (.runs-at l) (.runs-len l))]
+            (let [r (d/run (mut m) j)]
+              (assert (>= (.at r) (.at l)))
+              (assert (<= (+ (.at r) (.len r)) (+ (.at l) (.len l)))))))))
+    (d/free! (mut m))))

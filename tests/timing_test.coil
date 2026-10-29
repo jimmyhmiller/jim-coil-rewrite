@@ -1,6 +1,5 @@
 (module jim.timing-test)
 (import "jim.timing-model" :as model)
-(import "coil.primitive" :as p)
 
 (defn near? [(a f64) (b f64)] (-> bool)
   (and (< (- a b) 0.00001) (> (- a b) -0.00001)))
@@ -16,36 +15,36 @@
     :overlay 0.5))
 
 (deftest timing-summary-percentile-and-stage-accounting
-         (let [h (p/alloc-stack model/History)]
-           (do
-             (set! (.count h) 0)
-             (set! (.next h) 0)
-             (for [i 0 19] (model/push! h (sample 16.0)))
-             (model/push! h (sample 40.0))
-             (let [s (model/summarize h)]
-               (assert (near? (.p95 s) 16.0))
-               (assert (near? (.maximum s) 40.0))
-               (assert (= (.late s) 1))
-               (assert (near? (.input s) 1.0))
-               (assert (near? (.ghostty s) 4.0))
-               (assert (> (.hz s) 58.0))
-               (assert (< (.hz s) 59.0))))))
+  (let [(mut h) (zeroed model/History)]
+    (do
+      (set! (.count h) 0)
+      (set! (.next h) 0)
+      (for [i 0 19] (model/push! (mut h) (sample 16.0)))
+      (model/push! (mut h) (sample 40.0))
+      (let [s (model/summarize (mut h))]
+        (assert (near? (.p95 s) 16.0))
+        (assert (near? (.maximum s) 40.0))
+        (assert (= (.late s) 1))
+        (assert (near? (.input s) 1.0))
+        (assert (near? (.ghostty s) 4.0))
+        (assert (> (.hz s) 58.0))
+        (assert (< (.hz s) 59.0))))))
 
 (deftest timing-history-replaces-oldest-samples
-         (let [h (p/alloc-stack model/History)]
-           (do
-             (set! (.count h) 0)
-             (set! (.next h) 0)
-             (model/push! h (sample 500.0))
-             (for [i 0 120] (model/push! h (sample 10.0)))
-             (assert (= (.count h) 120))
-             (let [s (model/summarize h)] (assert (near? (.maximum s) 10.0)))
-             (let [s (model/summarize h)] (assert (near? (.hz s) 100.0))))))
+  (let [(mut h) (zeroed model/History)]
+    (do
+      (set! (.count h) 0)
+      (set! (.next h) 0)
+      (model/push! (mut h) (sample 500.0))
+      (for [i 0 120] (model/push! (mut h) (sample 10.0)))
+      (assert (= (.count h) 120))
+      (let [s (model/summarize (mut h))] (assert (near? (.maximum s) 10.0)))
+      (let [s (model/summarize (mut h))] (assert (near? (.hz s) 100.0))))))
 
 (deftest empty-timing-history-is-defined
-         (let [h (p/alloc-stack model/History)]
-           (do
-             (set! (.count h) 0)
-             (set! (.next h) 0)
-             (let [s (model/summarize h)] (assert (near? (.hz s) 0.0)))
-             (let [s (model/summarize h)] (assert (near? (.p95 s) 0.0))))))
+  (let [(mut h) (zeroed model/History)]
+    (do
+      (set! (.count h) 0)
+      (set! (.next h) 0)
+      (let [s (model/summarize (mut h))] (assert (near? (.hz s) 0.0)))
+      (let [s (model/summarize (mut h))] (assert (near? (.p95 s) 0.0))))))

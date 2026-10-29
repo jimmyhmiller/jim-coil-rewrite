@@ -26,7 +26,7 @@
 
 (defn visible? [] (-> bool)
   (and (!= (p/cast i64 (.view (state))) 0)
-       (= (msg i8 (.view (state)) (sel c"isHidden") []) (p/cast i8 0))))
+       (= (msg i8 (.view (state)) (sel c"isHidden") []) (: 0 i8))))
 
 (defn owns-event? [(event (ptr i8))] (-> bool)
   (let [kind (msg i64 event (sel c"type") [])]
@@ -101,11 +101,11 @@
            (class c"CATransaction")
            (sel c"setDisableActions:")
            [i8]
-           (p/cast i8 1))
+           (: 1 i8))
       (for [i 0 120]
         (let [at (% (+ (.next h) i) 120)
-              sample (load (p/index (field h samples) at))
-              bar (load (p/index (field s bars) i))
+              sample (load (index (field h samples) at))
+              bar (load (index (field s bars) i))
               x (+ 20.0 (* (p/cast f64 i) 5.0))
               (mut y) 80.0]
           (do
@@ -115,7 +115,7 @@
                  [Rect]
                  (rect x 230.0 4.0 (* 95.0 (/ (.interval sample) ceiling))))
             (for [j 0 5]
-              (let [segment (load (p/index (field s segments) (+ (* i 5) j)))
+              (let [segment (load (index (field s segments) (+ (* i 5) j)))
                     height
                       (* 95.0
                          (clamp (/ (stage-value sample j) ceiling) 0.0 1.0))]
@@ -198,7 +198,7 @@
           (paint! time)
           (record! 4 (* 1000.0 (- (now) time))))
         (do
-          (msg i64 link (sel c"setPaused:") [i8] (p/cast i8 1))
+          (msg i64 link (sel c"setPaused:") [i8] (: 1 i8))
           (set! (.last s) 0.0)
           (do)))))
 
@@ -206,8 +206,8 @@
   (let [s (state)]
     (if (visible?)
         (do
-          (msg i64 (.view s) (sel c"setHidden:") [i8] (p/cast i8 1))
-          (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 1))
+          (msg i64 (.view s) (sel c"setHidden:") [i8] (: 1 i8))
+          (msg i64 (.link s) (sel c"setPaused:") [i8] (: 1 i8))
           (do))
         (do
           (set! (.last s) 0.0)
@@ -220,7 +220,7 @@
                   :windows 0.0
                   :ghostty 0.0
                   :overlay 0.0))
-          (msg i64 (.view s) (sel c"setHidden:") [i8] (p/cast i8 0))
+          (msg i64 (.view s) (sel c"setHidden:") [i8] (: 0 i8))
           (msg i64
                (msg (ptr i8) (.owner s) (sel c"contentView") [])
                (sel c"addSubview:positioned:relativeTo:")
@@ -228,7 +228,7 @@
                (.view s)
                1
                (nil))
-          (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 0))
+          (msg i64 (.link s) (sel c"setPaused:") [i8] (: 0 i8))
           (do)))))
 
 (defn new-layer [(parent (ptr i8)) (r f64) (g f64) (b f64)] (-> (ptr i8))
@@ -256,7 +256,7 @@
     (do
       (set! (.view s) root)
       (set! (.owner s) owner)
-      (msg i64 root (sel c"setHidden:") [i8] (p/cast i8 1))
+      (msg i64 root (sel c"setHidden:") [i8] (: 1 i8))
       (msg i64 root (sel c"setAutoresizingMask:") [u64] 9)
       (msg i64 (layer root) (sel c"setCornerRadius:") [f64] 10.0)
       (msg i64 (layer root) (sel c"setBorderWidth:") [f64] 1.0)
@@ -294,9 +294,9 @@
              true)
       (for [i 0 120]
         (do
-          (set! (p/index (field s bars) i) (new-layer root 0.4 0.78 0.96))
+          (set! (index (field s bars) i) (new-layer root 0.4 0.78 0.96))
           (for [j 0 5]
-            (set! (p/index (field s segments) (+ (* i 5) j))
+            (set! (index (field s segments) (+ (* i 5) j))
                   (new-layer root
                              (cond (= j 0) 0.4
                                    (= j 1) 0.98
@@ -313,8 +313,8 @@
                                    (= j 2) 0.5
                                    (= j 3) 0.95
                                    :else 0.6))))))
-      (method! cls c"display:" (p/cast (ptr i8) (p/fnptr-of display)) c"v@:@")
-      (method! cls c"close:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
+      (method! cls c"display:" (p/cast (ptr i8) (fnptr-of display)) c"v@:@")
+      (method! cls c"close:" (p/cast (ptr i8) (fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
       (set! (.target s) (new c"JimFrameTimings"))
       (let [close
@@ -327,7 +327,7 @@
                    (sel c"close:"))]
         (do
           (frame! close (rect 596.0 407.0 28.0 28.0))
-          (msg i64 close (sel c"setBordered:") [i8] (p/cast i8 0))
+          (msg i64 close (sel c"setBordered:") [i8] (: 0 i8))
           (msg i64
                close
                (sel c"setAccessibilityLabel:")
@@ -342,7 +342,7 @@
                  (.target s)
                  (sel c"display:")))
       (msg (ptr i8) (.link s) (sel c"retain") [])
-      (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 1))
+      (msg i64 (.link s) (sel c"setPaused:") [i8] (: 1 i8))
       (msg i64
            (.link s)
            (sel c"addToRunLoop:forMode:")

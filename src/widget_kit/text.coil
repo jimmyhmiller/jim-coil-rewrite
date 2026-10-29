@@ -3,7 +3,8 @@
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-eq str-find str-trim str-parse-int])
+(import "coil.str" :use [parse-int])
+(import "coil.str" :as str)
 (import "jim.widget-api" :as api)
 
 ;;; Byte-string helpers for widgets. Text is UTF-8 `(slice u8)`; owned text is
@@ -16,36 +17,36 @@
        (= (subslice s (- (len s) (len suffix)) (len s)) suffix)))
 
 (defn contains? [(s (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find s needle) (Some [_] true) (None [] false)))
+  (match (find s needle) (Some [_] true) (None [] false)))
 
 (defn index-of [(s (slice u8)) (needle (slice u8))] (-> i64)
-  (match (str-find s needle) (Some [i] i) (None [] -1)))
+  (match (find s needle) (Some [i] i) (None [] -1)))
 
 (defn trim [(s (slice u8))] (-> (slice u8))
-  (str-trim s))
+  (str/trim s))
 
 (defn from [(s (slice u8)) (start i64)] (-> (slice u8))
   (if (>= start (len s)) "" (subslice s start (len s))))
 
 (defn parse-i64 [(s (slice u8)) (default i64)] (-> i64)
-  (match (str-parse-int (str-trim s)) (Some [n] n) (None [] default)))
+  (match (parse-int (str/trim s)) (Some [n] n) (None [] default)))
 
 ;;; The part of PATH after its last '/'.
 (defn basename [(path (slice u8))] (-> (slice u8))
   (let [(mut start) 0]
     (for [i 0 (len path)]
-      (when (= (get path i) (p/cast u8 47)) (set! start (+ i 1)) 0))
+      (when (= (get path i) (: 47 u8)) (set! start (+ i 1)) 0))
     (from path (load start))))
 
 ;;; The part of PATH before its last '/', or "." without one.
 (defn dirname [(path (slice u8))] (-> (slice u8))
   (let [(mut end) -1]
     (for [i 0 (len path)]
-      (when (= (get path i) (p/cast u8 47)) (set! end i) 0))
+      (when (= (get path i) (: 47 u8)) (set! end i) 0))
     (if (< (load end) 0) "." (subslice path 0 (load end)))))
 
 (defn push-str! [(out (ptr (ArrayList u8))) (s (slice u8))] (-> void)
-  (al-extend! (mut out) (slice-data s) (len s))
+  (extend! (mut out) (data s) (len s))
   (do))
 
 (defn push-byte! [(out (ptr (ArrayList u8))) (b u8)] (-> void)
@@ -53,15 +54,15 @@
   (do))
 
 (defn push-i64! [(out (ptr (ArrayList u8))) (value i64)] (-> void)
-  (let [digits (p/alloc-stack (array u8 20))]
-    (push-str! out (api/decimal (p/cast (ptr u8) digits) value))))
+  (let [(mut digits) (zeroed (array u8 20))]
+    (push-str! out (api/decimal (p/cast (ptr u8) (mut digits)) value))))
 
 (defn set-str! [(out (ptr (ArrayList u8))) (s (slice u8))] (-> void)
-  (al-clear! (mut out))
+  (clear! (mut out))
   (push-str! out s))
 
 (defn owned [(s (slice u8))] (-> (ArrayList u8))
-  (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
     (push-str! (mut out) s)
     (load out)))
 
@@ -70,10 +71,10 @@
 (defstruct Span [(at i64) (len i64)])
 
 (defn lines! [(text (slice u8)) (out (ptr (ArrayList Span)))] (-> void)
-  (al-clear! (mut out))
+  (clear! (mut out))
   (let [(mut start) 0]
     (for [i 0 (len text)]
-      (when (= (get text i) (p/cast u8 10))
+      (when (= (get text i) (: 10 u8))
         (push! (mut out) (Span :at (load start) :len (- i (load start))))
         (set! start (+ i 1))
         0))
@@ -86,14 +87,16 @@
   (subslice text (.at s) (+ (.at s) (.len s))))
 
 ;;; Left-pad the decimal VALUE with spaces to WIDTH, into OUT.
-(defn push-padded! [(out (ptr (ArrayList u8))) (value i64) (width i64)] (-> void)
-  (let [digits (p/alloc-stack (array u8 20))
-        d (api/decimal (p/cast (ptr u8) digits) value)]
-    (for [i (len d) width] (push-byte! out (p/cast u8 32)))
+(defn push-padded! [(out (ptr (ArrayList u8))) (value i64) (width i64)]
+  (-> void)
+  (let [(mut digits) (zeroed (array u8 20))
+        d (api/decimal (p/cast (ptr u8) (mut digits)) value)]
+    (for [i (len d) width] (push-byte! out (: 32 u8)))
     (push-str! out d)))
 
 ;;; "3s ago" style age of an epoch-milliseconds stamp, relative to NOW-MS.
-(defn push-ago! [(out (ptr (ArrayList u8))) (stamp-ms i64) (now-ms i64)] (-> void)
+(defn push-ago! [(out (ptr (ArrayList u8))) (stamp-ms i64) (now-ms i64)]
+  (-> void)
   (let [seconds (/ (- now-ms stamp-ms) 1000)]
     (cond (< seconds 0) (push-str! out "now")
           (< seconds 60) (do (push-i64! out seconds) (push-str! out "s ago"))
@@ -104,7 +107,8 @@
           :else (do (push-i64! out (/ seconds 86400)) (push-str! out "d ago")))))
 
 ;;; S cut to MAX bytes with an ellipsis, without splitting a UTF-8 sequence.
-(defn push-truncated! [(out (ptr (ArrayList u8))) (s (slice u8)) (max i64)] (-> void)
+(defn push-truncated! [(out (ptr (ArrayList u8))) (s (slice u8)) (max i64)]
+  (-> void)
   (if (<= (len s) max)
       (push-str! out s)
       (let [(mut end) max]

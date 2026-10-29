@@ -116,7 +116,7 @@
 
 (defn begin-transition! [] (-> void)
   (let [st (state)]
-    (if (p/fcmp-eq (.transition st) 0.0)
+    (if (= (.transition st) 0.0)
         (do)
         (let [animation
                 (msg (ptr i8) (class c"CATransition") (sel c"animation") [])]
@@ -149,7 +149,7 @@
     (do
       (frame! b bounds)
       (msg i64 b (sel c"setAlignment:") [i64] 0)
-      (msg i64 b (sel c"setBordered:") [i8] (p/cast i8 0))
+      (msg i64 b (sel c"setBordered:") [i8] (: 0 i8))
       (msg i64
            b
            (sel c"setFont:")
@@ -266,17 +266,17 @@
                              (sel c"setStringValue:")
                              [(ptr i8)]
                              (s/get record c"name"))
-                        (msg i64 field (sel c"setBordered:") [i8] (p/cast i8 0))
+                        (msg i64 field (sel c"setBordered:") [i8] (: 0 i8))
                         (msg i64
                              field
                              (sel c"setDrawsBackground:")
                              [i8]
-                             (p/cast i8 0))
+                             (: 0 i8))
                         (msg i64
                              field
                              (sel c"setFocusRingType:")
                              [u64]
-                             (p/cast u64 1))
+                             (: 1 u64))
                         (msg i64
                              field
                              (sel c"setFont:")
@@ -486,10 +486,12 @@
               (background! (.footer-pupil (state)) 0.38 0.42 0.48))
           :else (do))))
 
-(defn rename-committed [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+(defn rename-committed [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))]
+  (-> void)
   (finish-rename!))
 
-(defn rename-ended [(self (ptr i8)) (cmd (ptr i8)) (notification (ptr i8))] (-> void)
+(defn rename-ended [(self (ptr i8)) (cmd (ptr i8)) (notification (ptr i8))]
+  (-> void)
   (finish-rename!))
 
 (defn rename-command [(self (ptr i8))
@@ -502,11 +504,12 @@
             (set! (.renaming (state)) 0)
             (set! (.rename-field (state)) (nil))
             (set! (.pending (state)) -2)
-            (p/cast i8 1))
-        (= command (sel c"insertNewline:")) (do (finish-rename!) (p/cast i8 1))
-        :else (p/cast i8 0)))
+            (: 1 i8))
+        (= command (sel c"insertNewline:")) (do (finish-rename!) (: 1 i8))
+        :else (: 0 i8)))
 
-(defn profile-selected [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+(defn profile-selected [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))]
+  (-> void)
   (do
     (projects/switch-profile! (.model (state))
                               (msg i64
@@ -536,31 +539,31 @@
         (do
           (method! cls
                    c"clicked:"
-                   (p/cast (ptr i8) (p/fnptr-of clicked))
+                   (p/cast (ptr i8) (fnptr-of clicked))
                    c"v@:@")
           (method! cls
                    c"hovered:"
-                   (p/cast (ptr i8) (p/fnptr-of hovered))
+                   (p/cast (ptr i8) (fnptr-of hovered))
                    c"v@:@")
           (method! cls
                    c"unhovered:"
-                   (p/cast (ptr i8) (p/fnptr-of unhovered))
+                   (p/cast (ptr i8) (fnptr-of unhovered))
                    c"v@:@")
           (method! cls
                    c"renameCommitted:"
-                   (p/cast (ptr i8) (p/fnptr-of rename-committed))
+                   (p/cast (ptr i8) (fnptr-of rename-committed))
                    c"v@:@")
           (method! cls
                    c"controlTextDidEndEditing:"
-                   (p/cast (ptr i8) (p/fnptr-of rename-ended))
+                   (p/cast (ptr i8) (fnptr-of rename-ended))
                    c"v@:@")
           (method! cls
                    c"control:textView:doCommandBySelector:"
-                   (p/cast (ptr i8) (p/fnptr-of rename-command))
+                   (p/cast (ptr i8) (fnptr-of rename-command))
                    c"c@:@@:")
           (method! cls
                    c"profileSelected:"
-                   (p/cast (ptr i8) (p/fnptr-of profile-selected))
+                   (p/cast (ptr i8) (fnptr-of profile-selected))
                    c"v@:@")
           (objc_registerClassPair cls)
           (set! (.target st) (new c"JimSidebarActions"))))
@@ -599,8 +602,8 @@
       (msg i64 (.footer st) (sel c"setTag:") [i64] 23)
       (controls/transparent! (.footer st))
       (set! (.scroll st) (new c"NSScrollView"))
-      (msg i64 (.scroll st) (sel c"setDrawsBackground:") [i8] (p/cast i8 0))
-      (msg i64 (.scroll st) (sel c"setHasVerticalScroller:") [i8] (p/cast i8 1))
+      (msg i64 (.scroll st) (sel c"setDrawsBackground:") [i8] (: 0 i8))
+      (msg i64 (.scroll st) (sel c"setHasVerticalScroller:") [i8] (: 1 i8))
       (msg i64 (.view st) (sel c"addSubview:") [(ptr i8)] (.scroll st))
       ;; The scroll view takes ownership only in setDocumentView:.
       (set! (.document st)
@@ -610,7 +613,7 @@
                  [Rect]
                  (rect 0.0 0.0 204.0 720.0)))
       (msg i64 (.scroll st) (sel c"setDocumentView:") [(ptr i8)] (.document st))
-      (msg i64 (.document st) (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+      (msg i64 (.document st) (sel c"setWantsLayer:") [i8] (: 1 i8))
       (release (.document st))
       (layout! 860.0))))
 
@@ -653,14 +656,14 @@
                          (sel c"timeIntervalSinceReferenceDate")
                          [])
                   quiet
-                    (or (p/fcmp-eq (.swipe-time st) 0.0)
+                    (or (= (.swipe-time st) 0.0)
                         (> (- now (.swipe-time st)) 0.18))
                   reversed
-                    (and (not (p/fcmp-eq dx 0.0))
-                         (not (p/fcmp-eq (.swipe st) 0.0))
+                    (and (not (= dx 0.0))
+                         (not (= (.swipe st) 0.0))
                          (< (* dx (.swipe st)) 0.0))]
               (do
-                (if (or (= phase (p/cast u64 1)) quiet reversed)
+                (if (or (= phase (: 1 u64)) quiet reversed)
                     (do
                       (set! (.swipe st) 0.0)
                       (set! (.swipe-y st) 0.0)

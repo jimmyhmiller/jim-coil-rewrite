@@ -1,5 +1,4 @@
 (module jim.widget-kit.git-view)
-(import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -47,13 +46,14 @@
         (= tag diff/DEL) "-"
         :else " "))
 
-(defn mono-text! [(ui (ptr api/Ui)) (value (slice u8)) (size f64) (color i64)] (-> void)
+(defn mono-text! [(ui (ptr api/Ui)) (value (slice u8)) (size f64) (color i64)]
+  (-> void)
   (api/text! ui value size color false)
   (api/mono! ui))
 
 ;;; "  12   13": old and new line numbers, blank where a side has none.
 (defn gutter! [(ui (ptr api/Ui)) (l (ptr diff/Line))] (-> void)
-  (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
     (if (> (.old l) 0)
         (text/push-padded! (mut out) (.old l) 4)
         (text/push-str! (mut out) "    "))
@@ -61,12 +61,13 @@
     (if (> (.new l) 0)
         (text/push-padded! (mut out) (.new l) 4)
         (text/push-str! (mut out) "    "))
-    (mono-text! ui (al-slice out) 11.0 MUTED)
-    (al-free! (mut out))
+    (mono-text! ui (slice out) 11.0 MUTED)
+    (free! (mut out))
     (do)))
 
 ;;; The line's code as syntax-colored runs.
-(defn code! [(ui (ptr api/Ui)) (m (ptr diff/Model)) (l (ptr diff/Line))] (-> void)
+(defn code! [(ui (ptr api/Ui)) (m (ptr diff/Model)) (l (ptr diff/Line))]
+  (-> void)
   (api/hstack! ui 0.0 0.0)
   (if (= (.runs-len l) 0)
       (mono-text! ui (if (> (.len l) 0) (diff/line-text m l) " ") 12.5 INK)

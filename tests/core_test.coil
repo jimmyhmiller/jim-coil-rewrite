@@ -3,64 +3,153 @@
 (import "jim.reload" :as reload)
 (import "jim.ghostty" :as ghostty)
 (import "jim.native" :use *)
-(import "coil.primitive" :as p)
+(import "coil.math" :use [Float])
 
 (defn near? [(x f64) (y f64)] (-> bool)
   (and (< (- x y) 0.000001) (> (- x y) -0.000001)))
 
 (deftest workspace-navigation-wraps-both-directions
-         (assert (= (workspace/wrap -1 4) 3))
-         (assert (= (workspace/wrap 4 4) 0))
-         (assert (= (workspace/wrap -9 4) 3)))
+  (assert (= (workspace/wrap -1 4) 3))
+  (assert (= (workspace/wrap 4 4) 0))
+  (assert (= (workspace/wrap -9 4) 3)))
 
-(deftest front-workspace-exactly-matches-flat-plane
-         (let [face
-                 (CATransform3DTranslate (workspace/face-transform 0 4 1000.0)
-                                         0.0
-                                         0.0
-                                         500.0)
-               root (workspace/root-transform 0.0 false 1000.0)]
-           (assert (near? (+ (.m43 face) (.m43 root)) 0.0))
-           (assert (near? (.m11 face) 1.0))
-           (assert (near? (.m22 face) 1.0))))
+(defn view [(shift f64) (lift f64) (distance f64) (yaw f64) (focal f64)]
+  (-> workspace/View)
+  (workspace/View
+    :shift shift
+    :lift lift
+    :distance distance
+    :yaw yaw
+    :focal focal))
 
-(deftest adjacent-faces-have-perpendicular-normals
-         (let [a (workspace/face-transform 0 4 1000.0)
-               b (workspace/face-transform 1 4 1000.0)]
-           (assert (near? (+ (* (.m31 a) (.m31 b)) (* (.m33 a) (.m33 b))) 0.0))))
+;;; Where a corner of face INDEX lands on the stage.
+(defn corner [(camera Transform)
+              (index i64)
+              (count i64)
+              (radius f64)
+              (x f64)
+              (y f64)] (-> workspace/Vec3)
+  (workspace/apply camera
+                   (workspace/apply (workspace/face-placement index
+                                                              count
+                                                              radius)
+                                    (workspace/Vec3
+                                      :x x
+                                      :y y
+                                      :z 0.0))))
+
+(deftest flat-view-lays-the-chosen-face-exactly-on-the-window
+  (let [radius (workspace/face-radius 4 1200.0)
+        focal (* workspace/FOCAL 800.0)
+        camera
+          (workspace/camera-transform (view 110.0
+                                            0.0
+                                            (+ radius focal)
+                                            (workspace/facing-yaw 1 4)
+                                            focal))
+        top-right (corner camera 1 4 radius 600.0 400.0)
+        bottom-left (corner camera 1 4 radius -600.0 -400.0)]
+    (assert (near? (.x top-right) 710.0))
+    (assert (near? (.y top-right) 400.0))
+    (assert (near? (.z top-right) 0.0))
+    (assert (near? (.x bottom-left) -490.0))
+    (assert (near? (.y bottom-left) -400.0))
+    (assert (near? (.z bottom-left) 0.0))))
+
+(deftest overview-camera-looks-down-at-the-axis
+  (let [focal 1000.0
+        camera (workspace/camera-transform (view 0.0 160.0 2000.0 0.0 focal))
+        axis
+          (workspace/apply camera
+                           (workspace/Vec3
+                             :x 0.0
+                             :y 0.0
+                             :z 0.0))
+        above
+          (workspace/apply camera
+                           (workspace/Vec3
+                             :x 0.0
+                             :y 100.0
+                             :z 0.0))
+        range (sqrt (+ (* 160.0 160.0) (* 2000.0 2000.0)))]
+    (assert (near? (.x axis) 0.0))
+    (assert (near? (.y axis) 0.0))
+    (assert (near? (.z axis) (- focal range)))
+    (assert (> (.y above) 0.0))))
+
+(deftest the-reflection-mirrors-across-the-floor
+  (let [camera (workspace/camera-transform (view 0.0 160.0 2000.0 0.7 1000.0))
+        mirrored
+          (workspace/apply (workspace/mirror-transform camera -400.0)
+                           (workspace/apply camera
+                                            (workspace/Vec3
+                                              :x 30.0
+                                              :y -350.0
+                                              :z 20.0)))
+        expected
+          (workspace/apply camera
+                           (workspace/Vec3
+                             :x 30.0
+                             :y -450.0
+                             :z 20.0))]
+    (assert (< (abs (- (.x mirrored) (.x expected))) 0.0001))
+    (assert (< (abs (- (.y mirrored) (.y expected))) 0.0001))
+    (assert (< (abs (- (.z mirrored) (.z expected))) 0.0001))))
+
+(deftest quads-contain-the-points-inside-them
+  (let [a (Point :x 0.0 :y 0.0)
+        b (Point :x 10.0 :y 1.0)
+        c (Point :x 9.0 :y 8.0)
+        d (Point :x -1.0 :y 9.0)]
+    (assert (workspace/quad-contains? (Point :x 5.0 :y 5.0) a b c d))
+    (assert (workspace/quad-contains? (Point :x 5.0 :y 5.0) d c b a))
+    (assert (not (workspace/quad-contains? (Point :x 12.0 :y 5.0) a b c d)))))
+
+(deftest faces-meet-at-their-edges-for-any-count
+  (assert (near? (workspace/face-radius 4 1000.0) 500.0))
+  ; Six faces 1000 wide form a hexagon whose apothem is 500 * sqrt 3.
+  (assert (near? (workspace/face-radius 6 1000.0) 866.0254037844386))
+  (let [radius (workspace/face-radius 6 1000.0)
+        camera
+          (workspace/camera-transform (view 0.0 0.0 (+ radius 900.0) 0.0 900.0))
+        ; Neighbouring faces 0 and 1 share an edge.
+        right-of-0 (corner camera 0 6 radius 500.0 0.0)
+        left-of-1 (corner camera 1 6 radius -500.0 0.0)]
+    (assert (< (abs (- (.x right-of-0) (.x left-of-1))) 0.0001))
+    (assert (< (abs (- (.z right-of-0) (.z left-of-1))) 0.0001))))
 
 (deftest ghostty-abi-matches-c-header
-         (assert (= (p/sizeof ghostty/SurfaceConfig) 88))
-         (assert (= (p/sizeof ghostty/Key) 32))
-         (assert (= (p/sizeof ghostty/Runtime) 64))
-         (assert (= (p/sizeof ghostty/Target) 16))
-         (assert (= (p/sizeof ghostty/Action) 32)))
+  (assert (= (sizeof ghostty/SurfaceConfig) 88))
+  (assert (= (sizeof ghostty/Key) 32))
+  (assert (= (sizeof ghostty/Runtime) 64))
+  (assert (= (sizeof ghostty/Target) 16))
+  (assert (= (sizeof ghostty/Action) 32)))
 
 (deftest hot-load-copies-values-without-retaining-code
-         (let [(mut config) (reload/defaults)]
-           (assert (reload/load-config! c"build/shell-test.dylib" config))
-           (assert (near? (.duration config) 0.42))
-           (assert (near? (.sidebar config) 224.0))
-           (assert (not (reload/load-config! c"build/no-such-image.dylib"
-                                             config)))
-           (assert (near? (.sidebar config) 224.0))))
+  (let [(mut config) (reload/defaults)]
+    (assert (reload/load-config! c"build/shell-test.dylib" config))
+    (assert (near? (.duration config) 0.42))
+    (assert (near? (.sidebar config) 224.0))
+    (assert (not (reload/load-config! c"build/no-such-image.dylib"
+                                      config)))
+    (assert (near? (.sidebar config) 224.0))))
 
 (deftest invalid-hot-load-values-are-rejected
-         (let [(mut config) (reload/defaults)]
-           (set! (.duration config) -1.0)
-           (assert (not (reload/valid? (load config))))
-           (set! config (reload/defaults))
-           (set! (.sidebar config) 10000.0)
-           (assert (not (reload/valid? (load config))))))
+  (let [(mut config) (reload/defaults)]
+    (set! (.duration config) -1.0)
+    (assert (not (reload/valid? (load config))))
+    (set! config (reload/defaults))
+    (set! (.sidebar config) 10000.0)
+    (assert (not (reload/valid? (load config))))))
 
 (deftest native-index-formatting-uses-the-real-integer
-         (let [pool (new c"NSAutoreleasePool")]
-           (assert (= (strcmp (utf8 (indexed-string c"Terminal " 2 c""))
-                              c"Terminal 2")
-                      (p/cast i32 0)))
-           (assert (= (strcmp (utf8 (indexed-string c"build/config-"
-                                                    12
-                                                    c".dylib"))
-                              c"build/config-12.dylib")
-                      (p/cast i32 0)))
-           (release pool)))
+  (let [pool (new c"NSAutoreleasePool")]
+    (assert (= (strcmp (utf8 (indexed-string c"Terminal " 2 c""))
+                       c"Terminal 2")
+               (: 0 i32)))
+    (assert (= (strcmp (utf8 (indexed-string c"build/config-"
+                                             12
+                                             c".dylib"))
+                       c"build/config-12.dylib")
+               (: 0 i32)))
+    (release pool)))

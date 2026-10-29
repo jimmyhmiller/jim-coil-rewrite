@@ -15,7 +15,7 @@
           (do
             (method! cls
                      c"noResponderFor:"
-                     (p/cast (ptr i8) (p/fnptr-of unhandled))
+                     (p/cast (ptr i8) (fnptr-of unhandled))
                      c"v@::")
             (objc_registerClassPair cls)
             cls)))))
@@ -31,7 +31,7 @@
 
 (defn flag [(view (ptr i8)) (key (ptr i8))] (-> bool)
   (!= (msg i8 (objc_getAssociatedObject view key) (sel c"boolValue") [])
-      (p/cast i8 0)))
+      (: 0 i8)))
 
 (defn flag! [(view (ptr i8)) (key (ptr i8)) (value bool)] (-> void)
   (do
@@ -54,7 +54,7 @@
            (class c"CATransaction")
            (sel c"setDisableActions:")
            [i8]
-           (p/cast i8 1))
+           (: 1 i8))
       (if (flag view (transparent-key))
           (msg i64
                (layer view)
@@ -85,7 +85,7 @@
                    (sel c"respondsToSelector:")
                    [(ptr i8)]
                    (sel c"hovered:"))
-              (p/cast i8 0))
+              (: 0 i8))
           (msg i64 target (sel c"hovered:") [(ptr i8)] self)
           0)
       (do))))
@@ -100,7 +100,7 @@
                    (sel c"respondsToSelector:")
                    [(ptr i8)]
                    (sel c"unhovered:"))
-              (p/cast i8 0))
+              (: 0 i8))
           (msg i64 target (sel c"unhovered:") [(ptr i8)] self)
           0)
       (do))))
@@ -114,20 +114,21 @@
           (do
             (method! cls
                      c"mouseEntered:"
-                     (p/cast (ptr i8) (p/fnptr-of hover))
+                     (p/cast (ptr i8) (fnptr-of hover))
                      c"v@:@")
             (method! cls
                      c"mouseMoved:"
-                     (p/cast (ptr i8) (p/fnptr-of hover))
+                     (p/cast (ptr i8) (fnptr-of hover))
                      c"v@:@")
             (method! cls
                      c"mouseExited:"
-                     (p/cast (ptr i8) (p/fnptr-of exit))
+                     (p/cast (ptr i8) (fnptr-of exit))
                      c"v@:@")
             (objc_registerClassPair cls)
             cls)))))
 
-(defn button [(title (ptr i8)) (target (ptr i8)) (action (ptr i8))] (-> (ptr i8))
+(defn button [(title (ptr i8)) (target (ptr i8)) (action (ptr i8))]
+  (-> (ptr i8))
   (let [b
           (msg (ptr i8)
                (msg (ptr i8) (button-class) (sel c"alloc") [])
@@ -149,7 +150,7 @@
       (msg i64 b (sel c"setAction:") [(ptr i8)] action)
       (msg i64 b (sel c"setButtonType:") [u64] 7)
       (msg (ptr i8) b (sel c"autorelease") [])
-      (msg i64 b (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+      (msg i64 b (sel c"setWantsLayer:") [i8] (: 1 i8))
       (msg i64 (layer b) (sel c"setCornerRadius:") [f64] 6.0)
       (msg i64 b (sel c"addTrackingArea:") [(ptr i8)] tracking)
       (release tracking)

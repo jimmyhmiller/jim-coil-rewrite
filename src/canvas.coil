@@ -9,10 +9,10 @@
 (import "jim.sessions" :as sessions)
 (import "jim.animation" :as animation)
 (import "jim.canvas-model" :as model)
+(import "coil.math" :use [Float])
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
-(import "coil.slice" :use [slice-new])
 
 (defstruct Pane
   [(id i64)
@@ -21,11 +21,12 @@
    (header (ptr i8))
    (message (ptr i8))
    (close (ptr i8))
-   (grip (ptr i8))
    (terminal (ptr terminal/Terminal))
    ;; Exactly one of terminal and widget is set.
    (widget (ptr widget-view/WidgetPane))
    (bounds Rect)
+   ;; Where Exposé shows the pane, in the canvas view's top-down coordinates.
+   (slot Rect)
    (render-scale f64)
    (render-w f64)
    (render-h f64)])
@@ -43,6 +44,17 @@
    (height f64)
    (scale f64)
    (visible bool)
+   ;; Laid out for the cube by cube-pose!: every pane shown, ignoring the
+   ;; camera's view.
+   (fitted bool)
+   ;; Exposé is open: the panes are spread into a grid, every one shown. They
+   ;; are carried there by their layers' transforms, never moved or resized.
+   ;; HOVERED is lifted; EXPOSED-AT is when the spread settles, and
+   ;; RETURNING-AT when the panes are home after it closes.
+   (exposed bool)
+   (hovered (ptr Pane))
+   (exposed-at f64)
+   (returning-at f64)
    (theme theme/Config)
    (zoom-enabled bool)
    (space-held bool)
@@ -54,7 +66,9 @@
    (start-world Point)
    (pointer Point)
    (start-bounds Rect)
-   (drag-pane (ptr Pane))])
+   (drag-pane (ptr Pane))
+   ;; The model/EDGE-* bits a resize gesture drags.
+   (resize-edges i64)])
 
 (defn display-camera [(c (ptr Canvas))] (-> model/Camera)
   (if (.zoom-enabled c)
@@ -99,6 +113,17 @@
                (nil))]
     (Point :x (.x pt) :y (- (.height c) (.y pt)))))
 
+;;; A header is always lighter than its pane's body, and more so on the
+;;; focused pane. The terminal has its own background.
+(defn paint-header! [(c (ptr Canvas)) (v (ptr Pane)) (active bool)] (-> void)
+  (let [cfg (.theme c)
+        lift (if active 0.08 0.04)]
+    (background! (.header v)
+                 (+ (.pane-r cfg) lift)
+                 (+ (.pane-g cfg) lift)
+                 (+ (.pane-b cfg) lift))
+    (do)))
+
 (defn focus! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
   (do
     (set! (.focused c) chosen)
@@ -109,11 +134,7 @@
             cfg (.theme c)]
         (do
           (msg i64 (layer (.view v)) (sel c"setBorderWidth:") [f64] 0.0)
-          ;; Only the exposed header changes; the terminal has its own background.
-          (background! (.header v)
-                       (+ (.pane-r cfg) (if active 0.07 0.0))
-                       (+ (.pane-g cfg) (if active 0.07 0.0))
-                       (+ (.pane-b cfg) (if active 0.07 0.0))))))
+          (paint-header! c v active))))
     (msg i8
          (msg (ptr i8) (.view c) (sel c"window") [])
          (sel c"makeFirstResponder:")
@@ -194,14 +215,16 @@
                                       (.start-world c)
                                       (.pointer c)
                                       (.start-bounds c)
-                                      (= (.gesture c) 3)))
+                                      (if (= (.gesture c) 3)
+                                          (.resize-edges c)
+                                          0)))
           0)
       (transaction! 0.0)
       (msg i64
            (class c"CATransaction")
            (sel c"setDisableActions:")
            [i8]
-           (p/cast i8 1))
+           (: 1 i8))
       (gradient! c
                  0
                  (rect 0.0 0.0 thick h)
@@ -229,8 +252,16 @@
       (for [i 0 (count c)]
         (let [v (pane c i)
               world (.bounds v)
-              screen (model/project display world)
-              visible (and (.visible c) (model/visible? screen w h))]
+              screen
+                (if (or (.exposed c) (.fitted c))
+                    (.slot v)
+                    (model/project display world))
+              shown
+                (or (.fitted c)
+                    (.exposed c)
+                    (> (.returning-at c) 0.0)
+                    (model/visible? screen w h))
+              visible (and (.visible c) shown)]
           (do
             (frame! (.view v)
                     (rect (.x screen)
@@ -247,12 +278,11 @@
                     (rect 16.0 (- (.h world) 29.0) (- (.w world) 80.0) 22.0))
             (frame! (.close v)
                     (rect (- (.w world) 31.0) (- (.h world) 28.0) 24.0 24.0))
-            (frame! (.grip v) (rect (- (.w world) 17.0) 1.0 16.0 17.0))
             (msg i64
                  (.view v)
                  (sel c"setHidden:")
                  [i8]
-                 (p/cast i8 (if (model/visible? screen w h) 0 1)))
+                 (p/cast i8 (if shown 0 1)))
             (if (and (not (widget? v))
                      (!= (p/cast i64 (.surface (term-of v))) 0))
                 (g/ghostty_surface_set_occlusion (.surface (term-of v)) visible)
@@ -279,11 +309,11 @@
 (defn apply-theme! [(c (ptr Canvas)) (cfg theme/Config)] (-> void)
   (do
     (set! (.theme c) cfg)
-    (background! (.view c) (.canvas-r cfg) (.canvas-g cfg) (.canvas-b cfg))
     (for [i 0 (count c)]
       (let [v (pane c i)]
         (do
           (background! (.view v) (.pane-r cfg) (.pane-g cfg) (.pane-b cfg))
+          (paint-header! c v (= (p/cast i64 v) (p/cast i64 (.focused c))))
           (msg i64
                (.title v)
                (sel c"setTextColor:")
@@ -296,11 +326,16 @@
                (color (.muted-r cfg) (.muted-g cfg) (.muted-b cfg) 1.0)))))
     (project! c)))
 
-(defn create! [(parent (ptr i8)) (width f64) (height f64) (cfg theme/Config)] (-> (ptr Canvas))
-  (let [c (alloc/box! (alloc/malloc-allocator) Canvas (p/zeroed Canvas))]
+(defn create! [(parent (ptr i8)) (width f64) (height f64) (cfg theme/Config)]
+  (-> (ptr Canvas))
+  (let [c (alloc/box! (alloc/malloc-allocator) Canvas (zeroed Canvas))]
     (do
-      (set! (.view c) (view parent (rect 0.0 0.0 width height)))
-      (set! (.panes c) (al/al-new [(ptr Pane)] (alloc/malloc-allocator)))
+      ; A 3D container, so panes can float off the project's face; the face's
+      ; plate behind it carries the background.
+      (set! (.view c)
+            (layer-view parent (rect 0.0 0.0 width height) c"CATransformLayer"))
+      (set! (.panes c)
+            (al/ArrayList::new [(ptr Pane)] (alloc/malloc-allocator)))
       (set! (.camera c) (model/camera))
       (set! (.width c) width)
       (set! (.height c) height)
@@ -315,25 +350,27 @@
                       [])
                  (sel c"retain")
                  []))
-      (msg i64 (layer (.view c)) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
       (for [i 0 4]
         (let [l (msg (ptr i8) (class c"CAGradientLayer") (sel c"layer") [])]
           (do
-            (set! (p/index (field c edges) i) l)
+            (set! (index (field c edges) i) l)
             (msg i64 l (sel c"setZPosition:") [f64] -1.0)
             (msg i64 (layer (.view c)) (sel c"addSublayer:") [(ptr i8)] l))))
       (apply-theme! c cfg)
       c)))
 
 (defn new-pane [(c (ptr Canvas)) (bounds Rect)] (-> (ptr Pane))
-  (let [v (alloc/box! (alloc/malloc-allocator) Pane (p/zeroed Pane))]
+  ; A pane opened during Exposé is laid out among the others, so the grid
+  ; makes way for it.
+  (when (.exposed c) (unexpose! c (no-pane)))
+  (let [v (alloc/box! (alloc/malloc-allocator) Pane (zeroed Pane))]
     (set! (.next-id c) (+ (.next-id c) 1))
     (set! (.id v) (.next-id c))
     (set! (.view v) (view (.view c) (rect 0.0 0.0 (.w bounds) (.h bounds))))
     (set! (.bounds v) bounds)
     v))
 
-;;; Header, title, close button and resize grip above the pane's content.
+;;; Header, title and close button above the pane's content.
 (defn add-chrome! [(c (ptr Canvas)) (v (ptr Pane)) (title (ptr i8))] (-> void)
   (let [host (.view v)
         bounds (.bounds v)]
@@ -352,14 +389,8 @@
                  (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0)
                  17.0
                  true))
-    (set! (.grip v)
-          (label host
-                 c"◢"
-                 (rect (- (.w bounds) 17.0) 1.0 16.0 17.0)
-                 10.0
-                 true))
     (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
-    (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+    (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (: 1 i8))
     (push! [(ptr Pane)] (mut (.panes c)) v)
     (apply-theme! c (.theme c))
     (focus! c v)))
@@ -391,12 +422,13 @@
            (p/cast i8 (if (= (p/cast i64 (.surface t)) 0) 0 1)))
       true)))
 
-(defn add-session! [(c (ptr Canvas)) (bounds Rect) (session-id (ptr i8))] (-> bool)
+(defn add-session! [(c (ptr Canvas)) (bounds Rect) (session-id (ptr i8))]
+  (-> bool)
   (add-session-in! c bounds session-id (.directory c)))
 
 (defn bytes-of [(s (ptr i8))] (-> (slice u8))
   (let [bytes (utf8 s)]
-    (slice-new (p/cast (ptr u8) bytes) (p/cast i64 (strlen bytes)))))
+    (slice::new (p/cast (ptr u8) bytes) (p/cast i64 (strlen bytes)))))
 
 (defn widget-title [(v (ptr Pane))] (-> (ptr i8))
   (let [chosen (widget-view/title (.widget v))]
@@ -499,7 +531,7 @@
         (do
           (set! (.terminal v) t)
           (terminal/free! old)
-          (msg i64 (.message v) (sel c"setHidden:") [i8] (p/cast i8 1))
+          (msg i64 (.message v) (sel c"setHidden:") [i8] (: 1 i8))
           (set! (.render-scale v) 0.0)
           (project! c)
           (focus! c v)
@@ -542,12 +574,18 @@
               (for [i (load found) (- (count c) 1)]
                 (set! (mut (.panes c)) i (pane c (+ i 1))))
               (pop! [(ptr Pane)] (mut (.panes c)))
+              (when (= (p/cast i64 (.hovered c)) (p/cast i64 chosen))
+                (set! (.hovered c) (no-pane)))
               (free-content! chosen true)
               (msg i64 (.view chosen) (sel c"removeFromSuperview") [])
               (alloc/destroy [Pane] (alloc/malloc-allocator) chosen)
               (focus! c (if (> (count c) 0) (pane c (- (count c) 1)) (no-pane))))
             (do))))
-    (project! c)))
+    (project! c)
+    ; Exposé closes up the gap the pane leaves.
+    (when (.exposed c)
+      (if (> (count c) 0) (spread! c EXPOSE-TIME) (set! (.exposed c) false)))
+    (do)))
 
 (defn hit [(c (ptr Canvas)) (world Point)] (-> (ptr Pane))
   (let [(mut found) (no-pane)]
@@ -595,6 +633,9 @@
 ;;; Dragging beyond the viewport therefore neither loses a pane nor types into
 ;;; a terminal. Ordinary wheel events inside a terminal remain terminal scroll.
 (defn handle! [(c (ptr Canvas)) (event (ptr i8))] (-> bool)
+  (if (.exposed c) (expose-handle! c event) (handle-panes! c event)))
+
+(defn handle-panes! [(c (ptr Canvas)) (event (ptr i8))] (-> bool)
   (let [kind (msg i64 event (sel c"type") [])
         flags (msg u64 event (sel c"modifierFlags") [])
         relevant
@@ -608,7 +649,7 @@
               (= kind 30))]
     (if (or (= kind 10) (= kind 11))
         (do
-          (if (= (msg u16 event (sel c"keyCode") []) (p/cast u16 49))
+          (if (= (msg u16 event (sel c"keyCode") []) (: 49 u16))
               (set! (.space-held c) (= kind 10))
               0)
           false)
@@ -620,8 +661,8 @@
                   inside
                     (model/contains? (rect 0.0 0.0 (.width c) (.height c))
                                      screen)
-                  alt (!= (& flags 524288) (p/cast u64 0))
-                  command (!= (& flags 1048576) (p/cast u64 0))]
+                  alt (!= (& flags 524288) (: 0 u64))
+                  command (!= (& flags 1048576) (: 0 u64))]
               (do
                 (set! (.pointer c) screen)
                 (cond (and (or (= kind 6) (= kind 27)) (> (.gesture c) 0))
@@ -697,22 +738,33 @@
                                                                    screen))
                                       (set! (.start-bounds c) r)
                                       (set! (.drag-pane c) v)
-                                      (cond (and (< local-y 36.0)
-                                                 (> local-x (- (.w r) 36.0)))
-                                              (do
-                                                (set! (.drag-pane c) (no-pane))
-                                                (close! c v)
-                                                true)
-                                            (< local-y 36.0)
-                                              (do
-                                                (set! (.gesture c) 2)
-                                                true)
-                                            (and (> local-y (- (.h r) 20.0))
-                                                 (> local-x (- (.w r) 20.0)))
-                                              (do
-                                                (set! (.gesture c) 3)
-                                                true)
-                                            :else false)))))
+                                      ; Like Jim: the close button, then a
+                                      ; 6 point band along every edge (two
+                                      ; at a corner), then the header.
+                                      (let [edges
+                                              (model/edges-at (.w r)
+                                                              (.h r)
+                                                              local-x
+                                                              local-y
+                                                              (/ 6.0
+                                                                 (.zoom (display-camera c))))]
+                                        (cond (and (< local-y 36.0)
+                                                   (> local-x (- (.w r) 36.0)))
+                                                (do
+                                                  (set! (.drag-pane c)
+                                                        (no-pane))
+                                                  (close! c v)
+                                                  true)
+                                              (!= edges 0)
+                                                (do
+                                                  (set! (.resize-edges c) edges)
+                                                  (set! (.gesture c) 3)
+                                                  true)
+                                              (< local-y 36.0)
+                                                (do
+                                                  (set! (.gesture c) 2)
+                                                  true)
+                                              :else false))))))
                       (= kind 30)
                         (if (.zoom-enabled c)
                             (do
@@ -732,7 +784,7 @@
                                                             event
                                                             (sel c"hasPreciseScrollingDeltas")
                                                             [])
-                                                       (p/cast i8 0))
+                                                       (: 0 i8))
                                                    (.scale c))
                               dx
                                 (* (msg f64 event (sel c"scrollingDeltaX") [])
@@ -767,10 +819,364 @@
     (set! (.height c) height)
     (set! (.scale c) scale)
     (frame! (.view c) (rect 0.0 0.0 width height))
-    (project! c)))
+    (project! c)
+    (when (.exposed c) (spread! c 0.0))))
+
+;;; The bounding box of every pane, in canvas units.
+(defn extent [(c (ptr Canvas))] (-> Rect)
+  (let [first (.bounds (pane c 0))
+        (mut left) (.x first)
+        (mut top) (.y first)
+        (mut right) (+ (.x first) (.w first))
+        (mut bottom) (+ (.y first) (.h first))]
+    (for [i 1 (count c)]
+      (let [r (.bounds (pane c i))]
+        (when (< (.x r) (load left)) (set! left (.x r)))
+        (when (< (.y r) (load top)) (set! top (.y r)))
+        (when (> (+ (.x r) (.w r)) (load right)) (set! right (+ (.x r) (.w r))))
+        (when (> (+ (.y r) (.h r)) (load bottom))
+          (set! bottom (+ (.y r) (.h r))))))
+    (rect (load left)
+          (load top)
+          (- (load right) (load left))
+          (- (load bottom) (load top)))))
+
+;;; The layer transform that carries a pane from where the canvas lays it out
+;;; (its view's FRAME, around the layer's POSITION) to TARGET, LIFT points off
+;;; the canvas. Both rects are in the canvas view's coordinates.
+(defn carry [(frame Rect) (position Point) (target Rect) (lift f64)]
+  (-> Transform)
+  (let [scale (/ (.w target) (.w frame))]
+    (CATransform3DScale (CATransform3DMakeTranslation (- (.x target)
+                                                         (.x position)
+                                                         (* scale
+                                                            (- (.x frame)
+                                                               (.x position))))
+                                                      (- (.y target)
+                                                         (.y position)
+                                                         (* scale
+                                                            (- (.y frame)
+                                                               (.y position))))
+                                                      lift)
+                        scale
+                        scale
+                        1.0)))
+
+;;; The transform that carries pane V from its frame onto TARGET, LIFT
+;;; points off the canvas. A zoomed pane's layer is as big as its bounds, and
+;;; AppKit shrinks it onto the frame with the layer's own transform, so the
+;;; carry starts from that scale. The layer's position is worked out from the
+;;; frame too: AppKit updates a view's layer only on its next layout, so just
+;;; after a frame change the layer still says where the view was.
+(defn carry-pane [(v (ptr Pane)) (target Rect) (lift f64)] (-> Transform)
+  (let [frame (msg Rect (.view v) (sel c"frame") [])
+        bounds (msg Rect (.view v) (sel c"bounds") [])
+        fit (/ (.w frame) (max (.w bounds) 1.0))]
+    (CATransform3DConcat (CATransform3DMakeScale fit fit 1.0)
+                         (carry frame (pivot v) target lift))))
+
+;;; Where pane V's layer is positioned, worked out from the view's frame.
+(defn pivot [(v (ptr Pane))] (-> Point)
+  (let [frame (msg Rect (.view v) (sel c"frame") [])
+        anchor (msg Point (layer (.view v)) (sel c"anchorPoint") [])]
+    (Point
+      :x (+ (.x frame) (* (.x anchor) (.w frame)))
+      :y (+ (.y frame) (* (.y anchor) (.h frame))))))
+
+;;; Where a pane's layer was positioned and the transform it was shown with,
+;;; so a pane given a new frame can start out exactly where it was seen.
+(defstruct Seen [(at Point) (shown Transform)])
+
+(defn seen [(c (ptr Canvas))] (-> (al/ArrayList Seen))
+  (let [(mut all) (al/ArrayList::new [Seen] (alloc/malloc-allocator))]
+    (for [i 0 (count c)]
+      (let [l (layer (.view (pane c i)))
+            shown (msg (ptr i8) l (sel c"presentationLayer") [])]
+        (push! (mut all)
+               (Seen
+                 :at (pivot (pane c i))
+                 :shown
+                   (msg Transform
+                        (if (= (p/cast i64 shown) 0) l shown)
+                        (sel c"transform")
+                        [])))))
+    all))
+
+;;; The transform that shows pane V, from its frame now, where it was SEEN.
+(defn seen-from [(v (ptr Pane)) (was Seen)] (-> Transform)
+  (let [at (pivot v)]
+    (CATransform3DConcat (.shown was)
+                         (CATransform3DMakeTranslation (- (.x (.at was))
+                                                          (.x at))
+                                                       (- (.y (.at was))
+                                                          (.y at))
+                                                       0.0))))
+
+;;; Move every pane over DURATION from where it was SEEN to its frame now,
+;;; LIFT points off the canvas plus STEP per place in the stack, and grown
+;;; by HOVER-LIFT if hovered. Each starts DELAY later than the one before.
+;;; Panes are moved by their frames, so AppKit draws them wherever they land;
+;;; their transforms only carry them on the way.
+(defn glide! [(c (ptr Canvas))
+              (was (al/ArrayList Seen))
+              (duration f64)
+              (delay f64)
+              (lift f64)
+              (step f64)] (-> void)
+  (for [i 0 (count c)]
+    (let [v (pane c i)
+          frame (msg Rect (.view v) (sel c"frame") [])
+          grow (if (= (p/cast i64 v) (p/cast i64 (.hovered c))) HOVER-LIFT 1.0)]
+      (tween! (layer (.view v))
+              (seen-from v (get was i))
+              (carry-pane v
+                          (rect (- (.x frame) (* 0.5 (.w frame) (- grow 1.0)))
+                                (- (.y frame) (* 0.5 (.h frame) (- grow 1.0)))
+                                (* (.w frame) grow)
+                                (* (.h frame) grow))
+                          (+ lift (* step (p/cast f64 i))))
+              duration
+              (ease-out-cubic)
+              (* delay (p/cast f64 i)))))
+  (do))
+
+;;; Pane V's transform at rest, lying on its frame.
+(defn rest [(v (ptr Pane))] (-> Transform)
+  (carry-pane v (msg Rect (.view v) (sel c"frame") []) 0.0))
+
+;;; Lay the panes out for the cube, as Jim does. When FIT, the whole layout is
+;;; scaled to fill 80% of the face and centered, whatever the camera shows, and
+;;; each pane floats LIFT points off the face plus STEP per place in the stack.
+;;; Otherwise the panes lie flat where the camera puts them. Animates over
+;;; DURATION.
+(defn cube-pose! [(c (ptr Canvas))
+                  (fit bool)
+                  (lift f64)
+                  (step f64)
+                  (duration f64)] (-> void)
+  (let [(mut was) (seen c)]
+    ; The cube lays the panes out itself.
+    (set! (.exposed c) false)
+    (set! (.hovered c) (no-pane))
+    (set! (.returning-at c) 0.0)
+    (set! (.fitted c) fit)
+    (when (and fit (> (count c) 0))
+      (let [box (extent c)
+            k
+              (min (/ (* (.width c) 0.8) (max (.w box) 1.0))
+                   (/ (* (.height c) 0.8) (max (.h box) 1.0)))
+            cx (+ (.x box) (* (.w box) 0.5))
+            cy (+ (.y box) (* (.h box) 0.5))]
+        (for [i 0 (count c)]
+          (let [v (pane c i)
+                r (.bounds v)]
+            (set! (.slot v)
+                  (rect (+ (* (.width c) 0.5) (* (- (.x r) cx) k))
+                        (+ (* (.height c) 0.5) (* (- (.y r) cy) k))
+                        (* (.w r) k)
+                        (* (.h r) k)))))))
+    (project! c)
+    (if fit
+        (glide! c was duration 0.0 lift step)
+        (glide! c was duration 0.0 0.0 0.0))
+    (free! (mut was)))
+  (do))
 
 (defn visibility! [(c (ptr Canvas)) (visible bool)] (-> void)
-  (do (set! (.visible c) visible) (project! c)))
+  ; A project put away closes its Exposé at once.
+  (let [closing (and (not visible) (.exposed c))]
+    (when closing
+      (set! (.exposed c) false)
+      (set! (.hovered c) (no-pane)))
+    (set! (.returning-at c) 0.0)
+    (set! (.visible c) visible)
+    (project! c)
+    (when closing
+      (for [i 0 (count c)]
+        (transform! (layer (.view (pane c i))) (rest (pane c i)) 0.0))))
+  (do))
+
+;;; Exposé, after Jim's ⌘⇧E. It spreads over EXPOSE-TIME with a cascade of
+;;; EXPOSE-STAGGER per pane; the hovered pane grows by HOVER-LIFT.
+(const EXPOSE-TIME 0.3)
+
+(const EXPOSE-STAGGER 0.01)
+
+(const HOVER-LIFT 1.07)
+
+(const HOVER-TIME 0.14)
+
+;;; The transform that grows pane V by LIFT about the center of its frame.
+(defn lifted [(v (ptr Pane)) (lift f64)] (-> Transform)
+  (let [frame (msg Rect (.view v) (sel c"frame") [])
+        grow (- lift 1.0)]
+    (carry-pane v
+                (rect (- (.x frame) (* 0.5 (.w frame) grow))
+                      (- (.y frame) (* 0.5 (.h frame) grow))
+                      (* (.w frame) lift)
+                      (* (.h frame) lift))
+                0.0)))
+
+;;; Grow pane V by LIFT over DURATION, from wherever it is shown now.
+(defn lift! [(v (ptr Pane)) (lift f64) (duration f64)] (-> void)
+  (eased-transform! (layer (.view v))
+                    (lifted v lift)
+                    duration
+                    (ease-out-cubic)
+                    0.0)
+  (do))
+
+;;; Lay every pane out in Exposé's grid over DURATION.
+(defn spread! [(c (ptr Canvas)) (duration f64)] (-> void)
+  (let [n (count c)
+        display (display-camera c)
+        region
+          (rect model/EXPOSE-PAD
+                model/EXPOSE-PAD
+                (max (- (.width c) (* 2.0 model/EXPOSE-PAD)) 1.0)
+                (max (- (.height c) (* 2.0 model/EXPOSE-PAD)) 1.0))
+        grid (model/expose-grid n (.w region) (.h region))
+        stagger (if (> duration 0.0) EXPOSE-STAGGER 0.0)
+        (mut was) (seen c)
+        (mut centers) (al/ArrayList::new [Point] (alloc/malloc-allocator))]
+    (for [i 0 n]
+      (let [r (model/project display (.bounds (pane c i)))]
+        (push! (mut centers)
+               (Point :x (+ (.x r) (* 0.5 (.w r))) :y (+ (.y r) (* 0.5 (.h r)))))))
+    (let [(mut cells) (model/expose-cells (slice centers) grid)]
+      (for [i 0 n]
+        (let [v (pane c i)
+              screen (model/project display (.bounds v))]
+          (set! (.slot v)
+                (model/expose-slot grid
+                                   region
+                                   (get cells i)
+                                   (.w screen)
+                                   (.h screen)))))
+      (free! (mut cells)))
+    (project! c)
+    (glide! c was duration stagger 0.0 0.0)
+    (free! (mut was))
+    (free! (mut centers))
+    (set! (.exposed-at c)
+          (+ (animation/animation-now) duration (* stagger (p/cast f64 n))))
+    (do)))
+
+;;; Spread the panes out, every one shown where it can be seen at once.
+(defn expose! [(c (ptr Canvas))] (-> void)
+  (when (and (not (.exposed c)) (> (count c) 0))
+    (set! (.exposed c) true)
+    (set! (.hovered c) (no-pane))
+    (set! (.returning-at c) 0.0)
+    (set! (.gesture c) 0)
+    (set! (.drag-pane c) (no-pane))
+    (spread! c EXPOSE-TIME))
+  (do))
+
+;;; Bring the panes home. CHOSEN, when set, is focused and brought to the
+;;; front; the camera moves only if none of it would be in view at home.
+(defn unexpose! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
+  (when (.exposed c)
+    (let [(mut was) (seen c)]
+      (set! (.exposed c) false)
+      (set! (.hovered c) (no-pane))
+      (set! (.returning-at c) (+ (animation/animation-now) EXPOSE-TIME))
+      (when (!= (p/cast i64 chosen) 0)
+        (let [home (model/project (display-camera c) (.bounds chosen))]
+          (when (not (model/visible? home (.width c) (.height c)))
+            (set! (.camera c)
+                  (model/clamp-camera (model/Camera
+                                        :x (- (.x (.bounds chosen)) 24.0)
+                                        :y (- (.y (.bounds chosen)) 24.0)
+                                        :zoom (.zoom (.camera c)))))
+            0)))
+      (project! c)
+      (glide! c was EXPOSE-TIME 0.0 0.0 0.0)
+      (free! (mut was))
+      ; Raised after the glide is set up, since raising reorders the panes.
+      (when (!= (p/cast i64 chosen) 0) (front! c chosen))))
+  (do))
+
+(defn toggle-expose! [(c (ptr Canvas))] (-> void)
+  (if (.exposed c) (unexpose! c (no-pane)) (expose! c)))
+
+;;; The topmost pane whose Exposé slot holds the top-down point PT.
+(defn expose-hit [(c (ptr Canvas)) (pt Point)] (-> (ptr Pane))
+  (let [(mut found) (no-pane)]
+    (for [i 0 (count c)]
+      (when (model/contains? (.slot (pane c i)) pt) (set! found (pane c i))))
+    (load found)))
+
+;;; Lift the pane under PT, once the spread has settled. The hovered pane
+;;; takes the focus as well, as in Jim, so the header marks it.
+(defn expose-hover! [(c (ptr Canvas)) (pt Point)] (-> void)
+  (when (>= (animation/animation-now) (.exposed-at c))
+    (let [v (expose-hit c pt)
+          old (.hovered c)]
+      (when (!= (p/cast i64 v) (p/cast i64 old))
+        (when (!= (p/cast i64 old) 0)
+          (lift! old 1.0 HOVER-TIME))
+        (set! (.hovered c) v)
+        (when (!= (p/cast i64 v) 0)
+          (lift! v HOVER-LIFT HOVER-TIME)
+          (focus! c v)))))
+  (do))
+
+;;; The pointer now, in the canvas's top-down coordinates.
+(defn mouse [(c (ptr Canvas))] (-> Point)
+  (let [window (msg (ptr i8) (.view c) (sel c"window") [])
+        pt
+          (msg Point
+               (.view c)
+               (sel c"convertPoint:fromView:")
+               [Point (ptr i8)]
+               (msg Point window (sel c"mouseLocationOutsideOfEventStream") [])
+               (nil))]
+    (Point :x (.x pt) :y (- (.height c) (.y pt)))))
+
+;;; Finish Exposé's animations: hover what the pointer rests on once the
+;;; spread settles, and hide panes out of view once they are home.
+(defn settle-expose! [(c (ptr Canvas)) (now f64)] (-> void)
+  (when (and (.exposed c) (> (.exposed-at c) 0.0) (>= now (.exposed-at c)))
+    (set! (.exposed-at c) 0.0)
+    (expose-hover! c (mouse c)))
+  (when (and (> (.returning-at c) 0.0) (>= now (.returning-at c)))
+    (set! (.returning-at c) 0.0)
+    (project! c))
+  (do))
+
+;;; While Exposé is open it owns the pointer: a click picks the pane under
+;;; it and Esc closes. Keys with ⌘ still reach the app's shortcuts; other
+;;; keys go nowhere.
+(defn expose-handle! [(c (ptr Canvas)) (event (ptr i8))] (-> bool)
+  (let [kind (msg i64 event (sel c"type") [])
+        command
+          (!= (& (msg u64 event (sel c"modifierFlags") []) 1048576) (: 0 u64))]
+    (cond (= kind 10)
+            (cond (= (msg u16 event (sel c"keyCode") []) (: 53 u16))
+                    (do (unexpose! c (no-pane)) true)
+                  command false
+                  :else true)
+          (= kind 11) (not command)
+          (= kind 1)
+            (let [v (expose-hit c (point c event))]
+              (when (!= (p/cast i64 v) 0) (unexpose! c v))
+              true)
+          (or (= kind 5) (= kind 6)) (do (expose-hover! c (point c event)) true)
+          (or (= kind 2)
+              (= kind 3)
+              (= kind 4)
+              (= kind 7)
+              (= kind 22)
+              (= kind 25)
+              (= kind 26)
+              (= kind 27)
+              (= kind 29)
+              (= kind 30)
+              (= kind 31)
+              (= kind 32))
+            true
+          :else false)))
 
 (defn free! [(c (ptr Canvas))] (-> void)
   (do
@@ -780,7 +1186,7 @@
           (free-content! v false)
           (msg i64 (.view v) (sel c"removeFromSuperview") [])
           (alloc/destroy [Pane] (alloc/malloc-allocator) v))))
-    (al/al-free! [(ptr Pane)] (mut (.panes c)))
+    (al/ArrayList::free! (mut (.panes c)))
     (release (.directory c))
     (msg i64 (.view c) (sel c"removeFromSuperview") [])
     (alloc/destroy [Canvas] (alloc/malloc-allocator) c)))
@@ -864,11 +1270,14 @@
                   :zoom (storage/value dict c"zoom")))
           (for [i 0 (storage/count panes)]
             (let [r (storage/at panes i)]
-              (if (not (let [bounds
-                               (rect (storage/value r c"x")
-                                     (storage/value r c"y")
-                                     (storage/value r c"width")
-                                     (storage/value r c"height"))
+              (if (not (let [; Layouts saved before drags were kept in reach
+                             ; may hold panes the camera cannot pan to.
+                             bounds
+                               (model/reachable (rect (storage/value r c"x")
+                                                      (storage/value r c"y")
+                                                      (storage/value r c"width")
+                                                      (storage/value r
+                                                                     c"height")))
                              widget (storage/get r c"widget")]
                          (if (storage/kind? widget c"NSString")
                              (add-widget! c
@@ -906,7 +1315,8 @@
         (do
           (set! (.camera c)
                 (model/zoom-at (.camera c)
-                               (Point :x (.x center)
+                               (Point
+                                 :x (.x center)
                                  :y (- (.height c) (.y center)))
                                factor))
           (project! c)))

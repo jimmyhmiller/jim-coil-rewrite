@@ -1,9 +1,10 @@
 (module jim.sessions)
+(import "coil.cc" :as cc)
 (import "jim.native" :use *)
 (import "jim.session.transport" :as transport)
 (import "coil.primitive" :as p)
 
-(extern chmod :cc c [(ptr i8) u16] (-> i32))
+(extern chmod :cc (cc/C) [(ptr i8) u16] (-> i32))
 
 (defn identifier [] (-> (ptr i8))
   (msg (ptr i8)
@@ -48,10 +49,10 @@
            (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
            [(ptr i8) i8 (ptr i8) (ptr i8)]
            (directory)
-           (p/cast i8 1)
+           (: 1 i8)
            (nil)
            (nil))
-      (chmod (utf8 (directory)) (p/cast u16 448))
+      (chmod (utf8 (directory)) (: 448 u16))
       (if (valid-id? id)
           (transport/session-open (utf8 (msg (ptr i8)
                                              base
@@ -65,8 +66,8 @@
                                              (sel c"stringByAppendingPathComponent:")
                                              [(ptr i8)]
                                              (ns c"build/ghostty/share/ghostty"))))
-          (p/cast i32 -1)))))
+          (: -1 i32)))))
 
 (defn kill! [(id (ptr i8))] (-> bool)
   (and (valid-id? id)
-       (= (transport/session-kill (utf8 (path id))) (p/cast i32 0))))
+       (= (transport/session-kill (utf8 (path id))) (: 0 i32))))

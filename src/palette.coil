@@ -30,7 +30,7 @@
 
 (defn open? [] (-> bool)
   (and (!= (p/cast i64 (.overlay (state))) 0)
-       (= (msg i8 (.overlay (state)) (sel c"isHidden") []) (p/cast i8 0))))
+       (= (msg i8 (.overlay (state)) (sel c"isHidden") []) (: 0 i8))))
 
 (defn focus! [] (-> void)
   (do
@@ -63,7 +63,7 @@
            (sel c"makeFirstResponder:")
            [(ptr i8)]
            (.previous-responder s))
-      (msg i64 (.overlay s) (sel c"setHidden:") [i8] (p/cast i8 1))
+      (msg i64 (.overlay s) (sel c"setHidden:") [i8] (: 1 i8))
       (release (.previous-responder s))
       (set! (.previous-responder s) (nil))
       (do))))
@@ -85,7 +85,7 @@
 (defn choose! [] (-> void)
   (let [s (state)]
     (cond (>= (.prompt s) 0)
-            (if (> (msg u64 (text) (sel c"length") []) (p/cast u64 0))
+            (if (> (msg u64 (text) (sel c"length") []) (: 0 u64))
                 (do (set! (.submission s) (.prompt s)) (dismiss!))
                 (do))
           (> (.count s) 0)
@@ -97,7 +97,7 @@
   (let [s (state)]
     (do
       (for [i 0 10]
-        (let [b (load (p/index (field s buttons) i))
+        (let [b (load (index (field s buttons) i))
               at (+ i (.offset s))]
           (do
             (msg i64
@@ -141,8 +141,9 @@
         query (text)]
     (if (< (.prompt s) 0)
         (do
-          (al/al-free! [Match] (mut (.matches s)))
-          (set! (.matches s) (al/al-new [Match] (alloc/malloc-allocator)))
+          (al/ArrayList::free! (mut (.matches s)))
+          (set! (.matches s)
+                (al/ArrayList::new [Match] (alloc/malloc-allocator)))
           (set! (.count s) 0)
           (set! (.selected s) 0)
           (set! (.offset s) 0)
@@ -206,8 +207,8 @@
               (= (p/cast i64 selector) (p/cast i64 (sel c"moveRight:")))
               (= (p/cast i64 selector) (p/cast i64 (sel c"moveForward:"))))
         boundary
-          (and (= (.length selection) (p/cast u64 0))
-               (or (and backward (= (.location selection) (p/cast u64 0)))
+          (and (= (.length selection) (: 0 u64))
+               (or (and backward (= (.location selection) (: 0 u64)))
                    (and forward (>= (.location selection) length))))]
     (p/cast i8
             (if (or boundary
@@ -216,7 +217,7 @@
                             (sel c"respondsToSelector:")
                             [(ptr i8)]
                             selector)
-                       (p/cast i8 0)))
+                       (: 0 i8)))
                 1
                 0))))
 
@@ -257,7 +258,7 @@
            (.overlay s)
            1
            (nil))
-      (msg i64 (.overlay s) (sel c"setHidden:") [i8] (p/cast i8 0))
+      (msg i64 (.overlay s) (sel c"setHidden:") [i8] (: 0 i8))
       (focus!))))
 
 (defn prompt! [(id i64) (label (ptr i8)) (initial (ptr i8))] (-> void)
@@ -267,10 +268,10 @@
     (set! (.count (state)) 0)
     (for [i 0 10]
       (msg i64
-           (load (p/index (field (state) buttons) i))
+           (load (index (field (state) buttons) i))
            (sel c"setHidden:")
            [i8]
-           (p/cast i8 1)))
+           (: 1 i8)))
     (msg i64
          (.search (state))
          (sel c"setPlaceholderString:")
@@ -309,32 +310,32 @@
                    (= kind 22)
                    (and (>= kind 25) (<= kind 30))))
             true
-          (!= (msg i8 editor (sel c"hasMarkedText") []) (p/cast i8 0)) false
+          (!= (msg i8 editor (sel c"hasMarkedText") []) (: 0 i8)) false
           (= kind 10)
             (let [key (msg u16 event (sel c"keyCode") [])]
-              (cond (= key (p/cast u16 53)) (do (dismiss!) true)
-                    (= key (p/cast u16 125)) (do (move! 1) true)
-                    (= key (p/cast u16 126)) (do (move! -1) true)
-                    (= key (p/cast u16 36)) (do (choose!) true)
-                    (= key (p/cast u16 48))
+              (cond (= key (: 53 u16)) (do (dismiss!) true)
+                    (= key (: 125 u16)) (do (move! 1) true)
+                    (= key (: 126 u16)) (do (move! -1) true)
+                    (= key (: 36 u16)) (do (choose!) true)
+                    (= key (: 48 u16))
                       (do
                         (move! (if (!= (& (msg u64
                                                event
                                                (sel c"modifierFlags")
                                                [])
                                           131072)
-                                       (p/cast u64 0))
+                                       (: 0 u64))
                                    -1
                                    1))
                         true)
                     :else
                       (let [flags (msg u64 event (sel c"modifierFlags") [])]
-                        (and (!= (& flags 1048576) (p/cast u64 0))
-                             (not (or (= key (p/cast u16 0))
-                                      (= key (p/cast u16 8))
-                                      (= key (p/cast u16 9))
-                                      (= key (p/cast u16 7))
-                                      (= key (p/cast u16 6))))))))
+                        (and (!= (& flags 1048576) (: 0 u64))
+                             (not (or (= key (: 0 u16))
+                                      (= key (: 8 u16))
+                                      (= key (: 9 u16))
+                                      (= key (: 7 u16))
+                                      (= key (: 6 u16))))))))
           :else false)))
 
 (defn setup! [(owner (ptr i8))] (-> void)
@@ -345,14 +346,14 @@
         overlay (view content bounds)
         root (view overlay (rect 0.0 0.0 620.0 460.0))]
     (do
-      (set! (.matches s) (al/al-new [Match] (alloc/malloc-allocator)))
+      (set! (.matches s) (al/ArrayList::new [Match] (alloc/malloc-allocator)))
       (set! (.prompt s) -1)
       (set! (.submission s) -1)
       (set! (.owner s) owner)
       (set! (.overlay s) overlay)
       (set! (.card s) root)
       (set! (.pending s) -1)
-      (msg i64 overlay (sel c"setHidden:") [i8] (p/cast i8 1))
+      (msg i64 overlay (sel c"setHidden:") [i8] (: 1 i8))
       (msg i64 overlay (sel c"setAutoresizingMask:") [u64] 18)
       (msg i64
            (layer overlay)
@@ -370,14 +371,14 @@
       (background! root 0.075 0.09 0.12)
       (method! cls
                c"controlTextDidChange:"
-               (p/cast (ptr i8) (p/fnptr-of changed))
+               (p/cast (ptr i8) (fnptr-of changed))
                c"v@:@")
-      (method! cls c"hovered:" (p/cast (ptr i8) (p/fnptr-of hovered)) c"v@:@")
+      (method! cls c"hovered:" (p/cast (ptr i8) (fnptr-of hovered)) c"v@:@")
       (method! cls
                c"control:textView:doCommandBySelector:"
-               (p/cast (ptr i8) (p/fnptr-of edit-command))
+               (p/cast (ptr i8) (fnptr-of edit-command))
                c"c@:@@:")
-      (method! cls c"choose:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
+      (method! cls c"choose:" (p/cast (ptr i8) (fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
       (set! (.target s) (new c"JimPaletteActions"))
       (set! (.search s)
@@ -396,12 +397,12 @@
       (for [i 0 10]
         (let [b (controls/button c"" (.target s) (sel c"choose:"))]
           (do
-            (set! (p/index (field s buttons) i) b)
+            (set! (index (field s buttons) i) b)
             (frame! b (rect 18.0 (- 365.0 (* (p/cast f64 i) 34.0)) 584.0 32.0))
             (msg i64 b (sel c"setTag:") [i64] i)
-            (msg i64 b (sel c"setBordered:") [i8] (p/cast i8 0))
+            (msg i64 b (sel c"setBordered:") [i8] (: 0 i8))
             (msg i64 b (sel c"setAlignment:") [i64] 0)
-            (msg i64 b (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+            (msg i64 b (sel c"setWantsLayer:") [i8] (: 1 i8))
             (msg i64 root (sel c"addSubview:") [(ptr i8)] b))))
       (set! (.hint s) (label root c"" (rect 18.0 12.0 584.0 24.0) 12.0 true))
       (do))))
@@ -411,6 +412,6 @@
     (if (open?) (dismiss!) (do))
     (release (.search (state)))
     (msg i64 (.overlay (state)) (sel c"removeFromSuperview") [])
-    (al/al-free! [Match] (mut (.matches (state))))
+    (al/ArrayList::free! (mut (.matches (state))))
     (release (.target (state)))
     (do)))

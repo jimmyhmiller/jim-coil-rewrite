@@ -1,4 +1,5 @@
 (module jim.ghostty)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as p)
 
 ;;; Audited subset of vendor/ghostty.h. Compile-time assertions below check this boundary.
@@ -80,71 +81,91 @@
 
 (defstruct ClipboardContent [(mime (ptr i8)) (data (ptr i8))])
 
-(extern ghostty_init :cc c [u64 (ptr (ptr i8))] (-> i32))
+(extern ghostty_init :cc (cc/C) [u64 (ptr (ptr i8))] (-> i32))
 
-(extern ghostty_config_new :cc c [] (-> (ptr i8)))
+(extern ghostty_config_new :cc (cc/C) [] (-> (ptr i8)))
 
-(extern ghostty_config_free :cc c [(ptr i8)] (-> void))
+(extern ghostty_config_free :cc (cc/C) [(ptr i8)] (-> void))
 
-(extern ghostty_config_load_file :cc c [(ptr i8) (ptr i8)] (-> void))
+(extern ghostty_config_load_file :cc (cc/C) [(ptr i8) (ptr i8)] (-> void))
 
-(extern ghostty_config_finalize :cc c [(ptr i8)] (-> void))
+(extern ghostty_config_finalize :cc (cc/C) [(ptr i8)] (-> void))
 
-(extern ghostty_app_new :cc c [(ptr Runtime) (ptr i8)] (-> (ptr i8)))
+(extern ghostty_app_new :cc (cc/C) [(ptr Runtime) (ptr i8)] (-> (ptr i8)))
 
-(extern ghostty_app_free :cc c [(ptr i8)] (-> void))
+(extern ghostty_app_free :cc (cc/C) [(ptr i8)] (-> void))
 
-(extern ghostty_app_tick :cc c [(ptr i8)] (-> void))
+(extern ghostty_app_tick :cc (cc/C) [(ptr i8)] (-> void))
 
-(extern ghostty_app_set_focus :cc c [(ptr i8) bool] (-> void))
+(extern ghostty_app_set_focus :cc (cc/C) [(ptr i8) bool] (-> void))
 
-(extern ghostty_surface_config_new :cc c [] (-> SurfaceConfig))
+(extern ghostty_surface_config_new :cc (cc/C) [] (-> SurfaceConfig))
 
-(extern ghostty_surface_new :cc c [(ptr i8) (ptr SurfaceConfig)] (-> (ptr i8)))
+(extern ghostty_surface_new
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr SurfaceConfig)]
+        (-> (ptr i8)))
 
-(extern ghostty_surface_free :cc c [(ptr i8)] (-> void))
+(extern ghostty_surface_free :cc (cc/C) [(ptr i8)] (-> void))
 
-(extern ghostty_surface_set_size :cc c [(ptr i8) u32 u32] (-> void))
+(extern ghostty_surface_set_size :cc (cc/C) [(ptr i8) u32 u32] (-> void))
 
-(extern ghostty_surface_set_content_scale :cc c [(ptr i8) f64 f64] (-> void))
+(extern ghostty_surface_set_content_scale
+        :cc
+        (cc/C)
+        [(ptr i8) f64 f64]
+        (-> void))
 
-(extern ghostty_surface_set_focus :cc c [(ptr i8) bool] (-> void))
+(extern ghostty_surface_set_focus :cc (cc/C) [(ptr i8) bool] (-> void))
 
-(extern ghostty_surface_set_occlusion :cc c [(ptr i8) bool] (-> void))
+(extern ghostty_surface_set_occlusion :cc (cc/C) [(ptr i8) bool] (-> void))
 
-(extern ghostty_surface_key :cc c [(ptr i8) Key] (-> bool))
+(extern ghostty_surface_key :cc (cc/C) [(ptr i8) Key] (-> bool))
 
-(extern ghostty_surface_text :cc c [(ptr i8) (ptr i8) u64] (-> void))
+(extern ghostty_surface_text :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> void))
 
-(extern ghostty_surface_preedit :cc c [(ptr i8) (ptr i8) u64] (-> void))
+(extern ghostty_surface_preedit :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> void))
 
-(extern ghostty_surface_mouse_pos :cc c [(ptr i8) f64 f64 i32] (-> void))
+(extern ghostty_surface_mouse_pos :cc (cc/C) [(ptr i8) f64 f64 i32] (-> void))
 
-(extern ghostty_surface_mouse_button :cc c [(ptr i8) i32 i32 i32] (-> bool))
+(extern ghostty_surface_mouse_button
+        :cc
+        (cc/C)
+        [(ptr i8) i32 i32 i32]
+        (-> bool))
 
-(extern ghostty_surface_mouse_scroll :cc c [(ptr i8) f64 f64 i32] (-> void))
+(extern ghostty_surface_mouse_scroll
+        :cc
+        (cc/C)
+        [(ptr i8) f64 f64 i32]
+        (-> void))
 
 (extern ghostty_surface_ime_point
         :cc
-        c
+        (cc/C)
         [(ptr i8) (ptr f64) (ptr f64) (ptr f64) (ptr f64)]
         (-> void))
 
-(extern ghostty_surface_binding_action :cc c [(ptr i8) (ptr i8) u64] (-> bool))
+(extern ghostty_surface_binding_action
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr i8) u64]
+        (-> bool))
 
 (extern ghostty_surface_complete_clipboard_request
         :cc
-        c
+        (cc/C)
         [(ptr i8) (ptr i8) (ptr i8) bool]
         (-> void))
 
-(extern ghostty_surface_process_exited :cc c [(ptr i8)] (-> bool))
+(extern ghostty_surface_process_exited :cc (cc/C) [(ptr i8)] (-> bool))
 
-(extern ghostty_surface_userdata :cc c [(ptr i8)] (-> (ptr i8)))
+(extern ghostty_surface_userdata :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (extern ghostty_surface_new_session
         :cc
-        c
+        (cc/C)
         [(ptr i8) (ptr SurfaceConfig) i32]
         (-> (ptr i8)))
 
@@ -157,8 +178,8 @@
 
 (extern ghostty_surface_read_text
         :cc
-        c
+        (cc/C)
         [(ptr i8) TextSelection (ptr Text)]
         (-> bool))
 
-(extern ghostty_surface_free_text :cc c [(ptr i8) (ptr Text)] (-> void))
+(extern ghostty_surface_free_text :cc (cc/C) [(ptr i8) (ptr Text)] (-> void))

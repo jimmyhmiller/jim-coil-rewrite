@@ -32,7 +32,7 @@
            (sel c"containsObject:")
            [(ptr i8)]
            (s/number (p/cast f64 project)))
-      (p/cast i8 0)))
+      (: 0 i8)))
 
 (defn select! [(root (ptr i8)) (project i64)] (-> void)
   (if (and (> project 0)
@@ -190,14 +190,14 @@
                               (> (s/value r c"id") 0.0)
                               (< (s/value r c"id") (s/value root c"next_id"))
                               (< (s/value r c"id") 1000000000.0)
-                              (p/fcmp-eq (s/value r c"id") (p/cast f64 (id r)))
+                              (= (s/value r c"id") (p/cast f64 (id r)))
                               (s/kind? (s/get r c"name") c"NSString")
                               (= (msg i8
                                       seen
                                       (sel c"containsObject:")
                                       [(ptr i8)]
                                       number)
-                                 (p/cast i8 0))
+                                 (: 0 i8))
                               (if (= group 0)
                                   (s/kind? (s/get r c"directory") c"NSString")
                                   (and (s/kind? (s/get r c"hidden") c"NSArray")
@@ -209,7 +209,7 @@
 
 ;;; Upgrade the original rewrite's anonymous four-canvas file without losing layout.
 (defn restore [(saved (ptr i8))] (-> (ptr i8))
-  (if (and (p/fcmp-eq (s/value saved c"version") 2.0)
+  (if (and (= (s/value saved c"version") 2.0)
            (> (s/count (profiles saved)) 0))
       (do (repair-selection! saved) saved)
       (let [root (fresh)
@@ -244,7 +244,8 @@
               0)))
       (load found))))
 
-(defn reorder-at! [(root (ptr i8)) (moving i64) (target-id i64) (after bool)] (-> void)
+(defn reorder-at! [(root (ptr i8)) (moving i64) (target-id i64) (after bool)]
+  (-> void)
   (let [items (list root)
         item (find items moving)
         target (find items target-id)]

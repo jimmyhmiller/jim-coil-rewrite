@@ -51,20 +51,20 @@
     (when (!= (p/cast i64 home) 0)
       (let [c (p/cast (ptr u8) home)
             (mut n) 0]
-        (while (!= (load (p/index c (load n))) (p/cast u8 0))
+        (while (!= (load (index c (load n))) (: 0 u8))
           (set! n (+ (load n) 1)))
-        (text/push-str! out (slice-new c (load n))))
+        (text/push-str! out (slice::new c (load n))))
       0)
     (text/push-str! out rest)))
 
 ;;; True when any line of PATHS (one per line) starts with PREFIX.
 (defn any-under? [(paths (slice u8)) (prefix (slice u8))] (-> bool)
-  (let [(mut spans) (al-new [text/Span] (alloc/malloc-allocator))
+  (let [(mut spans) (ArrayList::new [text/Span] (alloc/malloc-allocator))
         (mut found) false]
     (text/lines! paths (mut spans))
     (for [i 0 (len spans)]
       (when (text/starts-with? (text/span-text paths (get spans i)) prefix)
         (set! found true)
         0))
-    (al-free! (mut spans))
+    (free! (mut spans))
     (load found)))

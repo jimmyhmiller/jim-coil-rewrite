@@ -1,4 +1,5 @@
 (module jim.native)
+(import "coil.cc" :as cc)
 (import "jim.objc" :use * :reexport)
 (import "coil.primitive" :as p)
 
@@ -28,39 +29,55 @@
    (m43 f64)
    (m44 f64)])
 
-(extern CATransform3DMakeTranslation :cc c [f64 f64 f64] (-> Transform))
+(extern CATransform3DMakeTranslation :cc (cc/C) [f64 f64 f64] (-> Transform))
 
-(extern CATransform3DRotate :cc c [Transform f64 f64 f64 f64] (-> Transform))
+(extern CATransform3DRotate
+        :cc
+        (cc/C)
+        [Transform f64 f64 f64 f64]
+        (-> Transform))
 
-(extern CATransform3DScale :cc c [Transform f64 f64 f64] (-> Transform))
+(extern CATransform3DMakeScale :cc (cc/C) [f64 f64 f64] (-> Transform))
 
-(extern objc_allocateClassPair :cc c [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+(extern CATransform3DScale :cc (cc/C) [Transform f64 f64 f64] (-> Transform))
 
-(extern objc_registerClassPair :cc c [(ptr i8)] (-> void))
+(extern CATransform3DConcat :cc (cc/C) [Transform Transform] (-> Transform))
 
-(extern class_addMethod :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> bool))
+(extern CATransform3DInvert :cc (cc/C) [Transform] (-> Transform))
 
-(extern class_addProtocol :cc c [(ptr i8) (ptr i8)] (-> i8))
+(extern CACurrentMediaTime :cc (cc/C) [] (-> f64))
 
-(extern objc_getProtocol :cc c [(ptr i8)] (-> (ptr i8)))
+(extern objc_allocateClassPair :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(extern objc_registerClassPair :cc (cc/C) [(ptr i8)] (-> void))
+
+(extern class_addMethod
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr i8) (ptr i8) (ptr i8)]
+        (-> bool))
+
+(extern class_addProtocol :cc (cc/C) [(ptr i8) (ptr i8)] (-> i8))
+
+(extern objc_getProtocol :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (extern objc_setAssociatedObject
         :cc
-        c
+        (cc/C)
         [(ptr i8) (ptr i8) (ptr i8) u64]
         (-> void))
 
-(extern objc_getAssociatedObject :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern objc_getAssociatedObject :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
 
-(extern strlen :cc c [(ptr i8)] (-> u64))
+(extern strlen :cc (cc/C) [(ptr i8)] (-> u64))
 
-(extern strcmp :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern strcmp :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
 
-(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern printf :cc (cc/C) [(ptr i8) ...] (-> i32))
 
-(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
-(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+(extern setenv :cc (cc/C) [(ptr i8) (ptr i8) i32] (-> i32))
 
 (defn nil [] (-> (ptr i8))
   (p/cast (ptr i8) 0))
@@ -120,7 +137,7 @@
            (sel c"setLayer:")
            [(ptr i8)]
            (msg (ptr i8) (class kind) (sel c"layer") []))
-      (msg i64 v (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+      (msg i64 v (sel c"setWantsLayer:") [i8] (: 1 i8))
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
       (release v)
       v)))
@@ -160,7 +177,8 @@
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
       v)))
 
-(defn method! [(cls (ptr i8)) (name (ptr i8)) (fn (ptr i8)) (encoding (ptr i8))] (-> i8)
+(defn method! [(cls (ptr i8)) (name (ptr i8)) (fn (ptr i8)) (encoding (ptr i8))]
+  (-> i8)
   (p/cast i8 (if (class_addMethod cls (sel name) fn encoding) 1 0)))
 
 (defn transaction! [(duration f64)] (-> i64)
@@ -175,74 +193,125 @@
 (defn commit! [] (-> i64)
   (msg i64 (class c"CATransaction") (sel c"commit") []))
 
-(extern CATransform3DTranslate :cc c [Transform f64 f64 f64] (-> Transform))
+(extern CATransform3DTranslate
+        :cc
+        (cc/C)
+        [Transform f64 f64 f64]
+        (-> Transform))
+
+;;; A named Core Animation timing curve, such as "easeInEaseOut".
+(defn timing [(name (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       (class c"CAMediaTimingFunction")
+       (sel c"functionWithName:")
+       [(ptr i8)]
+       (ns name)))
+
+;;; The ease-out cubic curve, 1 - (1 - t)^3.
+(defn ease-out-cubic [] (-> (ptr i8))
+  (msg (ptr i8)
+       (class c"CAMediaTimingFunction")
+       (sel c"functionWithControlPoints::::")
+       [f32 f32 f32 f32]
+       (: 0.33 f32)
+       (: 1.0 f32)
+       (: 0.68 f32)
+       (: 1.0 f32)))
 
 (defn transform! [(l (ptr i8)) (t Transform) (duration f64)] (-> i64)
-  (let [shown (msg (ptr i8) l (sel c"presentationLayer") [])
-        current
-          (msg Transform
-               (if (= (p/cast i64 shown) 0) l shown)
-               (sel c"transform")
-               [])]
-    (do
-      (transaction! 0.0)
-      (msg i64
-           (class c"CATransaction")
-           (sel c"setDisableActions:")
-           [i8]
-           (p/cast i8 1))
-      (msg i64 l (sel c"setTransform:") [Transform] t)
-      (if (> duration 0.0)
-          (let [a
-                  (msg (ptr i8)
-                       (class c"CABasicAnimation")
-                       (sel c"animationWithKeyPath:")
-                       [(ptr i8)]
-                       (ns c"transform"))]
-            (do
+  (eased-transform! l t duration (timing c"easeInEaseOut") 0.0))
+
+;;; Move layer L to transform T over DURATION along CURVE, from wherever it
+;;; is shown now, starting DELAY seconds from now.
+(defn eased-transform! [(l (ptr i8))
+                        (t Transform)
+                        (duration f64)
+                        (curve (ptr i8))
+                        (delay f64)] (-> i64)
+  (let [shown (msg (ptr i8) l (sel c"presentationLayer") [])]
+    (tween! l
+            (msg Transform
+                 (if (= (p/cast i64 shown) 0) l shown)
+                 (sel c"transform")
+                 [])
+            t
+            duration
+            curve
+            delay)))
+
+;;; Move layer L from transform START to T over DURATION along CURVE,
+;;; starting DELAY seconds from now and held at START until then.
+(defn tween! [(l (ptr i8))
+              (start Transform)
+              (t Transform)
+              (duration f64)
+              (curve (ptr i8))
+              (delay f64)] (-> i64)
+  (do
+    (transaction! 0.0)
+    (msg i64
+         (class c"CATransaction")
+         (sel c"setDisableActions:")
+         [i8]
+         (: 1 i8))
+    (msg i64 l (sel c"setTransform:") [Transform] t)
+    (if (> duration 0.0)
+        (let [a
+                (msg (ptr i8)
+                     (class c"CABasicAnimation")
+                     (sel c"animationWithKeyPath:")
+                     [(ptr i8)]
+                     (ns c"transform"))]
+          (do
+            (msg i64
+                 a
+                 (sel c"setFromValue:")
+                 [(ptr i8)]
+                 (msg (ptr i8)
+                      (class c"NSValue")
+                      (sel c"valueWithCATransform3D:")
+                      [Transform]
+                      start))
+            (msg i64
+                 a
+                 (sel c"setToValue:")
+                 [(ptr i8)]
+                 (msg (ptr i8)
+                      (class c"NSValue")
+                      (sel c"valueWithCATransform3D:")
+                      [Transform]
+                      t))
+            (msg i64 a (sel c"setDuration:") [f64] duration)
+            (msg i64
+                 a
+                 (sel c"setTimingFunction:")
+                 [(ptr i8)]
+                 curve)
+            (when (> delay 0.0)
+              ; Held at the start until it begins.
               (msg i64
                    a
-                   (sel c"setFromValue:")
-                   [(ptr i8)]
-                   (msg (ptr i8)
-                        (class c"NSValue")
-                        (sel c"valueWithCATransform3D:")
-                        [Transform]
-                        current))
-              (msg i64
-                   a
-                   (sel c"setToValue:")
-                   [(ptr i8)]
-                   (msg (ptr i8)
-                        (class c"NSValue")
-                        (sel c"valueWithCATransform3D:")
-                        [Transform]
-                        t))
-              (msg i64 a (sel c"setDuration:") [f64] duration)
-              (msg i64
-                   a
-                   (sel c"setTimingFunction:")
-                   [(ptr i8)]
-                   (msg (ptr i8)
-                        (class c"CAMediaTimingFunction")
-                        (sel c"functionWithName:")
-                        [(ptr i8)]
-                        (ns c"easeInEaseOut")))
-              (msg i64
-                   l
-                   (sel c"addAnimation:forKey:")
-                   [(ptr i8) (ptr i8)]
-                   a
-                   (ns c"workspace-transition"))))
-          (msg i64
-               l
-               (sel c"removeAnimationForKey:")
-               [(ptr i8)]
-               (ns c"workspace-transition")))
-      (commit!))))
+                   (sel c"setBeginTime:")
+                   [f64]
+                   (+ (CACurrentMediaTime) delay))
+              (msg i64 a (sel c"setFillMode:") [(ptr i8)] (ns c"backwards"))
+              0)
+            (msg i64
+                 l
+                 (sel c"addAnimation:forKey:")
+                 [(ptr i8) (ptr i8)]
+                 a
+                 (ns c"workspace-transition"))))
+        (msg i64
+             l
+             (sel c"removeAnimationForKey:")
+             [(ptr i8)]
+             (ns c"workspace-transition")))
+    (commit!)))
 
 ;;; Non-variadic Foundation formatting keeps the Objective-C/C ABI explicit.
-(defn indexed-string [(prefix (ptr i8)) (value i64) (suffix (ptr i8))] (-> (ptr i8))
+(defn indexed-string [(prefix (ptr i8)) (value i64) (suffix (ptr i8))]
+  (-> (ptr i8))
   (msg (ptr i8)
        (msg (ptr i8)
             (ns prefix)

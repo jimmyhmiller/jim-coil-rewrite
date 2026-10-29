@@ -1,181 +1,327 @@
 (module jim.canvas-test)
 (import "jim.canvas-model" :as model)
-(import "jim.native" :use [Point rect])
+(import "jim.native" :use [Point Transform rect])
+(import "jim.canvas" :as canvas)
+(import "jim.workspace" :as workspace)
 
 (defn near? [(a f64) (b f64)] (-> bool)
   (and (< (- a b) 0.00001) (> (- a b) -0.00001)))
 
 (deftest zoom-keeps-the-world-point-under-the-pointer
-         (let [c
-                 (model/Camera
-                   :x 900.0
-                   :y 600.0
-                   :zoom 0.5)
-               pointer (Point :x 320.0 :y 220.0)
-               before (model/screen-to-world c pointer)
-               after
-                 (model/screen-to-world (model/zoom-at c pointer 1.8) pointer)]
-           (assert (near? (.x before) (.x after)))
-           (assert (near? (.y before) (.y after)))))
+  (let [c
+          (model/Camera
+            :x 900.0
+            :y 600.0
+            :zoom 0.5)
+        pointer (Point :x 320.0 :y 220.0)
+        before (model/screen-to-world c pointer)
+        after (model/screen-to-world (model/zoom-at c pointer 1.8) pointer)]
+    (assert (near? (.x before) (.x after)))
+    (assert (near? (.y before) (.y after)))))
 
 (deftest zoom-limits-still-preserve-the-anchor
-         (let [c (model/camera)
-               anchor (Point :x 400.0 :y 300.0)
-               zoomed (model/zoom-at c anchor 1000.0)]
-           (assert (near? (.zoom zoomed) 4.0))
-           (let [world (model/screen-to-world zoomed anchor)]
-             (assert (near? (.x world) 400.0)))))
+  (let [c (model/camera)
+        anchor (Point :x 400.0 :y 300.0)
+        zoomed (model/zoom-at c anchor 1000.0)]
+    (assert (near? (.zoom zoomed) 4.0))
+    (let [world (model/screen-to-world zoomed anchor)]
+      (assert (near? (.x world) 400.0)))))
 
 (deftest origin-inside-viewport-has-no-edge-shading
-         (let [e
-                 (model/edges (model/Camera
-                                :x -100.0
-                                :y -200.0
-                                :zoom 1.0)
-                              800.0
-                              600.0
-                              600.0)]
-           (assert (near? (.left e) 0.0))
-           (assert (near? (.right e) 0.0))
-           (assert (near? (.top e) 0.0))
-           (assert (near? (.bottom e) 0.0))))
+  (let [e
+          (model/edges (model/Camera
+                         :x -100.0
+                         :y -200.0
+                         :zoom 1.0)
+                       800.0
+                       600.0
+                       600.0)]
+    (assert (near? (.left e) 0.0))
+    (assert (near? (.right e) 0.0))
+    (assert (near? (.top e) 0.0))
+    (assert (near? (.bottom e) 0.0))))
 
 (deftest panning-right-and-down-darkens-left-and-top
-         (let [e
-                 (model/edges (model/Camera
-                                :x 300.0
-                                :y 600.0
-                                :zoom 1.0)
-                              800.0
-                              600.0
-                              600.0)]
-           (assert (near? (.left e) 0.5))
-           (assert (near? (.top e) 1.0))
-           (assert (near? (.right e) 0.0))
-           (assert (near? (.bottom e) 0.0))))
+  (let [e
+          (model/edges (model/Camera
+                         :x 300.0
+                         :y 600.0
+                         :zoom 1.0)
+                       800.0
+                       600.0
+                       600.0)]
+    (assert (near? (.left e) 0.5))
+    (assert (near? (.top e) 1.0))
+    (assert (near? (.right e) 0.0))
+    (assert (near? (.bottom e) 0.0))))
 
 (deftest opposite-edges-account-for-viewport-and-zoom
-         (let [e
-                 (model/edges (model/Camera
-                                :x -700.0
-                                :y -500.0
-                                :zoom 2.0)
-                              800.0
-                              600.0
-                              600.0)]
-           (assert (near? (.right e) 0.5))
-           (assert (near? (.bottom e) (/ 200.0 600.0)))
-           (assert (near? (.left e) 0.0))
-           (assert (near? (.top e) 0.0))))
+  (let [e
+          (model/edges (model/Camera
+                         :x -700.0
+                         :y -500.0
+                         :zoom 2.0)
+                       800.0
+                       600.0
+                       600.0)]
+    (assert (near? (.right e) 0.5))
+    (assert (near? (.bottom e) (/ 200.0 600.0)))
+    (assert (near? (.left e) 0.0))
+    (assert (near? (.top e) 0.0))))
 
 (deftest panes-can-be-negative-and-partially-visible
-         (assert (model/visible? (rect -200.0 -100.0 500.0 400.0) 800.0 600.0))
-         (assert (not (model/visible? (rect -900.0 0.0 500.0 400.0) 800.0 600.0)))
-         (let [r
-                 (model/project (model/Camera
-                                  :x -1000.0
-                                  :y -1000.0
-                                  :zoom 0.5)
-                                (rect -800.0 -700.0 640.0 430.0))]
-           (assert (near? (.x r) 100.0))
-           (assert (near? (.y r) 150.0))
-           (assert (near? (.w r) 320.0))))
+  (assert (model/visible? (rect -200.0 -100.0 500.0 400.0) 800.0 600.0))
+  (assert (not (model/visible? (rect -900.0 0.0 500.0 400.0) 800.0 600.0)))
+  (let [r
+          (model/project (model/Camera
+                           :x -1000.0
+                           :y -1000.0
+                           :zoom 0.5)
+                         (rect -800.0 -700.0 640.0 430.0))]
+    (assert (near? (.x r) 100.0))
+    (assert (near? (.y r) 150.0))
+    (assert (near? (.w r) 320.0))))
 
 (deftest jim-wheel-modifiers-have-one-owner
-         (assert (= (model/wheel-route false false true) 0))
-         (assert (= (model/wheel-route false true true) 0))
-         (assert (= (model/wheel-route true false true) 1))
-         (assert (= (model/wheel-route true true true) 2))
-         (assert (= (model/wheel-route true true false) 1)))
+  (assert (= (model/wheel-route false false true) 0))
+  (assert (= (model/wheel-route false true true) 0))
+  (assert (= (model/wheel-route true false true) 1))
+  (assert (= (model/wheel-route true true true) 2))
+  (assert (= (model/wheel-route true true false) 1)))
 
 (deftest jim-wheel-and-pinch-sensitivities
-         (assert (near? (model/wheel-scale true 2.0) 2.0))
-         (assert (near? (model/wheel-scale false 2.0) 16.0))
-         (assert (near? (model/wheel-factor 16.0) 1.08))
-         (assert (near? (model/wheel-factor -16.0) (/ 1.0 1.08)))
-         (assert (near? (model/pinch-factor 0.1) 1.35))
-         (assert (near? (model/pinch-factor -1.0) 0.01)))
+  (assert (near? (model/wheel-scale true 2.0) 2.0))
+  (assert (near? (model/wheel-scale false 2.0) 16.0))
+  (assert (near? (model/wheel-factor 16.0) 1.08))
+  (assert (near? (model/wheel-factor -16.0) (/ 1.0 1.08)))
+  (assert (near? (model/pinch-factor 0.1) 1.35))
+  (assert (near? (model/pinch-factor -1.0) 0.01)))
 
 (deftest jim-top-left-wall-and-drag-reversal
-         (let [c
-                 (model/Camera
-                   :x 5.0
-                   :y 5.0
-                   :zoom 1.0)
-               wall (model/pan-by c 20.0 30.0)
-               back (model/pan-by wall -1.0 -1.0)]
-           (assert (near? (.x wall) 0.0))
-           (assert (near? (.y wall) 0.0))
-           (assert (near? (.x back) 1.0))
-           (assert (near? (.y back) 1.0))))
+  (let [c
+          (model/Camera
+            :x 5.0
+            :y 5.0
+            :zoom 1.0)
+        wall (model/pan-by c 20.0 30.0)
+        back (model/pan-by wall -1.0 -1.0)]
+    (assert (near? (.x wall) 0.0))
+    (assert (near? (.y wall) 0.0))
+    (assert (near? (.x back) 1.0))
+    (assert (near? (.y back) 1.0))))
 
 (deftest jim-reset-zoom-preserves-pan
-         (let [reset
-                 (model/reset-zoom (model/Camera
-                                     :x 812.0
-                                     :y 490.0
-                                     :zoom 0.4))]
-           (assert (near? (.x reset) 812.0))
-           (assert (near? (.y reset) 490.0))
-           (assert (near? (.zoom reset) 1.0))))
+  (let [reset
+          (model/reset-zoom (model/Camera
+                              :x 812.0
+                              :y 490.0
+                              :zoom 0.4))]
+    (assert (near? (.x reset) 812.0))
+    (assert (near? (.y reset) 490.0))
+    (assert (near? (.zoom reset) 1.0))))
 
 (deftest jim-double-click-uses-24-point-margin-and-native-zoom
-         (let [jump (model/jump-to-pane (rect 824.0 424.0 640.0 430.0))]
-           (assert (near? (.x jump) 800.0))
-           (assert (near? (.y jump) 400.0))
-           (assert (near? (.zoom jump) 1.0))))
+  (let [jump (model/jump-to-pane (rect 824.0 424.0 640.0 430.0))]
+    (assert (near? (.x jump) 800.0))
+    (assert (near? (.y jump) 400.0))
+    (assert (near? (.zoom jump) 1.0))))
 
 (deftest jim-zoom-out-clamps-at-the-origin-and-at-point-two
-         (let [c (model/zoom-at (model/camera) (Point :x 400.0 :y 300.0) 0.001)]
-           (assert (near? (.x c) 0.0))
-           (assert (near? (.y c) 0.0))
-           (assert (near? (.zoom c) 0.2))))
+  (let [c (model/zoom-at (model/camera) (Point :x 400.0 :y 300.0) 0.001)]
+    (assert (near? (.x c) 0.0))
+    (assert (near? (.y c) 0.0))
+    (assert (near? (.zoom c) 0.2))))
 
 (deftest held-pane-follows-command-scroll-with-stationary-pointer
-         (let [camera
-                 (model/Camera
-                   :x 100.0
-                   :y 200.0
-                   :zoom 0.5)
-               pointer (Point :x 80.0 :y 30.0)
-               start (model/screen-to-world camera pointer)
-               bounds (rect 240.0 240.0 640.0 430.0)
-               before (model/project camera bounds)
-               panned (model/pan-by camera -120.0 -60.0)
-               moved (model/dragged-bounds panned start pointer bounds false)
-               after (model/project panned moved)]
-           (assert (near? (.x before) (.x after)))
-           (assert (near? (.y before) (.y after)))
-           (assert (near? (.x moved) 480.0))
-           (assert (near? (.y moved) 360.0))))
+  (let [camera
+          (model/Camera
+            :x 100.0
+            :y 200.0
+            :zoom 0.5)
+        pointer (Point :x 80.0 :y 30.0)
+        start (model/screen-to-world camera pointer)
+        bounds (rect 240.0 240.0 640.0 430.0)
+        before (model/project camera bounds)
+        panned (model/pan-by camera -120.0 -60.0)
+        moved (model/dragged-bounds panned start pointer bounds 0)
+        after (model/project panned moved)]
+    (assert (near? (.x before) (.x after)))
+    (assert (near? (.y before) (.y after)))
+    (assert (near? (.x moved) 480.0))
+    (assert (near? (.y moved) 360.0))))
 
 (deftest held-pane-uses-current-camera-after-pan-and-pointer-motion
-         (let [camera
-                 (model/Camera
-                   :x 300.0
-                   :y 200.0
-                   :zoom 2.0)
-               start (Point :x 50.0 :y 60.0)
-               bounds (rect 30.0 50.0 640.0 430.0)
-               pointer (Point :x 100.0 :y 80.0)
-               moved (model/dragged-bounds camera start pointer bounds false)
-               screen (model/project camera moved)]
-           (assert (near? (+ (.x screen) 40.0) (.x pointer)))
-           (assert (near? (+ (.y screen) 20.0) (.y pointer)))))
+  (let [camera
+          (model/Camera
+            :x 300.0
+            :y 200.0
+            :zoom 2.0)
+        start (Point :x 50.0 :y 60.0)
+        bounds (rect 30.0 50.0 640.0 430.0)
+        pointer (Point :x 100.0 :y 80.0)
+        moved (model/dragged-bounds camera start pointer bounds 0)
+        screen (model/project camera moved)]
+    (assert (near? (+ (.x screen) 40.0) (.x pointer)))
+    (assert (near? (+ (.y screen) 20.0) (.y pointer)))))
+
+(deftest dragged-panes-stay-where-the-camera-can-reach
+  (let [camera
+          (model/Camera
+            :x 0.0
+            :y 0.0
+            :zoom 1.0)
+        moved
+          (model/dragged-bounds camera
+                                (Point :x 100.0 :y 100.0)
+                                (Point :x 10.0 :y 20.0)
+                                (rect 40.0 50.0 640.0 430.0)
+                                0)]
+    (assert (near? (.x moved) 0.0))
+    (assert (near? (.y moved) 0.0))
+    (assert (near? (.w moved) 640.0))
+    (let [kept (model/reachable (rect 331.0 -50.0 396.0 216.0))]
+      (assert (near? (.x kept) 331.0))
+      (assert (near? (.y kept) 0.0)))))
 
 (deftest resize-follows-camera-without-moving-opposite-corner
-         (let [camera
-                 (model/Camera
-                   :x 100.0
-                   :y 200.0
-                   :zoom 1.0)
-               resized
-                 (model/dragged-bounds camera
-                                       (Point :x 650.0 :y 450.0)
-                                       (Point :x 650.0 :y 450.0)
-                                       (rect 10.0 20.0 640.0 430.0)
-                                       true)]
-           (assert (near? (.x resized) 10.0))
-           (assert (near? (.y resized) 20.0))
-           (assert (near? (.w resized) 740.0))
-           (assert (near? (.h resized) 630.0))))
+  (let [camera
+          (model/Camera
+            :x 100.0
+            :y 200.0
+            :zoom 1.0)
+        resized
+          (model/dragged-bounds camera
+                                (Point :x 650.0 :y 450.0)
+                                (Point :x 650.0 :y 450.0)
+                                (rect 10.0 20.0 640.0 430.0)
+                                (+ model/EDGE-BOTTOM model/EDGE-RIGHT))]
+    (assert (near? (.x resized) 10.0))
+    (assert (near? (.y resized) 20.0))
+    (assert (near? (.w resized) 740.0))
+    (assert (near? (.h resized) 630.0))))
+
+(deftest edges-are-found-in-a-band-along-each-side
+  (assert (= (model/edges-at 640.0 430.0 320.0 3.0 6.0) model/EDGE-TOP))
+  (assert (= (model/edges-at 640.0 430.0 320.0 427.0 6.0) model/EDGE-BOTTOM))
+  (assert (= (model/edges-at 640.0 430.0 2.0 200.0 6.0) model/EDGE-LEFT))
+  (assert (= (model/edges-at 640.0 430.0 636.0 200.0 6.0) model/EDGE-RIGHT))
+  (assert (= (model/edges-at 640.0 430.0 2.0 2.0 6.0)
+             (+ model/EDGE-TOP model/EDGE-LEFT)))
+  (assert (= (model/edges-at 640.0 430.0 320.0 200.0 6.0) 0)))
+
+(deftest top-left-resize-keeps-the-bottom-right-corner
+  (let [camera
+          (model/Camera
+            :x 0.0
+            :y 0.0
+            :zoom 1.0)
+        bounds (rect 200.0 100.0 640.0 430.0)
+        grow
+          (model/dragged-bounds camera
+                                (Point :x 200.0 :y 100.0)
+                                (Point :x 150.0 :y 60.0)
+                                bounds
+                                (+ model/EDGE-TOP model/EDGE-LEFT))]
+    (assert (near? (.x grow) 150.0))
+    (assert (near? (.y grow) 60.0))
+    (assert (near? (+ (.x grow) (.w grow)) 840.0))
+    (assert (near? (+ (.y grow) (.h grow)) 530.0))
+    ; Shrinking stops at the minimum size without moving the far corner.
+    (let [shrink
+            (model/dragged-bounds camera
+                                  (Point :x 200.0 :y 100.0)
+                                  (Point :x 1000.0 :y 1000.0)
+                                  bounds
+                                  (+ model/EDGE-TOP model/EDGE-LEFT))]
+      (assert (near? (.w shrink) 320.0))
+      (assert (near? (.h shrink) 180.0))
+      (assert (near? (+ (.x shrink) (.w shrink)) 840.0))
+      (assert (near? (+ (.y shrink) (.h shrink)) 530.0)))
+    ; Growing past the world origin stops there, as dragging does.
+    (let [past
+            (model/dragged-bounds camera
+                                  (Point :x 200.0 :y 100.0)
+                                  (Point :x -100.0 :y -100.0)
+                                  bounds
+                                  model/EDGE-LEFT)]
+      (assert (near? (.x past) 0.0))
+      (assert (near? (.w past) 840.0))
+      (assert (near? (.y past) 100.0))
+      (assert (near? (.h past) 430.0)))))
+
+;;; Where a point of a layer at POSITION lands under its transform T.
+(defn carried [(t Transform) (position Point) (x f64) (y f64)] (-> Point)
+  (let [moved
+          (workspace/apply t
+                           (workspace/Vec3
+                             :x (- x (.x position))
+                             :y (- y (.y position))
+                             :z 0.0))]
+    (Point :x (+ (.x position) (.x moved)) :y (+ (.y position) (.y moved)))))
+
+(deftest panes-are-carried-onto-their-fitted-rect
+  (let [frame (rect 10.0 20.0 100.0 50.0)
+        target (rect 300.0 200.0 50.0 25.0)]
+    ; Whether the layer is positioned by its corner or by its center.
+    (for position [(Point :x 10.0 :y 20.0) (Point :x 60.0 :y 45.0)]
+      (let [t (canvas/carry frame position target 12.0)
+            low (carried t position 10.0 20.0)
+            high (carried t position 110.0 70.0)]
+        (assert (near? (.x low) 300.0))
+        (assert (near? (.y low) 200.0))
+        (assert (near? (.x high) 350.0))
+        (assert (near? (.y high) 225.0))))))
+
+(deftest expose-grids-follow-the-region
+  (let [square (model/expose-grid 4 800.0 800.0)
+        wide (model/expose-grid 4 1600.0 400.0)
+        one (model/expose-grid 1 800.0 600.0)
+        odd (model/expose-grid 5 800.0 600.0)]
+    (assert (= (.cols square) 2))
+    (assert (= (.rows square) 2))
+    (assert (= (.cols wide) 4))
+    (assert (= (.rows wide) 1))
+    (assert (= (.cols one) 1))
+    (assert (= (.rows one) 1))
+    (assert (>= (* (.cols odd) (.rows odd)) 5))))
+
+(deftest expose-places-panes-where-they-lie
+  (let [grid (model/Grid :cols 2 :rows 2)
+        (mut cells)
+          (model/expose-cells [(Point :x 900.0 :y 700.0)
+                               (Point :x 100.0 :y 80.0)
+                               (Point :x 880.0 :y 90.0)
+                               (Point :x 120.0 :y 650.0)]
+                              grid)]
+    (assert (= (get cells 0) 3))
+    (assert (= (get cells 1) 0))
+    (assert (= (get cells 2) 1))
+    (assert (= (get cells 3) 2))
+    (free! (mut cells))))
+
+(deftest expose-moves-a-crowded-pane-to-the-nearest-free-cell
+  (let [grid (model/Grid :cols 2 :rows 2)
+        (mut cells)
+          (model/expose-cells [(Point :x 0.0 :y 0.0)
+                               (Point :x 1.0 :y 1.0)
+                               (Point :x 0.5 :y 0.5)
+                               (Point :x 1000.0 :y 1000.0)]
+                              grid)]
+    ; Every pane gets a cell of its own.
+    (for [i 0 4]
+      (for [j 0 4]
+        (when (!= i j) (assert (!= (get cells i) (get cells j))))))
+    (assert (= (get cells 3) 3))
+    (free! (mut cells))))
+
+(deftest expose-thumbnails-fit-their-cells-and-never-grow
+  (let [grid (model/Grid :cols 2 :rows 1)
+        region (rect 0.0 0.0 1000.0 500.0)
+        big (model/expose-slot grid region 1 2000.0 1000.0)
+        small (model/expose-slot grid region 0 100.0 50.0)]
+    (assert (<= (.w big) (* 500.0 (- 1.0 model/EXPOSE-GUTTER))))
+    (assert (near? (/ (.w big) (.h big)) 2.0))
+    (assert (near? (+ (.x big) (* 0.5 (.w big))) 750.0))
+    (assert (near? (+ (.y big) (* 0.5 (.h big))) 250.0))
+    (assert (near? (.w small) 100.0))
+    (assert (near? (.x small) 200.0))))

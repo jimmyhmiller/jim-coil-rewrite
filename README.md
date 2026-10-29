@@ -45,17 +45,43 @@ Canvas controls follow the original Jim handler:
 | ⌘⇧Z | Toggle zoom |
 | Double-click a pane away from 1× | Jump to 1× with a 24-point margin |
 | Drag pane header | Move pane |
-| Drag bottom-right grip | Resize pane |
+| Drag any pane edge or corner | Resize pane |
 | ⌘T / ⌘N / New terminal | Add a terminal pane |
 | ⌘⇧P | Search actions; arrows or pointer select, Return or click runs |
 | ⌘W / pane × | Close focused / selected pane |
 | ⌘1–4 | Switch among the first four visible projects |
-| ⌘⇧\ / All workspaces | Toggle cube; drag rotates, arrows select, Return enters |
+| ⌘⇧\ / All workspaces | Toggle cube; drag spins, scroll zooms, click or Return enters, Esc returns |
+| ⌘⇧E | Toggle Exposé; click a pane to focus it, Esc returns |
 
 Default empty-canvas left drag does not pan, matching Jim. Zoom spans 0.2×–4×.
 Pan stops at the top-left origin; the canvas extends to the right and down.
 Directional edge shading points back toward the origin as it leaves the viewport.
 The Fit all panes button is an additional way to find the project's panes.
+
+**The cube.** ⌘⇧\ pulls back from the project into a ring with one face per
+visible project, after Jim's Compiz-style cube (`jim-app/src/cube.rs`): the
+camera stands back and above the ring, under a night sky with twinkling stars,
+and the ring is reflected in the floor. Each face shows its project's whole
+layout scaled to fit, its panes floating off the face. A drag throws the ring,
+which coasts to a stop; scrolling moves the camera in and out; clicking a face
+dives into it. Every face is drawn, turned away or not; depth decides what
+shows. The sky and floor are views beside the cube's stage rather than
+inside it: Core Animation depth-tests layers under one perspective, and an
+opaque sky at depth 0 would hide the ring behind it.
+
+**Exposé.** ⌘⇧E spreads every pane of the project into a grid, after Jim's
+(`jim-app/src/expose.rs`): each goes to the cell nearest where it lies, shrunk
+to fit and never resized, so terminals and widgets keep their layout. Hovering
+lifts a pane; clicking it, Esc or ⌘⇧E brings the panes home, and a clicked pane
+is focused and raised. The camera moves only when that pane would be entirely
+out of view at home. Nothing is saved from the grid.
+
+Both the cube and Exposé move panes by their frames and animate the move with
+the layer transform. AppKit draws no view whose frame lies outside the window,
+so a pane only carried into view by its transform would show up blank. A
+zoomed pane's layer is as big as its bounds and AppKit scales it onto the
+frame with the layer's transform, so every transform the canvas sets starts
+from that scale.
 
 Edit and save `config/shell.coil` to hot-load theme/configuration values. ⌘R forces
 a reload. Invalid builds preserve the last good configuration and live terminals.
@@ -153,10 +179,27 @@ after staging or committing, and diff sends `review.changed` after editing a
 review thread. The kit's `live/Refresher` coalesces notices so a widget
 refreshes at most every 500 ms and never while a refresh is still running.
 
-**Persistence.** A widget's `save` writes named values into a `Snapshot`. Jim
-uses it both across reloads and across app restarts: the layout file stores each
-widget pane's spec and its saved state, and on relaunch the widget boots from
-that state.
+**Persistence.** A widget keeps what should survive in a `State` struct that
+derives `coil.serde`'s `Serialize` and `Deserialize`:
+
+```coil
+(defstruct State [(file i64) (message (ArrayList u8))])
+
+(derive (Serialize (field message (with text-ser text-de)))
+        (Deserialize (field message (with text-ser text-de)))
+        State)
+```
+
+`save` calls `(save-state! s (.state self))`, which stores the state as one JSON
+entry in the `Snapshot`. `boot` matches `(load-state [State] saved)`: `Fresh` on
+a first boot, `Loaded` with the decoded state, or `Refused`. A field the saved
+JSON lacks takes its `(default …)` option, and saved fields the struct no longer
+has are skipped. If a new field has no default, the reload is refused: the
+previous version keeps running and the pane names the missing field. The
+`text-ser`/`text-de` hooks store an owned `(ArrayList u8)` as a JSON string. Jim
+uses the snapshot both across reloads and across app restarts: the layout file
+stores each widget pane's spec and its saved state, and on relaunch the widget
+boots from that state.
 
 Editing `src/widget_api.coil` requires rebuilding Jim, and widgets refuse to
 load until then.

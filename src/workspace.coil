@@ -1,6 +1,7 @@
 (module jim.workspace)
 (import "jim.native" :use *)
 (import "coil.primitive" :as p)
+(import "coil.math" :use [Float])
 
 ;;; Geometry is shared by flat and overview layouts. Workspaces retain their
 ;;; native views and GPU surfaces; only their layer transforms change.
@@ -8,25 +9,120 @@
   (if (<= count 0) 0 (% (+ (% index count) count) count)))
 
 (defn face-angle [(index i64) (count i64)] (-> f64)
-  (/ (* (p/cast f64 index) 6.283185307179586) (p/cast f64 count)))
+  (if (<= count 0)
+      0.0
+      (/ (* (p/cast f64 index) 6.283185307179586) (p/cast f64 count))))
 
-(defn face-transform [(index i64) (count i64) (width f64)] (-> Transform)
-  (CATransform3DRotate (CATransform3DMakeTranslation 0.0 0.0 0.0)
-                       (face-angle index count)
-                       0.0
-                       1.0
-                       0.0))
+;;; How far each face of WIDTH sits from the cube's axis: the apothem of a
+;;; regular COUNT-gon, so neighboring faces meet at their edges instead of
+;;; cutting through each other. One or two faces stand back to back.
+(defn face-radius [(count i64) (width f64)] (-> f64)
+  (if (< count 3)
+      (* width 0.5)
+      (/ (* width 0.5) (tan (/ 3.141592653589793 (p/cast f64 count))))))
+
+;;; How far each face's outer edges are from the axis: the ring's reach.
+(defn face-reach [(count i64) (width f64)] (-> f64)
+  (if (< count 3)
+      (* width 0.5)
+      (/ (* width 0.5) (sin (/ 3.141592653589793 (p/cast f64 count))))))
+
+;;; ---- the camera ---------------------------------------------------------------
+;;; Jim's cube camera, in points with H the face height. FOCAL ×H is the
+;;; camera distance at which a face exactly fills the window (a 45° vertical
+;;; field); the overview stands PULLBACK ×H farther back and LIFT ×H higher,
+;;; still aimed at the ring's axis. The floor lies along the faces' bottom
+;;; edges and reaches FLOOR-REACH ×H beyond the axis.
+(const FOCAL 1.2071)
+
+(const PULLBACK 0.9)
+
+(const LIFT 0.16)
+
+(const FLOOR-REACH 10.0)
+
+;;; Where the camera stands: SHIFT points sideways (the sidebar offset of the
+;;; flat view), LIFT points up, DISTANCE from the ring's axis; the ring turned
+;;; by YAW; FOCAL the perspective distance.
+(defstruct View
+  [(shift f64) (lift f64) (distance f64) (yaw f64) (focal f64)])
+
+;;; The ring's transform as seen from VIEW: world points (the ring's axis at
+;;; the origin, y up) to the stage, whose perspective puts the eye at FOCAL.
+(defn camera-transform [(v View)] (-> Transform)
+  (let [pitch (atan2 (.lift v) (.distance v))
+        placed (CATransform3DMakeTranslation (.shift v) 0.0 (.focal v))
+        tilted (CATransform3DRotate placed pitch 1.0 0.0 0.0)
+        moved
+          (CATransform3DTranslate tilted
+                                  0.0
+                                  (- 0.0 (.lift v))
+                                  (- 0.0 (.distance v)))]
+    (CATransform3DRotate moved (.yaw v) 0.0 1.0 0.0)))
+
+;;; Face INDEX of COUNT around the ring, RADIUS (face-radius) from the axis.
+(defn face-placement [(index i64) (count i64) (radius f64)] (-> Transform)
+  (CATransform3DTranslate (CATransform3DRotate (CATransform3DMakeTranslation 0.0
+                                                                             0.0
+                                                                             0.0)
+                                               (face-angle index count)
+                                               0.0
+                                               1.0
+                                               0.0)
+                          0.0
+                          0.0
+                          radius))
+
+;;; The yaw that turns face INDEX of COUNT to face the camera.
+(defn facing-yaw [(index i64) (count i64)] (-> f64)
+  (- 0.0 (face-angle index count)))
+
+;;; The reflection's transform: what CAMERA (a camera-transform) shows,
+;;; mirrored across the floor at FLOOR-Y in the world. It acts after CAMERA,
+;;; so it undoes the camera, mirrors, and applies the camera again.
+(defn mirror-transform [(camera Transform) (floor-y f64)] (-> Transform)
+  (let [mirror
+          (CATransform3DScale (CATransform3DMakeTranslation 0.0
+                                                            (* 2.0 floor-y)
+                                                            0.0)
+                              1.0
+                              -1.0
+                              1.0)]
+    (CATransform3DConcat (CATransform3DConcat (CATransform3DInvert camera)
+                                              mirror)
+                         camera)))
+
+(defstruct Vec3 [(x f64) (y f64) (z f64)])
+
+;;; P through T, in Core Animation's row-vector convention. T has no
+;;; perspective of its own.
+(defn apply [(t Transform) (p Vec3)] (-> Vec3)
+  (Vec3
+    :x (+ (* (.x p) (.m11 t)) (* (.y p) (.m21 t)) (* (.z p) (.m31 t)) (.m41 t))
+    :y (+ (* (.x p) (.m12 t)) (* (.y p) (.m22 t)) (* (.z p) (.m32 t)) (.m42 t))
+    :z (+ (* (.x p) (.m13 t)) (* (.y p) (.m23 t)) (* (.z p) (.m33 t)) (.m43 t))))
+
+;;; Where stage point P lands on screen, from the stage's center (y up), under
+;;; the stage's perspective with the eye at FOCAL.
+(defn on-screen [(p Vec3) (focal f64)] (-> Point)
+  (let [scale (/ focal (- focal (.z p)))]
+    (Point :x (* (.x p) scale) :y (* (.y p) scale))))
+
+;;; Which side of the line from U to V the point PT is on: positive left of it.
+(defn side [(pt Point) (u Point) (v Point)] (-> f64)
+  (- (* (- (.x v) (.x u)) (- (.y pt) (.y u)))
+     (* (- (.y v) (.y u)) (- (.x pt) (.x u)))))
+
+;;; Whether PT lies inside the convex quad A B C D (either winding).
+(defn quad-contains? [(pt Point) (a Point) (b Point) (c Point) (d Point)]
+  (-> bool)
+  (let [ab (side pt a b)
+        bc (side pt b c)
+        cd (side pt c d)
+        da (side pt d a)]
+    (or (and (>= ab 0.0) (>= bc 0.0) (>= cd 0.0) (>= da 0.0))
+        (and (<= ab 0.0) (<= bc 0.0) (<= cd 0.0) (<= da 0.0)))))
 
 (defn perspective [(distance f64)] (-> Transform)
   (let [(mut t) (CATransform3DMakeTranslation 0.0 0.0 0.0)]
     (do (set! (.m34 t) (/ -1.0 distance)) (load t))))
-
-(defn root-transform [(angle f64) (overview bool) (width f64)] (-> Transform)
-  (let [base
-          (CATransform3DMakeTranslation 0.0
-                                        0.0
-                                        (if overview
-                                            (* width -1.25)
-                                            (* width -0.5)))
-        turned (CATransform3DRotate base angle 0.0 1.0 0.0)]
-    (if overview (CATransform3DRotate turned -0.13 1.0 0.0 0.0) turned)))

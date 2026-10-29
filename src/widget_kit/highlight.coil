@@ -2,7 +2,6 @@
 (import "coil.primitive" :as p)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-eq])
 (import "jim.widget-kit.text" :as text)
 
 ;;; A small lexical highlighter: comments, strings, numbers, keywords, types,
@@ -470,10 +469,10 @@
     (let [count (len (load out))]
       ; Merge with the previous run of the same kind on this line.
       (if (and (> count floor)
-               (let [last (al-elem out (- count 1))]
+               (let [last (elem out (- count 1))]
                  (and (= (.kind last) kind)
                       (= (+ (.at last) (.len last)) (+ base at)))))
-          (let [last (al-elem out (- count 1))]
+          (let [last (elem out (- count 1))]
             (set! (.len last) (+ (.len last) n))
             0)
           (do

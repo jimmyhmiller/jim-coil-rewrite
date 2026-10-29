@@ -19,7 +19,7 @@
 
 (defn kind? [(value (ptr i8)) (name (ptr i8))] (-> bool)
   (!= (msg i8 value (sel c"isKindOfClass:") [(ptr i8)] (class name))
-      (p/cast i8 0)))
+      (: 0 i8)))
 
 (defn get [(dict (ptr i8)) (key (ptr i8))] (-> (ptr i8))
   (if (kind? dict c"NSDictionary")
@@ -63,7 +63,7 @@
                      (sel c"fileExistsAtPath:")
                      [(ptr i8)]
                      (path))
-                (p/cast i8 0))
+                (: 0 i8))
             (dictionary)
             (nil))
         (let [result
@@ -95,7 +95,7 @@
            (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
            [(ptr i8) i8 (ptr i8) (ptr i8)]
            (msg (ptr i8) file (sel c"stringByDeletingLastPathComponent") [])
-           (p/cast i8 1)
+           (: 1 i8)
            (nil)
            (nil))
       (!= (msg i8
@@ -103,5 +103,5 @@
                (sel c"writeToFile:atomically:")
                [(ptr i8) i8]
                file
-               (p/cast i8 1))
-          (p/cast i8 0)))))
+               (: 1 i8))
+          (: 0 i8)))))

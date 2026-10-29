@@ -55,28 +55,28 @@
 (defn model-new [] (-> Model)
   (let [a (alloc/malloc-allocator)]
     (Model
-      :text (al-new [u8] a)
-      :lines (al-new [Line] a)
-      :hunks (al-new [Hunk] a)
-      :files (al-new [File] a)
-      :runs (al-new [hl/Run] a)
+      :text (ArrayList::new [u8] a)
+      :lines (ArrayList::new [Line] a)
+      :hunks (ArrayList::new [Hunk] a)
+      :files (ArrayList::new [File] a)
+      :runs (ArrayList::new [hl/Run] a)
       :old-no 0
       :new-no 0)))
 
 (defn clear! [(m (ptr Model))] (-> void)
-  (al-clear! (mut (.text m)))
-  (al-clear! (mut (.lines m)))
-  (al-clear! (mut (.hunks m)))
-  (al-clear! (mut (.files m)))
-  (al-clear! (mut (.runs m)))
+  (ArrayList::clear! (mut (.text m)))
+  (ArrayList::clear! (mut (.lines m)))
+  (ArrayList::clear! (mut (.hunks m)))
+  (ArrayList::clear! (mut (.files m)))
+  (ArrayList::clear! (mut (.runs m)))
   (do))
 
 (defn free! [(m (ptr Model))] (-> void)
-  (al-free! (mut (.text m)))
-  (al-free! (mut (.lines m)))
-  (al-free! (mut (.hunks m)))
-  (al-free! (mut (.files m)))
-  (al-free! (mut (.runs m)))
+  (ArrayList::free! (mut (.text m)))
+  (ArrayList::free! (mut (.lines m)))
+  (ArrayList::free! (mut (.hunks m)))
+  (ArrayList::free! (mut (.files m)))
+  (ArrayList::free! (mut (.runs m)))
   (do))
 
 (defn keep! [(m (ptr Model)) (s (slice u8))] (-> i64)
@@ -85,19 +85,19 @@
     at))
 
 (defn text-at [(m (ptr Model)) (at i64) (n i64)] (-> (slice u8))
-  (subslice (al-slice (.text m)) at (+ at n)))
+  (subslice (slice (.text m)) at (+ at n)))
 
 (defn file-count [(m (ptr Model))] (-> i64)
   (len (.files m)))
 
 (defn file [(m (ptr Model)) (i i64)] (-> (ptr File))
-  (al-elem (field m files) i))
+  (elem (field m files) i))
 
 (defn line [(m (ptr Model)) (i i64)] (-> (ptr Line))
-  (al-elem (field m lines) i))
+  (elem (field m lines) i))
 
 (defn hunk [(m (ptr Model)) (i i64)] (-> (ptr Hunk))
-  (al-elem (field m hunks) i))
+  (elem (field m hunks) i))
 
 (defn line-text [(m (ptr Model)) (l (ptr Line))] (-> (slice u8))
   (text-at m (.at l) (.len l)))
@@ -244,12 +244,13 @@
 (defn hunk-starts [(header (slice u8))] (-> Pair)
   (let [minus (text/index-of header "-")
         plus (text/index-of header "+")]
-    (Pair :a (if (>= minus 0) (first-number (text/from header (+ minus 1))) 1)
+    (Pair
+      :a (if (>= minus 0) (first-number (text/from header (+ minus 1))) 1)
       :b (if (>= plus 0) (first-number (text/from header (+ plus 1))) 1))))
 
 ;;; Parse RAW, the output of `git diff`, `gh pr diff`, `diff -u` …, into M.
 (defn parse-unified! [(m (ptr Model)) (raw (slice u8))] (-> void)
-  (let [(mut spans) (al-new [text/Span] (alloc/malloc-allocator))
+  (let [(mut spans) (ArrayList::new [text/Span] (alloc/malloc-allocator))
         (mut have) false
         (mut in-hunk) false
         (mut i) 0]
@@ -353,7 +354,7 @@
                       (set! (.change-len f) 7))
                     0)
                   (set! i (+ (load i) 1))))))
-    (al-free! (mut spans))
+    (ArrayList::free! (mut spans))
     (do)))
 
 ;;; ---- highlighting ------------------------------------------------------------
@@ -374,9 +375,10 @@
                 (hl/line! (mut new-lx) (line-text m l) (.at l) (field m runs)))
             ; Context lines advance the old side's comment state too.
             (when (= tag CONTEXT)
-              (let [(mut scratch) (al-new [hl/Run] (alloc/malloc-allocator))]
+              (let [(mut scratch)
+                      (ArrayList::new [hl/Run] (alloc/malloc-allocator))]
                 (hl/line! (mut old-lx) (line-text m l) 0 (mut scratch))
-                (al-free! (mut scratch)))
+                (ArrayList::free! (mut scratch)))
               0)
             (set! (.runs-at l) start)
             (set! (.runs-len l) (- (len (.runs m)) start)))

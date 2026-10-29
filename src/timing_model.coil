@@ -26,7 +26,7 @@
 
 (defn push! [(h (ptr History)) (s Sample)] (-> void)
   (do
-    (set! (p/index (field h samples) (.next h)) s)
+    (set! (index (field h samples) (.next h)) s)
     (set! (.next h) (% (+ (.next h) 1) 120))
     (if (< (.count h) 120) (set! (.count h) (+ (.count h) 1)) 0)
     (do)))
@@ -42,7 +42,7 @@
         (mut overlay) 0.0]
     (do
       (for [i 0 (.count h)]
-        (let [s (load (p/index (field h samples) i))
+        (let [s (load (index (field h samples) i))
               (mut at) i]
           (do
             (set! sum (+ (load sum) (.interval s)))
@@ -55,23 +55,23 @@
             (set! ghostty (+ (load ghostty) (.ghostty s)))
             (set! overlay (+ (load overlay) (.overlay s)))
             (while (and (> (load at) 0)
-                        (> (load (p/index sorted (- (load at) 1)))
+                        (> (load (index sorted (- (load at) 1)))
                            (.interval s)))
               (do
-                (set! (p/index sorted (load at))
-                      (load (p/index sorted (- (load at) 1))))
+                (set! (index sorted (load at))
+                      (load (index sorted (- (load at) 1))))
                 (set! at (- (load at) 1))))
-            (set! (p/index sorted (load at)) (.interval s)))))
+            (set! (index sorted (load at)) (.interval s)))))
       (let [n (p/cast f64 (if (> (.count h) 0) (.count h) 1))]
         (Summary
           :hz (if (> (load sum) 0.0) (/ (* n 1000.0) (load sum)) 0.0)
           :mean (/ (load sum) n)
           :p95
             (if (> (.count h) 0)
-                (load (p/index sorted (- (/ (+ (* (.count h) 95) 99) 100) 1)))
+                (load (index sorted (- (/ (+ (* (.count h) 95) 99) 100) 1)))
                 0.0)
           :maximum
-            (if (> (.count h) 0) (load (p/index sorted (- (.count h) 1))) 0.0)
+            (if (> (.count h) 0) (load (index sorted (- (.count h) 1))) 0.0)
           :late (load late)
           :input (/ (load input) n)
           :maintenance (/ (load maintenance) n)

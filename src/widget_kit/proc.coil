@@ -1,5 +1,4 @@
 (module jim.widget-kit.proc)
-(import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -28,7 +27,7 @@
   (Job
     :host host
     :handle 0
-    :output (al-new [u8] (alloc/malloc-allocator))
+    :output (ArrayList::new [u8] (alloc/malloc-allocator))
     :state IDLE
     :code 0
     :tag 0))
@@ -40,7 +39,7 @@
   (= (.state j) DONE))
 
 (defn output [(j (ptr Job))] (-> (slice u8))
-  (al-slice (.output j)))
+  (slice (.output j)))
 
 ;;; Run ARGV (program first, found on PATH) in directory CWD. TAG is yours,
 ;;; e.g. which request this job answers. A job still running is stopped first.
@@ -49,7 +48,7 @@
               (cwd (slice u8))
               (tag i64)] (-> void)
   (when (running? j) (api/release (.host j) (.handle j)) 0)
-  (al-clear! (mut (.output j)))
+  (clear! (mut (.output j)))
   (set! (.tag j) tag)
   (set! (.code j) 0)
   (set! (.handle j) (api/spawn (.host j) argv cwd))
@@ -73,7 +72,7 @@
 ;;; Forget a finished job's output so it can be reused.
 (defn reset! [(j (ptr Job))] (-> void)
   (when (not (running? j))
-    (al-clear! (mut (.output j)))
+    (clear! (mut (.output j)))
     (set! (.state j) IDLE)
     0)
   (do))
@@ -84,5 +83,5 @@
     (api/release (.host j) (.handle j))
     (set! (.state j) IDLE)
     0)
-  (al-free! (mut (.output j)))
+  (ArrayList::free! (mut (.output j)))
   (do))

@@ -1,4 +1,5 @@
 (module jim.processes)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
@@ -14,35 +15,35 @@
 ;;; git), and fork is worse: it copies the page tables of all of Jim. Reading
 ;;; output and reaping are non-blocking and happen when a widget polls, on the
 ;;; main thread.
-(extern posix_spawn_file_actions_init :cc c [(ptr (ptr i8))] (-> i32))
+(extern posix_spawn_file_actions_init :cc (cc/C) [(ptr (ptr i8))] (-> i32))
 
-(extern posix_spawn_file_actions_destroy :cc c [(ptr (ptr i8))] (-> i32))
+(extern posix_spawn_file_actions_destroy :cc (cc/C) [(ptr (ptr i8))] (-> i32))
 
 (extern posix_spawn_file_actions_adddup2
         :cc
-        c
+        (cc/C)
         [(ptr (ptr i8)) i32 i32]
         (-> i32))
 
 (extern posix_spawn_file_actions_addopen
         :cc
-        c
+        (cc/C)
         [(ptr (ptr i8)) i32 (ptr i8) i32 u16]
         (-> i32))
 
 (extern posix_spawn_file_actions_addchdir_np
         :cc
-        c
+        (cc/C)
         [(ptr (ptr i8)) (ptr i8)]
         (-> i32))
 
-(extern posix_spawnattr_init :cc c [(ptr (ptr i8))] (-> i32))
+(extern posix_spawnattr_init :cc (cc/C) [(ptr (ptr i8))] (-> i32))
 
-(extern posix_spawnattr_destroy :cc c [(ptr (ptr i8))] (-> i32))
+(extern posix_spawnattr_destroy :cc (cc/C) [(ptr (ptr i8))] (-> i32))
 
-(extern posix_spawnattr_setflags :cc c [(ptr (ptr i8)) i16] (-> i32))
+(extern posix_spawnattr_setflags :cc (cc/C) [(ptr (ptr i8)) i16] (-> i32))
 
-(extern _NSGetEnviron :cc c [] (-> (ptr (ptr (ptr i8)))))
+(extern _NSGetEnviron :cc (cc/C) [] (-> (ptr (ptr (ptr i8)))))
 
 (const F-GETFL 3)
 
@@ -88,96 +89,98 @@
   (p/alloc-static Launcher))
 
 (defn lock! [(l (ptr Launcher))] (-> void)
-  (try (let [_ (try-or! (sync/mutex-lock! (field l lock)) 0)] 0))
+  (try (let [_ (try-or! (sync/Mutex::lock! (field l lock)) 0)] 0))
   (do))
 
 (defn unlock! [(l (ptr Launcher))] (-> void)
-  (try (let [_ (try-or! (sync/mutex-unlock! (field l lock)) 0)] 0))
+  (try (let [_ (try-or! (sync/Mutex::unlock! (field l lock)) 0)] 0))
   (do))
 
 (defn owned [(s (slice u8))] (-> (ArrayList u8))
-  (let [(mut b) (al-new [u8] (alloc/malloc-allocator))]
-    (al-extend! (mut b) (slice-data s) (len s))
-    (push! (mut b) (p/cast u8 0))
+  (let [(mut b) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (extend! (mut b) (data s) (len s))
+    (push! (mut b) (: 0 u8))
     (load b)))
 
 (defn c-str [(b (ptr (ArrayList u8)))] (-> (ptr i8))
-  (p/cast (ptr i8) (slice-data (al-slice (load b)))))
+  (p/cast (ptr i8) (data (slice (load b)))))
 
 (defn free-proc! [(proc (ptr Proc))] (-> void)
-  (for [i 0 (len (.argv proc))] (al-free! (al-elem (field proc argv) i)))
-  (al-free! (mut (.argv proc)))
-  (al-free! (mut (.cwd proc)))
+  (for [i 0 (len (.argv proc))] (free! (elem (field proc argv) i)))
+  (free! (mut (.argv proc)))
+  (free! (mut (.cwd proc)))
   (alloc/destroy [Proc] (alloc/malloc-allocator) proc)
   (do))
 
 ;;; Worker: posix_spawn PROC. Returns the pid and read end, or -1.
 (defn launch! [(proc (ptr Proc)) (fd-out (ptr i32))] (-> i32)
   (let [a (alloc/malloc-allocator)
-        (mut args) (al-new [(ptr i8)] a)
-        (mut env) (al-new [(ptr i8)] a)
+        (mut args) (ArrayList::new [(ptr i8)] a)
+        (mut env) (ArrayList::new [(ptr i8)] a)
         (mut optional-locks) (owned "GIT_OPTIONAL_LOCKS=0")
         (mut devnull) (owned "/dev/null")
-        fds (p/alloc-stack (array i32 2))
-        actions (p/alloc-stack (ptr i8))
-        attr (p/alloc-stack (ptr i8))
-        pid (p/alloc-stack i32)
-        (mut result) (p/cast i32 -1)]
+        (mut fds) (zeroed (array i32 2))
+        (mut actions) (zeroed (ptr i8))
+        (mut attr) (zeroed (ptr i8))
+        (mut pid) (zeroed i32)
+        (mut result) (: -1 i32)]
     (for [i 0 (len (.argv proc))]
-      (push! (mut args) (c-str (al-elem (field proc argv) i))))
+      (push! (mut args) (c-str (elem (field proc argv) i))))
     (push! (mut args) (p/cast (ptr i8) 0))
     ; The current environment (read now, so a PATH Jim adopted at startup
     ; applies) plus GIT_OPTIONAL_LOCKS=0.
     (let [environ (load (_NSGetEnviron))
           (mut k) 0]
-      (loop (let [entry (load (p/index environ (load k)))]
+      (loop (let [entry (load (index environ (load k)))]
               (if (= (p/cast i64 entry) 0)
                   (break)
                   (do (push! (mut env) entry) (set! k (+ (load k) 1)) 0)))))
     (push! (mut env) (c-str (mut optional-locks)))
     (push! (mut env) (p/cast (ptr i8) 0))
-    (when (= (os/pipe (p/cast (ptr i32) fds)) (p/cast i32 0))
-      (let [read-end (load (p/index (p/cast (ptr i32) fds) 0))
-            write-end (load (p/index (p/cast (ptr i32) fds) 1))]
-        (posix_spawn_file_actions_init actions)
-        (posix_spawn_file_actions_addopen actions
-                                          (p/cast i32 0)
+    (when (= (os/pipe (p/cast (ptr i32) (mut fds))) (: 0 i32))
+      (let [read-end (load (index (p/cast (ptr i32) (mut fds)) 0))
+            write-end (load (index (p/cast (ptr i32) (mut fds)) 1))]
+        (posix_spawn_file_actions_init (mut actions))
+        (posix_spawn_file_actions_addopen (mut actions)
+                                          (: 0 i32)
                                           (c-str (mut devnull))
-                                          (p/cast i32 0)
-                                          (p/cast u16 0))
-        (posix_spawn_file_actions_adddup2 actions write-end (p/cast i32 1))
-        (posix_spawn_file_actions_adddup2 actions write-end (p/cast i32 2))
-        (posix_spawn_file_actions_addchdir_np actions (c-str (field proc cwd)))
-        (posix_spawnattr_init attr)
-        (posix_spawnattr_setflags attr (p/cast i16 POSIX-SPAWN-CLOEXEC-DEFAULT))
+                                          (: 0 i32)
+                                          (: 0 u16))
+        (posix_spawn_file_actions_adddup2 (mut actions) write-end (: 1 i32))
+        (posix_spawn_file_actions_adddup2 (mut actions) write-end (: 2 i32))
+        (posix_spawn_file_actions_addchdir_np (mut actions)
+                                              (c-str (field proc cwd)))
+        (posix_spawnattr_init (mut attr))
+        (posix_spawnattr_setflags (mut attr)
+                                  (p/cast i16 POSIX-SPAWN-CLOEXEC-DEFAULT))
         (let [status
-                (os/posix_spawnp pid
-                                 (load (p/index (p/cast (ptr (ptr i8))
-                                                        (slice-data (al-slice args)))
-                                                0))
-                                 (p/cast (ptr i8) actions)
-                                 (p/cast (ptr i8) attr)
+                (os/posix_spawnp (mut pid)
+                                 (load (index (p/cast (ptr (ptr i8))
+                                                      (data (slice args)))
+                                              0))
+                                 (p/cast (ptr i8) (mut actions))
+                                 (p/cast (ptr i8) (mut attr))
                                  (p/cast (ptr (ptr i8))
-                                         (slice-data (al-slice args)))
+                                         (data (slice args)))
                                  (p/cast (ptr (ptr i8))
-                                         (slice-data (al-slice env))))]
-          (posix_spawn_file_actions_destroy actions)
-          (posix_spawnattr_destroy attr)
+                                         (data (slice env))))]
+          (posix_spawn_file_actions_destroy (mut actions))
+          (posix_spawnattr_destroy (mut attr))
           (os/close write-end)
-          (if (= status (p/cast i32 0))
+          (if (= status (: 0 i32))
               (let [flags (os/fcntl read-end (p/cast i32 F-GETFL) 0)]
                 (os/fcntl read-end
                           (p/cast i32 F-SETFL)
                           (| (p/cast i64 flags) O-NONBLOCK))
                 (set! fd-out read-end)
-                (set! result (load pid))
+                (set! result pid)
                 0)
               (do (os/close read-end) 0))))
       0)
-    (al-free! (mut args))
-    (al-free! (mut env))
-    (al-free! (mut optional-locks))
-    (al-free! (mut devnull))
+    (free! (mut args))
+    (free! (mut env))
+    (free! (mut optional-locks))
+    (free! (mut devnull))
     (load result)))
 
 (defn stop! [(l (ptr Launcher)) (pid i32)] (-> void)
@@ -187,18 +190,18 @@
 
 ;;; Reap stopped processes that have exited. Call with the lock held.
 (defn reap-stopped! [(l (ptr Launcher))] (-> void)
-  (let [status (p/alloc-stack i32)
+  (let [(mut status) (zeroed i32)
         (mut k) 0]
     (for [i 0 (len (.stopped l))]
       (let [pid (get (.stopped l) i)]
-        (when (= (os/waitpid pid status (p/cast i32 WNOHANG)) (p/cast i32 0))
-          (set! (al-elem (field l stopped) (load k)) pid)
+        (when (= (os/waitpid pid (mut status) (p/cast i32 WNOHANG)) (: 0 i32))
+          (set! (elem (field l stopped) (load k)) pid)
           (set! k (+ (load k) 1))
           0)))
     (set! (.len (field l stopped)) (load k))
     (do)))
 
-(extern pthread_set_qos_class_self_np :cc c [u32 i32] (-> i32))
+(extern pthread_set_qos_class_self_np :cc (cc/C) [u32 i32] (-> i32))
 
 ;;; QOS_CLASS_USER_INITIATED
 (const QOS-USER-INITIATED 25)
@@ -207,53 +210,49 @@
   (let [l (p/cast (ptr Launcher) arg)]
     ; Below the main thread, which runs user-interactive: never compete with it.
     (pthread_set_qos_class_self_np (p/cast u32 QOS-USER-INITIATED)
-                                   (p/cast i32 0))
+                                   (: 0 i32))
     (loop (lock! l)
       (while (= (len (.queue l)) 0)
         (try (let [_
-                     (try-or! (sync/condition-wait! (field l wake)
-                                                    (field l lock))
+                     (try-or! (wait! (field l wake)
+                                     (field l lock))
                               0)]
                0)))
       (let [proc (get (.queue l) 0)]
         (for [i 1 (len (.queue l))]
-          (set! (al-elem (field l queue) (- i 1)) (get (.queue l) i)))
+          (set! (elem (field l queue) (- i 1)) (get (.queue l) i)))
         (set! (.len (field l queue)) (- (len (.queue l)) 1))
         (unlock! l)
-        (let [fd (p/alloc-stack i32)
-              pid (launch! proc fd)]
+        (let [(mut fd) (zeroed i32)
+              pid (launch! proc (mut fd))]
           (lock! l)
           (cond (.released proc)
-                ; Released while launching: stop it, and nobody polls it.
-                (do
-                  (when (> pid (p/cast i32 0))
-                    (os/close (load fd))
-                    (stop! l pid)
+                  ; Released while launching: stop it, and nobody polls it.
+                  (do
+                    (when (> pid (: 0 i32)) (os/close fd) (stop! l pid) 0)
+                    (free-proc! proc)
                     0)
-                  (free-proc! proc)
-                  0)
-                  (> pid (p/cast i32 0))
-                (do
-                  (set! (.pid proc) pid)
-                  (set! (.fd proc) (load fd))
-                  (set! (.state proc) RUNNING)
-                  0)
-                  :else
-                (do (set! (.code proc) -1) (set! (.state proc) FAILED) 0))
+                (> pid (: 0 i32))
+                  (do
+                    (set! (.pid proc) pid)
+                    (set! (.fd proc) fd)
+                    (set! (.state proc) RUNNING)
+                    0)
+                :else (do (set! (.code proc) -1) (set! (.state proc) FAILED) 0))
           (unlock! l))))
     (p/cast (ptr i8) 0)))
 
 (defn launcher [] (-> (ptr Launcher))
   (let [l (launcher-cell)]
     (when (not (.started l))
-      (sync/mutex-init (field l lock))
-      (sync/condition-init (field l wake))
-      (set! (.queue l) (al-new [(ptr Proc)] (alloc/malloc-allocator)))
-      (set! (.stopped l) (al-new [i32] (alloc/malloc-allocator)))
+      (sync/Mutex::init (field l lock))
+      (sync/Condition::init (field l wake))
+      (set! (.queue l) (ArrayList::new [(ptr Proc)] (alloc/malloc-allocator)))
+      (set! (.stopped l) (ArrayList::new [i32] (alloc/malloc-allocator)))
       (set! (.started l) true)
-      (thread/thread-spawn (field l worker)
-                           (p/fnptr-of worker)
-                           (p/cast (ptr i8) l))
+      (thread/Thread::spawn (field l worker)
+                            (fnptr-of worker)
+                            (p/cast (ptr i8) l))
       0)
     l))
 
@@ -263,12 +262,12 @@
 (defn spawn-process [(argv (slice (slice u8))) (cwd (slice u8))] (-> i64)
   (let [l (launcher)
         a (alloc/malloc-allocator)
-        proc (alloc/box! a Proc (p/zeroed Proc))]
-    (set! (.argv proc) (al-new [(ArrayList u8)] a))
+        proc (alloc/box! a Proc (zeroed Proc))]
+    (set! (.argv proc) (ArrayList::new [(ArrayList u8)] a))
     (for [i 0 (len argv)] (push! (mut (.argv proc)) (owned (get argv i))))
     (set! (.cwd proc) (owned cwd))
     (set! (.state proc) LAUNCHING)
-    (set! (.fd proc) (p/cast i32 -1))
+    (set! (.fd proc) (: -1 i32))
     (if (= (len argv) 0)
         (do
           (set! (.code proc) -1)
@@ -277,7 +276,7 @@
         (do
           (lock! l)
           (push! (mut (.queue l)) proc)
-          (try (let [_ (try-or! (sync/condition-notify-one! (field l wake)) 0)]
+          (try (let [_ (try-or! (notify-one! (field l wake)) 0)]
                  0))
           (unlock! l)
           (p/cast i64 proc)))))
@@ -288,10 +287,10 @@
           program
             (if (> (len (.argv proc)) 0)
                 (let [b (get (.argv proc) 0)]
-                  (subslice (al-slice b) 0 (- (len b) 1)))
+                  (subslice (slice b) 0 (- (len b) 1)))
                 "")]
-      (al-extend! (mut out) (slice-data message) (len message))
-      (al-extend! (mut out) (slice-data program) (len program))
+      (extend! (mut out) (data message) (len message))
+      (extend! (mut out) (data program) (len program))
       (set! (.reported proc) true))
     0)
   (do))
@@ -312,23 +311,23 @@
             (= state FAILED) (do (append-failure! proc out) -1)
             (= state EXITED) (.code proc)
             :else
-              (let [buffer (p/alloc-stack (array u8 16384))]
+              (let [(mut buffer) (zeroed (array u8 16384))]
                 (when (not (.eof proc))
                   (loop (let [n
                                 (p/cast i64
                                         (io/read (.fd proc)
-                                                 (p/cast (ptr i8) buffer)
+                                                 (p/cast (ptr i8) (mut buffer))
                                                  (p/cast isize 16384)))]
                           (cond (> n 0)
                                   (do
-                                    (al-extend! (mut out)
-                                                (p/cast (ptr u8) buffer)
-                                                n)
+                                    (extend! (mut out)
+                                             (p/cast (ptr u8) (mut buffer))
+                                             n)
                                     0)
                                 (= n 0)
                                   (do
                                     (os/close (.fd proc))
-                                    (set! (.fd proc) (p/cast i32 -1))
+                                    (set! (.fd proc) (: -1 i32))
                                     (set! (.eof proc) true)
                                     (break))
                                 :else (break))))
@@ -336,13 +335,13 @@
                 (if (not (.eof proc))
                     api/PROCESS-RUNNING
                     ; Output is complete; report once the process has exited.
-                    (let [status (p/alloc-stack i32)]
+                    (let [(mut status) (zeroed i32)]
                       (if (= (os/waitpid (.pid proc)
-                                         status
+                                         (mut status)
                                          (p/cast i32 WNOHANG))
                              (.pid proc))
                           (do
-                            (set! (.code proc) (exit-code (load status)))
+                            (set! (.code proc) (exit-code status))
                             (set! (.state proc) EXITED)
                             (.code proc))
                           api/PROCESS-RUNNING))))))))

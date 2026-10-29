@@ -3,9 +3,10 @@
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-eq])
 (import "coil.fs" :as fs)
 (import "coil.os" :as os)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
 (import "jim.widget-api" :use *)
 (import "jim.widget-kit.text" :as text)
 (import "jim.widget-kit.git-view" :as gv)
@@ -19,9 +20,16 @@
 ;;; pipe tables and horizontal rules. Inline: **bold**, *italic* and `code`
 ;;; markers are removed when balanced (so "5 * 3" survives), [text](url)
 ;;; becomes "text (url)" and ![alt](url) becomes "🖼 alt".
+;;; What survives reloads and restarts: the open document's path, as typed.
+(defstruct State [(path (ArrayList u8))])
+
+(derive (Serialize (field path (with text-ser text-de)))
+        (Deserialize (field path (with text-ser text-de)))
+        State)
+
 (defstruct Markdown
   [(doc (ArrayList u8))
-   (path (ArrayList u8))
+   (state State)
    (draft (ArrayList u8))
    (project (ArrayList u8))
    (status (ArrayList u8))
@@ -40,15 +48,15 @@
             (when (!= (p/cast i64 home) 0)
               (let [c (p/cast (ptr u8) home)
                     (mut n) 0]
-                (while (!= (load (p/index c (load n))) (p/cast u8 0))
+                (while (!= (load (index c (load n))) (: 0 u8))
                   (set! n (+ (load n) 1)))
-                (text/push-str! out (slice-new c (load n))))
+                (text/push-str! out (slice::new c (load n))))
               0)
             (text/push-str! out (text/from path 1)))
         (text/starts-with? path "/") (text/push-str! out path)
         :else
           (do
-            (text/push-str! out (al-slice (.project s)))
+            (text/push-str! out (slice (.project s)))
             (text/push-str! out "/")
             (text/push-str! out path))))
 
@@ -56,40 +64,42 @@
   (if (= (len path) 0)
       (do
         (text/set-str! (field s doc) (welcome))
-        (al-clear! (mut (.path s)))
-        (al-clear! (mut (.full s)))
+        (clear! (mut (.path (.state s))))
+        (clear! (mut (.full s)))
         (say! s "welcome"))
-      (let [(mut full) (al-new [u8] (alloc/malloc-allocator))]
+      (let [(mut full) (ArrayList::new [u8] (alloc/malloc-allocator))]
         (resolve-path s path (mut full))
-        (text/set-str! (field s full) (al-slice full))
+        (text/set-str! (field s full) (slice full))
         (try (let [bytes
                      (try-or! (fs/read-file (alloc/malloc-allocator)
-                                            (al-slice full))
+                                            (slice full))
                               (do
                                 (text/set-str! (field s doc)
                                                "# Could not read file\n\n`")
-                                (text/push-str! (field s doc) (al-slice full))
+                                (text/push-str! (field s doc) (slice full))
                                 (text/push-str! (field s doc) "`\n")
-                                (text/set-str! (field s path) path)
+                                (text/set-str! (field (field s state) path)
+                                               path)
                                 (say! s "read failed")
                                 0))]
                (do
                  (text/set-str! (field s doc) bytes)
                  (alloc/free [u8] (alloc/malloc-allocator) bytes)
-                 (text/set-str! (field s path) path)
+                 (text/set-str! (field (field s state) path) path)
                  (text/set-str! (field s draft) path)
                  (say! s "ok · ")
                  (text/push-i64! (field s status) (len (.doc s)))
                  (text/push-str! (field s status) " bytes")
                  0)))
-        (al-free! (mut full))
+        (free! (mut full))
         (do))))
 
 ;;; ---- inline cleanup --------------------------------------------------------
 
 ;;; Drop MARKER where it appears an even number of times; an odd count is not
 ;;; emphasis (e.g. "5 * 3"), so the text stays as written.
-(defn strip-pair [(s (slice u8)) (marker (slice u8)) (out (ptr (ArrayList u8)))] (-> void)
+(defn strip-pair [(s (slice u8)) (marker (slice u8)) (out (ptr (ArrayList u8)))]
+  (-> void)
   (let [(mut count) 0
         (mut i) 0]
     (while (<= (+ (load i) (len marker)) (len s))
@@ -120,7 +130,7 @@
                 (do (text/push-str! out r) (break))
                 (let [(mut lb) -1]
                   (for [k 0 open]
-                    (when (= (get r k) (p/cast u8 91)) (set! lb k) 0))
+                    (when (= (get r k) (: 91 u8)) (set! lb k) 0))
                   (if (< (load lb) 0)
                       (do
                         (text/push-str! out (subslice r 0 (+ open 2)))
@@ -135,7 +145,7 @@
                                   image
                                     (and (> (load lb) 0)
                                          (= (get r (- (load lb) 1))
-                                            (p/cast u8 33)))]
+                                            (: 33 u8)))]
                               (text/push-str! out
                                               (subslice r
                                                         0
@@ -157,22 +167,22 @@
 
 (defn clean-inline [(s (slice u8)) (out (ptr (ArrayList u8)))] (-> void)
   (let [a (alloc/malloc-allocator)
-        (mut one) (al-new [u8] a)
-        (mut two) (al-new [u8] a)
-        (mut three) (al-new [u8] a)]
+        (mut one) (ArrayList::new [u8] a)
+        (mut two) (ArrayList::new [u8] a)
+        (mut three) (ArrayList::new [u8] a)]
     (replace-links s (mut one))
-    (strip-pair (al-slice one) "**" (mut two))
-    (strip-pair (al-slice two) "*" (mut three))
-    (strip-pair (al-slice three) "`" out)
-    (al-free! (mut one))
-    (al-free! (mut two))
-    (al-free! (mut three))
+    (strip-pair (slice one) "**" (mut two))
+    (strip-pair (slice two) "*" (mut three))
+    (strip-pair (slice three) "`" out)
+    (free! (mut one))
+    (free! (mut two))
+    (free! (mut three))
     (do)))
 
 ;;; ---- block predicates ------------------------------------------------------
 (defn lead-spaces [(s (slice u8))] (-> i64)
   (let [(mut i) 0]
-    (while (and (< (load i) (len s)) (= (get s (load i)) (p/cast u8 32)))
+    (while (and (< (load i) (len s)) (= (get s (load i)) (: 32 u8)))
       (set! i (+ (load i) 1)))
     (load i)))
 
@@ -190,7 +200,7 @@
       (set! i (+ (load i) 1)))
     (if (and (> (load i) 0)
              (< (load i) (len s))
-             (= (get s (load i)) (p/cast u8 46)))
+             (= (get s (load i)) (: 46 u8)))
         (+ (load i) 1)
         0)))
 
@@ -198,16 +208,16 @@
   (let [t (text/trim s)
         (mut count) 0
         (mut ok) (> (len t) 0)
-        c0 (if (> (len t) 0) (get t 0) (p/cast u8 0))]
-    (when (not (or (= c0 (p/cast u8 45))
-                   (= c0 (p/cast u8 42))
-                   (= c0 (p/cast u8 95))))
+        c0 (if (> (len t) 0) (get t 0) (: 0 u8))]
+    (when (not (or (= c0 (: 45 u8))
+                   (= c0 (: 42 u8))
+                   (= c0 (: 95 u8))))
       (set! ok false)
       0)
     (for [i 0 (len t)]
       (let [c (get t i)]
         (cond (= c c0) (set! count (+ (load count) 1))
-              (= c (p/cast u8 32)) 0
+              (= c (: 32 u8)) 0
               :else (set! ok false))))
     (and (load ok) (>= (load count) 3))))
 
@@ -221,11 +231,11 @@
 
 (defn heading-level [(s (slice u8))] (-> i64)
   (let [(mut n) 0]
-    (while (and (< (load n) (len s)) (= (get s (load n)) (p/cast u8 35)))
+    (while (and (< (load n) (len s)) (= (get s (load n)) (: 35 u8)))
       (set! n (+ (load n) 1)))
     (if (and (>= (load n) 1)
              (<= (load n) 6)
-             (or (= (load n) (len s)) (= (get s (load n)) (p/cast u8 32))))
+             (or (= (load n) (len s)) (= (get s (load n)) (: 32 u8))))
         (load n)
         0)))
 
@@ -248,9 +258,9 @@
         t1 (if (text/starts-with? t0 "|") (text/from t0 1) t0)
         t (if (text/ends-with? t1 "|") (subslice t1 0 (- (len t1) 1)) t1)
         (mut start) 0]
-    (al-clear! (mut cells))
+    (clear! (mut cells))
     (for [i 0 (+ (len t) 1)]
-      (when (or (= i (len t)) (= (get t i) (p/cast u8 124)))
+      (when (or (= i (len t)) (= (get t i) (: 124 u8)))
         (let [at (len (load out))]
           (clean-inline (text/trim (subslice t (load start) i)) out)
           (push! (mut cells) (text/Span :at at :len (- (len (load out)) at)))
@@ -259,16 +269,17 @@
     (do)))
 
 ;;; ---- rendering ---------------------------------------------------------------
-(defn paragraph! [(ui (ptr Ui)) (raw (slice u8)) (size f64) (color i64)] (-> void)
-  (let [(mut clean) (al-new [u8] (alloc/malloc-allocator))]
+(defn paragraph! [(ui (ptr Ui)) (raw (slice u8)) (size f64) (color i64)]
+  (-> void)
+  (let [(mut clean) (ArrayList::new [u8] (alloc/malloc-allocator))]
     (clean-inline raw (mut clean))
-    (text! ui (al-slice clean) size color false)
+    (text! ui (slice clean) size color false)
     (wrap! ui)
-    (al-free! (mut clean))
+    (free! (mut clean))
     (do)))
 
 (defn heading! [(ui (ptr Ui)) (level i64) (raw (slice u8))] (-> void)
-  (let [(mut clean) (al-new [u8] (alloc/malloc-allocator))
+  (let [(mut clean) (ArrayList::new [u8] (alloc/malloc-allocator))
         size
           (cond (= level 1) 25.0
                 (= level 2) 21.0
@@ -279,11 +290,11 @@
     (clean-inline raw (mut clean))
     (vstack! ui 4.0 0.0)
     (margin! ui (if (<= level 2) 10.0 6.0) 0.0 0.0 0.0)
-    (text! ui (al-slice clean) size gv/INK true)
+    (text! ui (slice clean) size gv/INK true)
     (wrap! ui)
     (when (<= level 2) (divider! ui) 0)
     (end! ui)
-    (al-free! (mut clean))
+    (free! (mut clean))
     (do)))
 
 (defn code-block! [(ui (ptr Ui)) (code (slice u8))] (-> void)
@@ -302,8 +313,8 @@
                     (first i64)
                     (last i64)] (-> void)
   (let [a (alloc/malloc-allocator)
-        (mut cells) (al-new [text/Span] a)
-        (mut out) (al-new [u8] a)
+        (mut cells) (ArrayList::new [text/Span] a)
+        (mut out) (ArrayList::new [u8] a)
         (mut columns) 0]
     (row-cells (text/span-text doc (get (load lines) first))
                (mut out)
@@ -313,7 +324,7 @@
     (border! ui 0x2c323c)
     (for [row first last]
       (when (!= row (+ first 1))
-        (al-clear! (mut out))
+        (clear! (mut out))
         (row-cells (text/span-text doc (get (load lines) row))
                    (mut out)
                    (mut cells))
@@ -324,7 +335,7 @@
                (cond (= row first) 0x1e2530 (= (% row 2) 0) 0x161a21 :else NONE))
           (text! ui
                  (if (< c (len cells))
-                     (text/span-text (al-slice out) (get cells c))
+                     (text/span-text (slice out) (get cells c))
                      "")
                  13.0
                  gv/INK
@@ -333,8 +344,8 @@
           (end! ui))
         0))
     (end! ui)
-    (al-free! (mut cells))
-    (al-free! (mut out))
+    (free! (mut cells))
+    (free! (mut out))
     (do)))
 
 (defn list-item! [(ui (ptr Ui))
@@ -352,8 +363,8 @@
 ;;; Render the Markdown in DOC as a column of blocks.
 (defn blocks! [(ui (ptr Ui)) (doc (slice u8))] (-> void)
   (let [a (alloc/malloc-allocator)
-        (mut lines) (al-new [text/Span] a)
-        (mut buffer) (al-new [u8] a)
+        (mut lines) (ArrayList::new [text/Span] a)
+        (mut buffer) (ArrayList::new [u8] a)
         (mut i) 0]
     (text/lines! doc (mut lines))
     (vstack! ui 10.0 0.0)
@@ -365,7 +376,7 @@
               (or (text/starts-with? s "```") (text/starts-with? s "~~~"))
                 (let [fence (subslice s 0 3)
                       (mut j) (+ (load i) 1)]
-                  (al-clear! (mut buffer))
+                  (clear! (mut buffer))
                   (while (and (< (load j) n)
                               (not (text/starts-with? (text/trim (text/span-text doc
                                                                                  (get lines
@@ -377,7 +388,7 @@
                     (text/push-str! (mut buffer)
                                     (text/span-text doc (get lines (load j))))
                     (set! j (+ (load j) 1)))
-                  (code-block! ui (al-slice buffer))
+                  (code-block! ui (slice buffer))
                   (set! i (+ (load j) 1)))
               (> (heading-level s) 0)
                 (let [level (heading-level s)]
@@ -400,7 +411,7 @@
               (rule? s) (do (divider! ui) (set! i (+ (load i) 1)))
               (text/starts-with? s ">")
                 (let [(mut j) (load i)]
-                  (al-clear! (mut buffer))
+                  (clear! (mut buffer))
                   (while (and (< (load j) n)
                               (text/starts-with? (text/trim (text/span-text doc
                                                                             (get lines
@@ -422,12 +433,12 @@
                   (bg! ui gv/ACCENT)
                   (radius! ui 2.0)
                   (end! ui)
-                  (let [(mut inner) (text/owned (al-slice buffer))]
+                  (let [(mut inner) (text/owned (slice buffer))]
                     (vstack! ui 0.0 0.0)
                     (grow! ui 1.0)
-                    (blocks! ui (al-slice inner))
+                    (blocks! ui (slice inner))
                     (end! ui)
-                    (al-free! (mut inner)))
+                    (free! (mut inner)))
                   (end! ui)
                   (set! i (load j)))
               (or (bullet? s) (> (ordered-marker s) 0))
@@ -455,7 +466,7 @@
                   (set! i (load j)))
               :else
                 (let [(mut j) (+ (load i) 1)]
-                  (al-clear! (mut buffer))
+                  (clear! (mut buffer))
                   (text/push-str! (mut buffer) s)
                   (while (and (< (load j) n)
                               (not (starts-block? (text/span-text doc
@@ -467,72 +478,71 @@
                                                                (get lines
                                                                     (load j)))))
                     (set! j (+ (load j) 1)))
-                  (paragraph! ui (al-slice buffer) 14.0 gv/INK)
+                  (paragraph! ui (slice buffer) 14.0 gv/INK)
                   (set! i (load j))))))
     (end! ui)
-    (al-free! (mut lines))
-    (al-free! (mut buffer))
+    (free! (mut lines))
+    (free! (mut buffer))
     (do)))
 
 (impl Widget Markdown
   (render [(self (ptr Markdown)) (ui (ptr Ui))]
-          (-> void)
-          (when (> (len (.full self)) 0) (watch! ui (al-slice (.full self))) 0)
-          (title! ui
-                  (if (> (len (.path self)) 0)
-                      (text/basename (al-slice (.path self)))
-                      "Markdown"))
-          (vstack! ui 12.0 14.0)
-          (hstack! ui 8.0 0.0)
-          (text! ui "▤ markdown" 13.0 gv/INK true)
-          (input! ui
-                  "path"
-                  (al-slice (.draft self))
-                  "path to .md … (Return to load)")
-          (grow! ui 1.0)
-          (button! ui "load" "Load")
-          (button! ui "reload" "↻")
-          (text! ui (al-slice (.status self)) 11.0 gv/MUTED false)
-          (end! ui)
-          (divider! ui)
-          (blocks! ui (al-slice (.doc self)))
-          (end! ui))
+    (-> void)
+    (when (> (len (.full self)) 0) (watch! ui (slice (.full self))) 0)
+    (title! ui
+            (if (> (len (.path (.state self))) 0)
+                (text/basename (slice (.path (.state self))))
+                "Markdown"))
+    (vstack! ui 12.0 14.0)
+    (hstack! ui 8.0 0.0)
+    (text! ui "▤ markdown" 13.0 gv/INK true)
+    (input! ui
+            "path"
+            (slice (.draft self))
+            "path to .md … (Return to load)")
+    (grow! ui 1.0)
+    (button! ui "load" "Load")
+    (button! ui "reload" "↻")
+    (text! ui (slice (.status self)) 11.0 gv/MUTED false)
+    (end! ui)
+    (divider! ui)
+    (blocks! ui (slice (.doc self)))
+    (end! ui))
   (event [(self (ptr Markdown)) (e (ptr Event))]
-         (-> void)
-         (cond (changed? e "path") (text/set-str! (field self draft) (.text e))
-               (files-changed? e)
-                 (let [(mut path) (text/owned (al-slice (.path self)))]
-                   (load! self (al-slice path))
-                   (al-free! (mut path))
-                   (do))
-               (or (clicked? e "load") (submitted? e "path"))
-                 (let [(mut path)
-                         (text/owned (text/trim (al-slice (.draft self))))]
-                   (load! self (al-slice path))
-                   (al-free! (mut path))
-                   (do))
-               (clicked? e "reload")
-                 (let [(mut path) (text/owned (al-slice (.path self)))]
-                   (load! self (al-slice path))
-                   (al-free! (mut path))
-                   (do))
-               :else (do)))
+    (-> void)
+    (cond (changed? e "path") (text/set-str! (field self draft) (.text e))
+          (files-changed? e)
+            (let [(mut path) (text/owned (slice (.path (.state self))))]
+              (load! self (slice path))
+              (free! (mut path))
+              (do))
+          (or (clicked? e "load") (submitted? e "path"))
+            (let [(mut path) (text/owned (text/trim (slice (.draft self))))]
+              (load! self (slice path))
+              (free! (mut path))
+              (do))
+          (clicked? e "reload")
+            (let [(mut path) (text/owned (slice (.path (.state self))))]
+              (load! self (slice path))
+              (free! (mut path))
+              (do))
+          :else (do)))
   (save [(self (ptr Markdown)) (s (ptr Snapshot))]
-        (-> void)
-        (put-text! s "path" (al-slice (.path self))))
+    (-> void)
+    (save-state! s (.state self)))
   (animating? [(self (ptr Markdown))]
-              (-> bool)
-              false)
+    (-> bool)
+    false)
   (destroy! [(self (ptr Markdown))]
-            (-> void)
-            (al-free! (mut (.doc self)))
-            (al-free! (mut (.path self)))
-            (al-free! (mut (.draft self)))
-            (al-free! (mut (.project self)))
-            (al-free! (mut (.status self)))
-            (al-free! (mut (.full self)))
-            (alloc/destroy [Markdown] (alloc/malloc-allocator) self)
-            (do)))
+    (-> void)
+    (free! (mut (.doc self)))
+    (free! (mut (.path (.state self))))
+    (free! (mut (.draft self)))
+    (free! (mut (.project self)))
+    (free! (mut (.status self)))
+    (free! (mut (.full self)))
+    (alloc/destroy [Markdown] (alloc/malloc-allocator) self)
+    (do)))
 
 (defn welcome [] (-> (slice u8))
   "# Markdown widget
@@ -580,19 +590,27 @@ long documents just keep going.
 Open something real: try `README.md` in this project.
 ")
 
-(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+(defn open [(saved (ptr Snapshot)) (state State)] (-> (ptr Markdown))
   (let [a (alloc/malloc-allocator)
         args (text/trim (get-text saved "jim.args" ""))
-        path (if (> (len args) 0) args (get-text saved "path" ""))
+        ; Owned: load! rewrites the state's path from it.
+        (mut path) (text/owned (if (> (len args) 0) args (slice (.path state))))
         s
           (alloc/box! a
                       Markdown
                       (Markdown
-                        :doc (al-new [u8] a)
-                        :path (al-new [u8] a)
-                        :draft (text/owned path)
+                        :doc (ArrayList::new [u8] a)
+                        :state state
+                        :draft (text/owned (slice path))
                         :project (text/owned (get-text saved "jim.dir" "."))
-                        :status (al-new [u8] a)
-                        :full (al-new [u8] a)))]
-    (load! s path)
-    (set! out s)))
+                        :status (ArrayList::new [u8] a)
+                        :full (ArrayList::new [u8] a)))]
+    (load! s (slice path))
+    (free! (mut path))
+    s))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (match (load-state [State] saved)
+    (Fresh [] (set! out (open saved (State :path (text/owned "")))))
+    (Loaded [state] (set! out (open saved state)))
+    (Refused [] (do))))

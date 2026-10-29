@@ -1,0 +1,246 @@
+(module jim.sky)
+(import "coil.cc" :as cc)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+(import "coil.math" :use [Float])
+
+;;; The night around the cube, after Jim's: a sky that darkens upward with a
+;;; glow above the cube and twinkling stars, a floor below the horizon, and a
+;;; fade over the reflection nearest the viewer. Jim spins the ring, never the
+;;; camera, so none of this moves while the cube turns: it is laid out in the
+;;; window's coordinates (y up) and only follows the horizon when the camera
+;;; moves in or out.
+;;;
+;;; The night is drawn in views beside the cube's stage, never inside it.
+;;; Core Animation depth-tests the layers under one perspective, so an opaque
+;;; sky at depth 0 in the stage would hide the whole ring, which stands
+;;; behind that plane.
+(defstruct Sky
+  [(back (ptr i8))
+   (air (ptr i8))
+   (glow (ptr i8))
+   (stars (ptr i8))
+   (floor (ptr i8))
+   (front (ptr i8))
+   (fade (ptr i8))])
+
+(const STAR-COUNT 170)
+
+;;; Stars twinkle as Jim's do: max(0, 0.35 + 0.65 sin(3t)), a 2.1 s period
+;;; sampled at TWINKLE-STEPS points.
+(const TWINKLE-PERIOD 2.0943951023931953)
+
+(const TWINKLE-STEPS 16)
+
+(defn cg [(r f64) (g f64) (b f64) (a f64)] (-> (ptr i8))
+  (msg (ptr i8) (color r g b a) (sel c"CGColor") []))
+
+(defn hex [(rgb i64) (a f64)] (-> (ptr i8))
+  (cg (/ (p/cast f64 (& (>> rgb 16) 255)) 255.0)
+      (/ (p/cast f64 (& (>> rgb 8) 255)) 255.0)
+      (/ (p/cast f64 (& rgb 255)) 255.0)
+      a))
+
+(defn array [] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSMutableArray") (sel c"array") []))
+
+(defn push! [(list (ptr i8)) (item (ptr i8))] (-> void)
+  (msg i64 list (sel c"addObject:") [(ptr i8)] item)
+  (do))
+
+(defn number [(x f64)] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSNumber") (sel c"numberWithDouble:") [f64] x))
+
+(defn gradient-layer [(parent (ptr i8))] (-> (ptr i8))
+  (let [l (msg (ptr i8) (class c"CAGradientLayer") (sel c"layer") [])]
+    (msg i64 parent (sel c"addSublayer:") [(ptr i8)] l)
+    l))
+
+(defn plain-layer [(parent (ptr i8))] (-> (ptr i8))
+  (let [l (msg (ptr i8) (class c"CALayer") (sel c"layer") [])]
+    (msg i64 parent (sel c"addSublayer:") [(ptr i8)] l)
+    l))
+
+(defn layer-frame! [(l (ptr i8)) (r Rect)] (-> void)
+  (msg i64 l (sel c"setFrame:") [Rect] r)
+  (do))
+
+;;; A vertical gradient through COLORS at LOCATIONS (0 at the layer's bottom).
+(defn vertical! [(l (ptr i8)) (colors (ptr i8)) (locations (ptr i8))] (-> void)
+  (msg i64 l (sel c"setColors:") [(ptr i8)] colors)
+  (msg i64 l (sel c"setLocations:") [(ptr i8)] locations)
+  (msg i64 l (sel c"setStartPoint:") [Point] (Point :x 0.5 :y 0.0))
+  (msg i64 l (sel c"setEndPoint:") [Point] (Point :x 0.5 :y 1.0))
+  (do))
+
+;;; The Nth pseudo-random number in [0, 1) of a fixed sequence, so every
+;;; layout puts each star in the same place.
+(defn noise [(n i64)] (-> f64)
+  ; Two rounds of a 31-bit linear congruential step; every product stays far
+  ; inside 64 bits.
+  (let [x (& (+ (* (& n 2147483647) 1103515245) 12345) 2147483647)
+        y (& (+ (* (^ x (>> x 13)) 1103515245) 12345) 2147483647)]
+    (/ (p/cast f64 (>> y 7)) 16777216.0)))
+
+(defn twinkle! [(star (ptr i8)) (brightness f64) (phase f64)] (-> void)
+  (let [values (array)
+        a
+          (msg (ptr i8)
+               (class c"CAKeyframeAnimation")
+               (sel c"animationWithKeyPath:")
+               [(ptr i8)]
+               (ns c"opacity"))]
+    (for [k 0 (+ TWINKLE-STEPS 1)]
+      (let [t
+              (* (/ (p/cast f64 k) (p/cast f64 TWINKLE-STEPS))
+                 6.283185307179586)]
+        (push! values
+               (number (* brightness (max 0.0 (+ 0.35 (* 0.65 (sin t)))))))))
+    (msg i64 a (sel c"setValues:") [(ptr i8)] values)
+    (msg i64 a (sel c"setDuration:") [f64] TWINKLE-PERIOD)
+    (msg i64 a (sel c"setRepeatCount:") [f32] (: 1000000000.0 f32))
+    (msg i64 a (sel c"setTimeOffset:") [f64] (* phase TWINKLE-PERIOD))
+    (msg i64
+         star
+         (sel c"addAnimation:forKey:")
+         [(ptr i8) (ptr i8)]
+         a
+         (ns c"twinkle"))
+    (do)))
+
+;;; The sky and floor, created under the cube in STAGE, and hidden.
+;;; A view in ROOT directly below (ORDER -1) or above (1) the view NEXT.
+(defn beside [(root (ptr i8)) (next (ptr i8)) (order i64)] (-> (ptr i8))
+  (let [v (view root (rect 0.0 0.0 100.0 100.0))]
+    (msg i64
+         root
+         (sel c"addSubview:positioned:relativeTo:")
+         [(ptr i8) i64 (ptr i8)]
+         v
+         order
+         next)
+    v))
+
+;;; The sky and floor, in ROOT just below the cube's STAGE, hidden.
+(defn create! [(root (ptr i8)) (stage (ptr i8))] (-> Sky)
+  (let [back (beside root stage -1)
+        root (layer back)
+        air (gradient-layer root)
+        glow (gradient-layer root)
+        stars (plain-layer root)
+        floor (gradient-layer root)
+        air-colors (array)
+        air-stops (array)
+        glow-colors (array)
+        floor-colors (array)
+        floor-stops (array)]
+    (push! air-colors (hex 0x1f263f 1.0))
+    (push! air-colors (hex 0x1d243c 1.0))
+    (push! air-colors (hex 0x191f37 1.0))
+    (push! air-stops (number 0.0))
+    (push! air-stops (number 0.45))
+    (push! air-stops (number 1.0))
+    (vertical! air air-colors air-stops)
+    (msg i64 glow (sel c"setType:") [(ptr i8)] (ns c"radial"))
+    (push! glow-colors (hex 0x2a3553 0.85))
+    (push! glow-colors (hex 0x2a3553 0.0))
+    (msg i64 glow (sel c"setColors:") [(ptr i8)] glow-colors)
+    (msg i64 glow (sel c"setStartPoint:") [Point] (Point :x 0.5 :y 0.5))
+    (msg i64 glow (sel c"setEndPoint:") [Point] (Point :x 1.0 :y 1.0))
+    ; The floor, measured down from the horizon: a dark band at the far edge,
+    ; lighter toward the viewer.
+    (push! floor-colors (hex 0x32394c 1.0))
+    (push! floor-colors (hex 0x343b4e 1.0))
+    (push! floor-colors (hex 0x313748 1.0))
+    (push! floor-colors (hex 0x2a2e3c 1.0))
+    (push! floor-colors (hex 0x242833 1.0))
+    (push! floor-colors (hex 0x242833 1.0))
+    (push! floor-stops (number 0.0))
+    (push! floor-stops (number 0.55))
+    (push! floor-stops (number 0.75))
+    (push! floor-stops (number 0.86))
+    (push! floor-stops (number 0.93))
+    (push! floor-stops (number 1.0))
+    (vertical! floor floor-colors floor-stops)
+    (for [i 0 STAR-COUNT]
+      (let [star (plain-layer stars)
+            size (+ 1.0 (* 1.2 (noise (+ (* i 5) 2))))]
+        (msg i64
+             star
+             (sel c"setBackgroundColor:")
+             [(ptr i8)]
+             (cg 1.0 1.0 1.0 1.0))
+        (msg i64 star (sel c"setCornerRadius:") [f64] (* size 0.5))
+        (msg i64 star (sel c"setBounds:") [Rect] (rect 0.0 0.0 size size))
+        (twinkle! star
+                  (+ 0.25 (* 0.6 (noise (+ (* i 5) 3))))
+                  (noise (+ (* i 5) 4)))))
+    (msg i64 back (sel c"setHidden:") [i8] (: 1 i8))
+    (Sky
+      :back back
+      :air air
+      :glow glow
+      :stars stars
+      :floor floor
+      :front (nil)
+      :fade (nil))))
+
+;;; The fade over the reflection, in ROOT just above the cube's STAGE.
+(defn add-fade! [(sky (ptr Sky)) (root (ptr i8)) (stage (ptr i8))] (-> void)
+  (let [front (beside root stage 1)
+        fade (gradient-layer (layer front))
+        colors (array)]
+    (push! colors (hex 0x333a4d 0.8))
+    (push! colors (hex 0x333a4d 0.0))
+    (msg i64 fade (sel c"setColors:") [(ptr i8)] colors)
+    (msg i64 fade (sel c"setStartPoint:") [Point] (Point :x 0.5 :y 0.0))
+    (msg i64 fade (sel c"setEndPoint:") [Point] (Point :x 0.5 :y 1.0))
+    (msg i64 front (sel c"setHidden:") [i8] (: 1 i8))
+    (set! (.front sky) front)
+    (set! (.fade sky) fade)
+    (do)))
+
+;;; Lay the night out over a W×H stage: the floor's far edge at HORIZON and
+;;; the cube's lowest point at NEAR, both in points up from the bottom.
+(defn layout! [(sky (ptr Sky)) (w f64) (h f64) (horizon f64) (near f64)]
+  (-> void)
+  (let [top (max (- h horizon) 1.0)]
+    (frame! (.back sky) (rect 0.0 0.0 w h))
+    (frame! (.front sky) (rect 0.0 0.0 w h))
+    (layer-frame! (.air sky) (rect 0.0 horizon w top))
+    (layer-frame! (.floor sky) (rect 0.0 0.0 w (max horizon 1.0)))
+    ; The glow sits above the cube, wider than tall.
+    (layer-frame! (.glow sky)
+                  (rect (* w 0.2)
+                        (+ horizon (* top 0.25))
+                        (* w 0.6)
+                        (* top 0.85)))
+    (layer-frame! (.stars sky) (rect 0.0 horizon w top))
+    (let [stars (msg (ptr i8) (.stars sky) (sel c"sublayers") [])]
+      (for [i 0 STAR-COUNT]
+        (let [star
+                (msg (ptr i8)
+                     stars
+                     (sel c"objectAtIndex:")
+                     [u64]
+                     (p/cast u64 i))
+              ; Denser toward the top, as Jim's are brighter there.
+              up (sqrt (noise (+ (* i 5) 1)))]
+          (msg i64
+               star
+               (sel c"setPosition:")
+               [Point]
+               (Point :x (* w (noise (* i 5))) :y (+ 6.0 (* (- top 6.0) up)))))))
+    (layer-frame! (.fade sky) (rect 0.0 0.0 w (max near 1.0)))
+    (do)))
+
+;;; Show or hide the night with the cube.
+(defn show! [(sky (ptr Sky)) (shown bool)] (-> void)
+  (msg i64 (.back sky) (sel c"setHidden:") [i8] (p/cast i8 (if shown 0 1)))
+  (do))
+
+;;; Show or hide the fade over the reflection. It is laid out for the cube
+;;; at rest, so it is shown only once the cube settles.
+(defn fade! [(sky (ptr Sky)) (shown bool)] (-> void)
+  (msg i64 (.front sky) (sel c"setHidden:") [i8] (p/cast i8 (if shown 0 1)))
+  (do))

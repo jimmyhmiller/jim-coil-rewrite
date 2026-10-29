@@ -16,9 +16,11 @@
                (try-or! (json/parse (alloc/malloc-allocator) (text/trim source))
                         (Reply
                           :doc
-                            (json/Doc :source ""
+                            (json/Doc
+                              :source ""
                               :tokens
-                                (al-new [json/Token] (alloc/malloc-allocator)))
+                                (ArrayList::new [json/Token]
+                                                (alloc/malloc-allocator)))
                           :ok false))]
          (Reply :doc d :ok true))))
 
@@ -104,14 +106,14 @@
         n (len raw)]
     (while (< (load i) n)
       (let [b (get raw (load i))]
-        (if (or (!= b (p/cast u8 92)) (>= (+ (load i) 1) n))
+        (if (or (!= b (: 92 u8)) (>= (+ (load i) 1) n))
             (do (text/push-byte! out b) (set! i (+ (load i) 1)))
             (let [e (p/cast i64 (get raw (+ (load i) 1)))]
-              (cond (= e 110) (text/push-byte! out (p/cast u8 10))
-                    (= e 116) (text/push-byte! out (p/cast u8 9))
-                    (= e 114) (text/push-byte! out (p/cast u8 13))
-                    (= e 98) (text/push-byte! out (p/cast u8 8))
-                    (= e 102) (text/push-byte! out (p/cast u8 12))
+              (cond (= e 110) (text/push-byte! out (: 10 u8))
+                    (= e 116) (text/push-byte! out (: 9 u8))
+                    (= e 114) (text/push-byte! out (: 13 u8))
+                    (= e 98) (text/push-byte! out (: 8 u8))
+                    (= e 102) (text/push-byte! out (: 12 u8))
                     (= e 117)
                       (let [hi (hex4 raw (+ (load i) 2))]
                         (cond (< hi 0) (text/push-str! out "\\u")
@@ -119,8 +121,8 @@
                               (and (>= hi 55296)
                                    (<= hi 56319)
                                    (<= (+ (load i) 12) n)
-                                   (= (get raw (+ (load i) 6)) (p/cast u8 92))
-                                   (= (get raw (+ (load i) 7)) (p/cast u8 117)))
+                                   (= (get raw (+ (load i) 6)) (: 92 u8))
+                                   (= (get raw (+ (load i) 7)) (: 117 u8)))
                                 (let [lo (hex4 raw (+ (load i) 8))]
                                   (if (and (>= lo 56320) (<= lo 57343))
                                       (do
@@ -142,7 +144,8 @@
     (do)))
 
 ;;; String value I decoded into OUT (appended). False when I is not a string.
-(defn string-into! [(r (ptr Reply)) (i i64) (out (ptr (ArrayList u8)))] (-> bool)
+(defn string-into! [(r (ptr Reply)) (i i64) (out (ptr (ArrayList u8)))]
+  (-> bool)
   (if (and (>= i 0) (json/is-string? (token r i)))
       (do (decode-into! (json/string-text (.doc r) (token r i)) out) true)
       false))
@@ -156,10 +159,12 @@
   (when (not (string-into! r (get r i key) out)) (text/push-str! out default) 0)
   (do))
 
-(defn field-i64 [(r (ptr Reply)) (i i64) (key (slice u8)) (default i64)] (-> i64)
+(defn field-i64 [(r (ptr Reply)) (i i64) (key (slice u8)) (default i64)]
+  (-> i64)
   (i64-of r (get r i key) default))
 
-(defn field-bool [(r (ptr Reply)) (i i64) (key (slice u8)) (default bool)] (-> bool)
+(defn field-bool [(r (ptr Reply)) (i i64) (key (slice u8)) (default bool)]
+  (-> bool)
   (bool-of r (get r i key) default))
 
 ;;; jimctl's contract: `ok` is true, else `error` says why.
