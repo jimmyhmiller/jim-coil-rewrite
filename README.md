@@ -79,7 +79,7 @@ Canvas controls follow the original Jim handler:
 | ⌘⇧P | Search actions; arrows or pointer select, Return or click runs |
 | ⌘W / pane × | Close focused / selected pane |
 | ⌘1–4 | Switch among the first four visible projects |
-| ⌘⇧\ / All workspaces | Toggle cube; drag spins, scroll zooms, click or Return enters, Esc returns |
+| ⌘⇧\ / All workspaces | Toggle cube; drag spins and tilts, scroll zooms, click or Return enters, Esc returns |
 | ⌘⇧E | Toggle Exposé; click a pane to focus it, Esc returns |
 
 Default empty-canvas left drag does not pan, matching Jim. Zoom spans 0.2×–4×.
@@ -93,7 +93,11 @@ camera stands back and above the ring, under a night sky with twinkling stars,
 and the ring is reflected in the floor. Each face shows its project's whole
 layout scaled to fit, its panes floating off the face. A drag throws the ring,
 which coasts to a stop; scrolling moves the camera in and out; clicking a face
-dives into it. Every face is drawn, turned away or not; depth decides what
+dives into it. Dragging up and down tips the ring as Compiz's cube did under
+XGL (its first `rotate.c`): about its center, around the screen's horizontal
+axis however the ring is turned, up to 100° either way. Released, it springs
+back level on Compiz's own spring. Tipped, the ring rises to rest its lowest
+corner on the floor, as Compiz's cube reflection did by default. Every face is drawn, turned away or not; depth decides what
 shows. The sky and floor are views beside the cube's stage rather than
 inside it: Core Animation depth-tests layers under one perspective, and an
 opaque sky at depth 0 would hide the ring behind it.
@@ -110,7 +114,11 @@ the layer transform. AppKit draws no view whose frame lies outside the window,
 so a pane only carried into view by its transform would show up blank. A
 zoomed pane's layer is as big as its bounds and AppKit scales it onto the
 frame with the layer's transform, so every transform the canvas sets starts
-from that scale.
+from that scale. AppKit also anchors each view's layer at its corner and puts
+that anchor back whenever it updates the layer from its view, which it first
+does at some point after launch. So the cube never moves an anchor: the stage's
+perspective, the reflection, the cube and its faces carry their centers in
+their transforms.
 
 Edit and save `config/shell.coil` to hot-load theme/configuration values. ⌘R forces
 a reload. Invalid builds preserve the last good configuration and live terminals.

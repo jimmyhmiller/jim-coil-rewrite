@@ -4,6 +4,7 @@
 (import "jim.ghostty" :as ghostty)
 (import "jim.native" :use *)
 (import "coil.math" :use [Float])
+(import "coil.primitive" :as p)
 
 (defn near? [(x f64) (y f64)] (-> bool)
   (and (< (- x y) 0.000001) (> (- x y) -0.000001)))
@@ -13,14 +14,25 @@
   (assert (= (workspace/wrap 4 4) 0))
   (assert (= (workspace/wrap -9 4) 3)))
 
-(defn view [(shift f64) (lift f64) (distance f64) (yaw f64) (focal f64)]
-  (-> workspace/View)
+(defn tipped-view [(shift f64)
+                   (lift f64)
+                   (distance f64)
+                   (yaw f64)
+                   (tilt f64)
+                   (rise f64)
+                   (focal f64)] (-> workspace/View)
   (workspace/View
     :shift shift
     :lift lift
     :distance distance
     :yaw yaw
+    :tilt tilt
+    :rise rise
     :focal focal))
+
+(defn view [(shift f64) (lift f64) (distance f64) (yaw f64) (focal f64)]
+  (-> workspace/View)
+  (tipped-view shift lift distance yaw 0.0 0.0 focal))
 
 ;;; Where a corner of face INDEX lands on the stage.
 (defn corner [(camera Transform)
@@ -117,6 +129,100 @@
         left-of-1 (corner camera 1 6 radius -500.0 0.0)]
     (assert (< (abs (- (.x right-of-0) (.x left-of-1))) 0.0001))
     (assert (< (abs (- (.z right-of-0) (.z left-of-1))) 0.0001))))
+
+;;; ---- the tilt ----
+
+(deftest tilting-shows-the-cube-top-to-the-viewer
+  (let [radius (workspace/face-radius 4 1000.0)
+        camera
+          (workspace/camera-transform (tipped-view 0.0
+                                                   0.0
+                                                   2000.0
+                                                   0.0
+                                                   0.3
+                                                   0.0
+                                                   1000.0))
+        level (workspace/camera-transform (view 0.0 0.0 2000.0 0.0 1000.0))
+        top (corner camera 0 4 radius 0.0 400.0)
+        bottom (corner camera 0 4 radius 0.0 -400.0)]
+    (assert (> (.z top) (.z (corner level 0 4 radius 0.0 400.0))))
+    (assert (< (.z bottom) (.z (corner level 0 4 radius 0.0 -400.0))))))
+
+(deftest the-cube-tips-about-the-screens-horizontal-axis-however-it-is-turned
+  (let [radius (workspace/face-radius 4 1000.0)
+        tipped
+          (workspace/camera-transform (tipped-view 0.0
+                                                   0.0
+                                                   2000.0
+                                                   0.7
+                                                   0.5
+                                                   0.0
+                                                   1000.0))
+        level (workspace/camera-transform (view 0.0 0.0 2000.0 0.7 1000.0))]
+    (for [i 0 4]
+      (let [a (corner tipped i 4 radius 500.0 400.0)
+            b (corner level i 4 radius 500.0 400.0)]
+        (assert (< (abs (- (.x a) (.x b))) 0.0001))))))
+
+(deftest a-tipped-cube-rises-to-rest-on-the-floor
+  (assert (near? (workspace/rise 4 500.0 500.0 400.0 0.3 0.0) 0.0))
+  (let [tilt 0.5
+        rise (workspace/rise 4 500.0 500.0 400.0 0.0 tilt)
+        camera
+          (workspace/camera-transform (tipped-view 0.0
+                                                   0.0
+                                                   2000.0
+                                                   0.0
+                                                   tilt
+                                                   rise
+                                                   1000.0))
+        floor
+          (workspace/apply (workspace/camera-transform (view 0.0
+                                                             0.0
+                                                             2000.0
+                                                             0.0
+                                                             1000.0))
+                           (workspace/Vec3
+                             :x 0.0
+                             :y -400.0
+                             :z 0.0))]
+    ; The front bottom edge is lowest: 400 cos t + 500 sin t below the axis.
+    (assert (near? rise (- (+ (* 400.0 (cos tilt)) (* 500.0 (sin tilt))) 400.0)))
+    (assert (near? (.y (corner camera 0 4 500.0 500.0 -400.0)) (.y floor)))))
+
+(deftest only-faces-turned-to-the-eye-face-it
+  (let [camera (workspace/camera-transform (view 0.0 160.0 2000.0 0.0 1000.0))]
+    (assert (workspace/faces-eye? camera
+                                  (workspace/face-placement 0 4 500.0)
+                                  1000.0))
+    (assert (not (workspace/faces-eye? camera
+                                       (workspace/face-placement 2 4 500.0)
+                                       1000.0)))))
+
+;;; Where a spring from START degrees has reached after SECONDS at 60 Hz, and
+;;; the lowest it went, both in degrees.
+(defstruct Sprung [(angle f64) (lowest f64)])
+
+(defn spring-from [(start f64) (seconds f64)] (-> Sprung)
+  (let [degrees 57.29577951308232
+        (mut t) (workspace/Tilt :angle (/ start degrees) :speed 0.0)
+        (mut lowest) start]
+    (for [frame 0 (p/cast i64 (* seconds 60.0))]
+      (set! t (workspace/spring-tilt (load t) (/ 1.0 60.0)))
+      (set! lowest (min (load lowest) (* (.angle (load t)) degrees))))
+    (Sprung :angle (* (.angle (load t)) degrees) :lowest (load lowest))))
+
+(deftest a-released-tilt-springs-back-exactly-level
+  ; Halfway back from 30° in under 0.2 s, at rest within half a second.
+  (assert (< (.angle (spring-from 30.0 0.2)) 15.0))
+  (let [done (spring-from 30.0 0.5)]
+    (assert (= (.angle done) 0.0))
+    (assert (> (.lowest done) -0.2)))
+  ; From 90° it swings past level by under 2° before settling.
+  (let [done (spring-from 90.0 1.0)]
+    (assert (= (.angle done) 0.0))
+    (assert (< (.lowest done) 0.0))
+    (assert (> (.lowest done) -2.0))))
 
 (deftest ghostty-abi-matches-c-header
   (assert (= (sizeof ghostty/SurfaceConfig) 88))

@@ -54,8 +54,16 @@
    (dragging bool)
    (drag-x f64)
    (drag-angle f64)
+   ;; The cube's tilt (workspace's tilt), set by dragging up and down from
+   ;; DRAG-TILT at DRAG-Y, and how fast it changes in radians per second:
+   ;; measured while dragging, then sprung back level after release.
+   (tilt f64)
+   (tilt-speed f64)
+   (drag-y f64)
+   (drag-tilt f64)
    ;; The cube's spin in radians per second: measured while dragging, then
-   ;; coasting down after release. DRAG-AT and SPIN-AT are when each last ran.
+   ;; coasting down after release. DRAG-AT and SPIN-AT are when each last ran;
+   ;; SPIN-AT also clocks the tilt's spring.
    (spin f64)
    (drag-at f64)
    (spin-at f64)
@@ -159,7 +167,8 @@
 
 (const DIVE-TIME 0.55)
 
-;;; Radians of spin per point dragged.
+;;; Radians of spin, or of tilt, per point dragged. Compiz turned the cube
+;;; equally fast both ways.
 (const DRAG-RATE 0.006)
 
 ;;; A released cube keeps 90% of its spin per 60 Hz frame: it falls by e
@@ -187,6 +196,17 @@
   (let [s (shell)]
     (and (.overview s) (not (.dragging s)) (> (abs (.spin s)) SPIN-REST))))
 
+;;; Whether a released cube is still springing back level. The spring ends
+;;; exactly level.
+(defn tilting? [] (-> bool)
+  (let [s (shell)]
+    (and (.overview s)
+         (not (.dragging s))
+         (or (!= (.tilt s) 0.0) (!= (.tilt-speed s) 0.0)))))
+
+(defn coasting? [] (-> bool)
+  (or (spinning?) (tilting?)))
+
 ;;; The width of each project's canvas: everything right of the sidebar in a
 ;;; window WIDTH wide. layout! sizes the faces with it and pose! builds the
 ;;; cube from it, so the two always agree.
@@ -203,8 +223,9 @@
 (defn overview-distance [] (-> f64)
   (+ (apothem) (focal) (* workspace/PULLBACK (.height (shell)))))
 
-;;; Where the camera stands now, with the ring turned by YAW.
-(defn camera-view [(yaw f64)] (-> workspace/View)
+;;; Where the camera stands now, with the ring turned by YAW and tipped by
+;;; TILT, risen so it rests on the floor. Flat, the ring is always level.
+(defn camera-view [(yaw f64) (tilt f64)] (-> workspace/View)
   (let [s (shell)]
     (if (.overview s)
         (workspace/View
@@ -212,6 +233,14 @@
           :lift (* workspace/LIFT (.height s))
           :distance (.view-distance s)
           :yaw yaw
+          :tilt tilt
+          :rise
+            (workspace/rise (ring-count)
+                            (apothem)
+                            (* 0.5 (face-width (.width s)))
+                            (* 0.5 (.height s))
+                            yaw
+                            tilt)
           :focal (focal))
         ; Flat: the face exactly over the canvas, which the wide stage holds
         ; half a sidebar right of its center.
@@ -220,11 +249,9 @@
           :lift 0.0
           :distance (+ (apothem) (focal))
           :yaw yaw
+          :tilt 0.0
+          :rise 0.0
           :focal (focal)))))
-
-;;; Whether face I points toward the viewer with the ring turned by YAW.
-(defn facing? [(i i64) (faces i64) (yaw f64)] (-> bool)
-  (> (cos (+ yaw (workspace/face-angle (ring-slot i) faces))) 0.0))
 
 ;;; Height above the stage's bottom where the camera sees world point P.
 (defn screen-height [(camera Transform) (p workspace/Vec3)] (-> f64)
@@ -236,7 +263,7 @@
 (defn night! [] (-> void)
   (let [s (shell)
         h (.height s)
-        still (workspace/camera-transform (camera-view 0.0))
+        still (workspace/camera-transform (camera-view 0.0 0.0))
         floor (* -0.5 h)]
     (sky/layout! (field s night)
                  (if (.wide s) (.width s) (face-width (.width s)))
@@ -255,43 +282,38 @@
                                                           (face-width (.width s))))))
     (do)))
 
-;;; Make V fill a W×H stage, centered on it.
-(defn fill! [(v (ptr i8)) (w f64) (h f64)] (-> void)
-  (frame! v (rect 0.0 0.0 w h))
-  (msg i64 (layer v) (sel c"setAnchorPoint:") [Point] (Point :x 0.5 :y 0.5))
-  (msg i64
-       (layer v)
-       (sel c"setPosition:")
-       [Point]
-       (Point :x (* 0.5 w) :y (* 0.5 h)))
-  (do))
+;;; The stage's center, about which the cube is drawn.
+(defn stage-center [] (-> Point)
+  (let [s (shell)]
+    (Point
+      :x (* 0.5 (if (.wide s) (.width s) (face-width (.width s))))
+      :y (* 0.5 (.height s)))))
 
 ;;; Size the stage for the cube (WIDE: the whole window, over the sidebar) or
 ;;; for the flat canvas. The ring stays centered in it, and camera-view's
 ;;; shift keeps a flat face exactly where it was, so this never moves anything
 ;;; on screen.
+;;;
+;;; The stage, the reflection, the cube and the faces are views, whose layers
+;;; AppKit anchors at their corners and lays out from their frames, resetting
+;;; any anchor it finds. Their anchors and positions are left to AppKit; the
+;;; transforms carry the centers (workspace/about).
 (defn wide! [(wide bool)] (-> void)
   (let [s (shell)
         h (.height s)
         rail (sidebar/width)
-        w (if wide (.width s) (face-width (.width s)))
-        center (Point :x (* 0.5 w) :y (* 0.5 h))]
+        w (if wide (.width s) (face-width (.width s)))]
     (set! (.wide s) wide)
     (frame! (.stage s) (rect (if wide 0.0 rail) 0.0 w h))
+    (frame! (.mirror s) (rect 0.0 0.0 w h))
+    (frame! (.cube s) (rect 0.0 0.0 w h))
+    ; The eye stands where a face exactly fills the window, over the stage's
+    ; center.
     (msg i64
          (layer (.stage s))
-         (sel c"setAnchorPoint:")
-         [Point]
-         (Point :x 0.5 :y 0.5))
-    (msg i64
-         (layer (.stage s))
-         (sel c"setPosition:")
-         [Point]
-         (Point :x (+ (if wide 0.0 rail) (* 0.5 w)) :y (* 0.5 h)))
-    (fill! (.mirror s) w h)
-    (fill! (.cube s) w h)
-    (for [i 0 (count)]
-      (msg i64 (layer (face i)) (sel c"setPosition:") [Point] center))
+         (sel c"setSublayerTransform:")
+         [Transform]
+         (workspace/about (workspace/perspective (focal)) (* 0.5 w) (* 0.5 h)))
     ; The reflection is drawn only while the cube can be seen.
     (msg i64
          (layer (.mirror s))
@@ -306,18 +328,35 @@
         h (.height s)
         faces (ring-count)
         radius (apothem)
-        camera (workspace/camera-transform (camera-view (.angle s)))
+        camera (workspace/camera-transform (camera-view (.angle s) (.tilt s)))
+        ; The reflection mirrors the ring across the floor as the ring is
+        ; tipped, so it starts from the level camera: yaw turns about the
+        ; floor's normal and commutes with the mirror, but tilt does not.
+        level (workspace/camera-transform (camera-view (.angle s) 0.0))
         ; Settled flat, the project lies exactly on the window. Its
         ; transforms are then exactly the identity, which Core Animation
         ; draws without resampling, so text stays sharp.
         flat (not (.wide s))
-        identity (CATransform3DMakeTranslation 0.0 0.0 0.0)]
-    (transform! (layer (.cube s)) (if flat identity camera) duration)
+        identity (CATransform3DMakeTranslation 0.0 0.0 0.0)
+        center (stage-center)
+        ; The ring's axis is the cube layer's origin; the camera carries it
+        ; to the stage's center. Each face is moved onto the axis by half its
+        ; size before it is placed around the ring.
+        on-stage (CATransform3DMakeTranslation (.x center) (.y center) 0.0)
+        half
+          (CATransform3DMakeTranslation (* -0.5 (face-width (.width s)))
+                                        (* -0.5 h)
+                                        0.0)]
+    (transform! (layer (.cube s))
+                (if flat identity (CATransform3DConcat camera on-stage))
+                duration)
     (msg i64
          (layer (.mirror s))
          (sel c"setInstanceTransform:")
          [Transform]
-         (workspace/mirror-transform camera (* -0.5 h)))
+         (workspace/about (workspace/mirror-transform level (* -0.5 h))
+                          (.x center)
+                          (.y center)))
     (for [i 0 (count)]
       ; Every face of the ring is drawn, turned away or not: the depth test
       ; hides what is behind, and what can be seen past it stays.
@@ -325,7 +364,10 @@
         (transform! (layer (face i))
                     (if (and flat (= i (.selected s)))
                         identity
-                        (workspace/face-placement (ring-slot i) faces radius))
+                        (CATransform3DConcat half
+                                             (workspace/face-placement (ring-slot i)
+                                                                       faces
+                                                                       radius)))
                     duration)
         (msg i64 (face i) (sel c"setHidden:") [i8] (p/cast i8 (if shown 0 1)))
         (when (!= (.visible (project i)) (or (.wide s) (= i (.selected s))))
@@ -345,6 +387,10 @@
             0))))
     (set! (.refit s) false)
     (when (.wide s) (night!) 0)
+    ; The fade is laid out for the cube at rest, level on the floor.
+    (when (and (.overview s) (= (.settle-at s) 0.0))
+      (sky/fade! (field s night) (= (.tilt s) 0.0))
+      0)
     (if (.overview s)
         (do
           (if (palette/open?)
@@ -391,6 +437,8 @@
         selected (choose! index)]
     (set! (.angle s) (ring-angle selected))
     (set! (.spin s) 0.0)
+    (set! (.tilt s) 0.0)
+    (set! (.tilt-speed s) 0.0)
     (set! (.overview s) false)
     (set! (.settle-at s) 0.0)
     ;; Project navigation is an immediate swap, including during an
@@ -420,6 +468,8 @@
   (let [s (shell)]
     (set! (.origin s) (.selected s))
     (set! (.spin s) 0.0)
+    (set! (.tilt s) 0.0)
+    (set! (.tilt-speed s) 0.0)
     (transaction! 0.0)
     (msg i64
          (class c"CATransaction")
@@ -432,8 +482,9 @@
     (set! (.overview s) true)
     (set! (.view-distance s) (overview-distance))
     (sky/fade! (field s night) false)
-    (pose! ENTER-TIME)
+    ; Set first: pose! leaves the fade hidden while a transition runs.
     (set! (.settle-at s) (+ (animation/animation-now) ENTER-TIME))
+    (pose! ENTER-TIME)
     (do)))
 
 ;;; Dive from the cube into project INDEX, turning the short way.
@@ -442,11 +493,13 @@
         selected (choose! index)]
     (set! (.angle s) (nearest-angle selected))
     (set! (.spin s) 0.0)
+    (set! (.tilt s) 0.0)
+    (set! (.tilt-speed s) 0.0)
     (set! (.dragging s) false)
     (set! (.overview s) false)
     (sky/fade! (field s night) false)
-    (pose! DIVE-TIME)
     (set! (.settle-at s) (+ (animation/animation-now) DIVE-TIME))
+    (pose! DIVE-TIME)
     (do)))
 
 ;;; Finish a cube transition once its animation has run: a dive gives the
@@ -457,7 +510,7 @@
                (>= (animation/animation-now) (.settle-at s)))
       (set! (.settle-at s) 0.0)
       (if (.overview s)
-          (sky/fade! (field s night) true)
+          (sky/fade! (field s night) (= (.tilt s) 0.0))
           (do
             (transaction! 0.0)
             (msg i64
@@ -494,43 +547,43 @@
   (let [s (shell)
         faces (ring-count)
         radius (apothem)
-        camera (workspace/camera-transform (camera-view (.angle s)))
+        camera (workspace/camera-transform (camera-view (.angle s) (.tilt s)))
         half-w (* 0.5 (face-width (.width s)))
         half-h (* 0.5 (.height s))
         at (Point :x (- (.x pt) (* 0.5 (.width s))) :y (- (.y pt) half-h))
         (mut found) -1
         (mut nearest) -1000000000.0]
     (for [i 0 (count)]
-      (when (and (shown? i) (facing? i faces (.angle s)))
-        (let [place (workspace/face-placement (ring-slot i) faces radius)
-              depth
-                (.z (workspace/apply camera
-                                     (workspace/apply place
-                                                      (workspace/Vec3
-                                                        :x 0.0
-                                                        :y 0.0
-                                                        :z 0.0))))]
-          (when (and (> depth (load nearest))
-                     (workspace/quad-contains? at
-                                               (face-corner camera
-                                                            place
-                                                            (- 0.0 half-w)
-                                                            (- 0.0 half-h))
-                                               (face-corner camera
-                                                            place
-                                                            half-w
-                                                            (- 0.0 half-h))
-                                               (face-corner camera
-                                                            place
-                                                            half-w
-                                                            half-h)
-                                               (face-corner camera
-                                                            place
-                                                            (- 0.0 half-w)
-                                                            half-h)))
-            (set! found i)
-            (set! nearest depth)
-            0))))
+      (let [place (workspace/face-placement (ring-slot i) faces radius)]
+        (when (and (shown? i) (workspace/faces-eye? camera place (focal)))
+          (let [depth
+                  (.z (workspace/apply camera
+                                       (workspace/apply place
+                                                        (workspace/Vec3
+                                                          :x 0.0
+                                                          :y 0.0
+                                                          :z 0.0))))]
+            (when (and (> depth (load nearest))
+                       (workspace/quad-contains? at
+                                                 (face-corner camera
+                                                              place
+                                                              (- 0.0 half-w)
+                                                              (- 0.0 half-h))
+                                                 (face-corner camera
+                                                              place
+                                                              half-w
+                                                              (- 0.0 half-h))
+                                                 (face-corner camera
+                                                              place
+                                                              half-w
+                                                              half-h)
+                                                 (face-corner camera
+                                                              place
+                                                              (- 0.0 half-w)
+                                                              half-h)))
+              (set! found i)
+              (set! nearest depth)
+              0)))))
     (load found)))
 
 (defn layout! [] (-> void)
@@ -556,20 +609,9 @@
       (frame! (.heading s) (rect (+ rail 32.0) (- height 44.0) 450.0 24.0))
       (frame! (.status s)
               (rect (+ rail 32.0) 10.0 (- width (+ rail 45.0)) 20.0))
-      ; The eye stands where a face exactly fills the window.
-      (msg i64
-           (layer (.stage s))
-           (sel c"setSublayerTransform:")
-           [Transform]
-           (workspace/perspective (focal)))
       (for [i 0 (count)]
         (do
           (frame! (face i) (rect 0.0 0.0 fw fh))
-          (msg i64
-               (layer (face i))
-               (sel c"setAnchorPoint:")
-               [Point]
-               (Point :x 0.5 :y 0.5))
           (frame! (.plate (runtime i)) (rect 0.0 0.0 fw fh))
           ; A face is the project's own background, solid, as in Jim.
           (background! (.plate (runtime i))
@@ -808,20 +850,31 @@
                :canvas c))
       (if (canvas/restorable? saved) (canvas/restore! c saved) true))))
 
-;;; Advance a coasting cube to now.
+;;; Advance a coasting cube to now: its spin slows and its tilt springs back.
 (defn coast! [] (-> void)
   (let [s (shell)]
-    (if (spinning?)
+    (if (coasting?)
         (let [now (animation/animation-now)
               ; A stalled frame resumes smoothly instead of jumping.
               dt (min (- now (.spin-at s)) 0.05)]
-          (set! (.angle s) (+ (.angle s) (* (.spin s) dt)))
-          (set! (.spin s) (* (.spin s) (exp (- 0.0 (* SPIN-FRICTION dt)))))
+          (when (spinning?)
+            (set! (.angle s) (+ (.angle s) (* (.spin s) dt)))
+            (set! (.spin s) (* (.spin s) (exp (- 0.0 (* SPIN-FRICTION dt)))))
+            0)
+          (when (tilting?)
+            (let [sprung
+                    (workspace/spring-tilt (workspace/Tilt
+                                             :angle (.tilt s)
+                                             :speed (.tilt-speed s))
+                                           dt)]
+              (set! (.tilt s) (.angle sprung))
+              (set! (.tilt-speed s) (.speed sprung))
+              0))
           (set! (.spin-at s) now)
           (select-nearest!)
           (pose! 0.0))
-        ; Not coasting. Leave the spin alone: while dragging it holds the
-        ; speed being measured for the throw.
+        ; Not coasting. Leave the spin and tilt alone: while dragging they
+        ; hold the speeds being measured for the throw.
         0)
     (do)))
 
@@ -1174,26 +1227,41 @@
                     now (animation/animation-now)]
                 (cond (= kind 1)
                         (do
-                          ; Grabbing the cube stops any coast.
+                          ; Grabbing the cube stops any coast, and holds
+                          ; its tilt where it is.
                           (set! (.dragging s) true)
                           (set! (.press s) pt)
                           (set! (.drag-x s) (.x pt))
                           (set! (.drag-angle s) (.angle s))
+                          (set! (.drag-y s) (.y pt))
+                          (set! (.drag-tilt s) (.tilt s))
                           (set! (.spin s) 0.0)
+                          (set! (.tilt-speed s) 0.0)
                           (set! (.drag-at s) now)
                           (do))
                       (and (= kind 6) (.dragging s))
                         (let [before (.angle s)
+                              tipped (.tilt s)
                               dt (- now (.drag-at s))]
                           (set! (.angle s)
                                 (+ (.drag-angle s)
                                    (* (- (.x pt) (.drag-x s)) DRAG-RATE)))
+                          ; Dragging down tips the cube's top toward the
+                          ; viewer, as Compiz's did.
+                          (set! (.tilt s)
+                                (workspace/clamp-tilt (- (.drag-tilt s)
+                                                         (* (- (.y pt)
+                                                               (.drag-y s))
+                                                            DRAG-RATE))))
                           ; Smoothed, so one jittery sample does not decide
                           ; the throw.
                           (when (> dt 0.0)
                             (set! (.spin s)
                                   (+ (* 0.6 (/ (- (.angle s) before) dt))
                                      (* 0.4 (.spin s))))
+                            (set! (.tilt-speed s)
+                                  (+ (* 0.6 (/ (- (.tilt s) tipped) dt))
+                                     (* 0.4 (.tilt-speed s))))
                             (set! (.drag-at s) now)
                             0)
                           (pose! 0.0))
@@ -1208,11 +1276,13 @@
                           (if (>= chosen 0)
                               (dive! chosen)
                               (do
-                                ; The cube keeps the spin it was thrown with,
-                                ; unless it was held still before release.
+                                ; The cube keeps the spin and tilt it was
+                                ; thrown with, unless it was held still
+                                ; before release. Its tilt then springs back.
                                 (when (or clicked
                                           (> (- now (.drag-at s)) SPIN-HOLD))
                                   (set! (.spin s) 0.0)
+                                  (set! (.tilt-speed s) 0.0)
                                   0)
                                 (set! (.spin-at s) now)
                                 (select-nearest!)
@@ -1460,7 +1530,7 @@
                                       (sel c"dateWithTimeIntervalSinceNow:")
                                       [f64]
                                       (if (or (widget-view/any-animating?)
-                                              (spinning?)
+                                              (coasting?)
                                               (> (.settle-at s) 0.0))
                                           (/ 1.0 60.0)
                                           0.2))

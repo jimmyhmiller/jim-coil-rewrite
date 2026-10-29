@@ -43,9 +43,16 @@
 
 ;;; Where the camera stands: SHIFT points sideways (the sidebar offset of the
 ;;; flat view), LIFT points up, DISTANCE from the ring's axis; the ring turned
-;;; by YAW; FOCAL the perspective distance.
+;;; by YAW, then tipped by TILT (see the tilt below) and raised RISE points;
+;;; FOCAL the perspective distance.
 (defstruct View
-  [(shift f64) (lift f64) (distance f64) (yaw f64) (focal f64)])
+  [(shift f64)
+   (lift f64)
+   (distance f64)
+   (yaw f64)
+   (tilt f64)
+   (rise f64)
+   (focal f64)])
 
 ;;; The ring's transform as seen from VIEW: world points (the ring's axis at
 ;;; the origin, y up) to the stage, whose perspective puts the eye at FOCAL.
@@ -57,8 +64,10 @@
           (CATransform3DTranslate tilted
                                   0.0
                                   (- 0.0 (.lift v))
-                                  (- 0.0 (.distance v)))]
-    (CATransform3DRotate moved (.yaw v) 0.0 1.0 0.0)))
+                                  (- 0.0 (.distance v)))
+        raised (CATransform3DTranslate moved 0.0 (.rise v) 0.0)
+        tipped (CATransform3DRotate raised (.tilt v) 1.0 0.0 0.0)]
+    (CATransform3DRotate tipped (.yaw v) 0.0 1.0 0.0)))
 
 ;;; Face INDEX of COUNT around the ring, RADIUS (face-radius) from the axis.
 (defn face-placement [(index i64) (count i64) (radius f64)] (-> Transform)
@@ -126,3 +135,125 @@
 (defn perspective [(distance f64)] (-> Transform)
   (let [(mut t) (CATransform3DMakeTranslation 0.0 0.0 0.0)]
     (do (set! (.m34 t) (/ -1.0 distance)) (load t))))
+
+;;; T applied about the point (X, Y) of a layer anchored at its corner.
+;;; AppKit anchors every view's layer at its corner and resets the anchor
+;;; whenever it updates the layer from the view, so the cube's layers keep
+;;; that anchor and carry their centers in their transforms instead.
+(defn about [(t Transform) (x f64) (y f64)] (-> Transform)
+  (CATransform3DConcat (CATransform3DConcat (CATransform3DMakeTranslation (- 0.0
+                                                                             x)
+                                                                          (- 0.0
+                                                                             y)
+                                                                          0.0)
+                                            t)
+                       (CATransform3DMakeTranslation x y 0.0)))
+
+;;; ---- the tilt -----------------------------------------------------------------
+;;; Compiz's cube, as XGL showed it in 2006 (rotate.c in Compiz's first
+;;; revision): dragging up or down tips the cube about its center, around the
+;;; screen's horizontal axis whatever way it is turned, and a tilt of TILT
+;;; shows its top toward the viewer. Released, it springs back level.
+;;;
+;;; Compiz tipped the cube about its center, so a tilted cube would sink
+;;; through the floor. As Compiz's cube reflection did by default ("Jumpy"
+;;; mode), the ring rises until its lowest corner rests on the floor, and the
+;;; reflection stays on the floor.
+
+;;; Compiz let a cube seen from outside tip 100° either way.
+(const TILT-LIMIT 1.7453292519943295)
+
+(defn clamp-tilt [(tilt f64)] (-> f64)
+  (max (min tilt TILT-LIMIT) (- 0.0 TILT-LIMIT)))
+
+;;; A tilt in radians and how fast it changes, in radians per second.
+(defstruct Tilt [(angle f64) (speed f64)])
+
+;;; T after DT seconds of Compiz's spring back to level. Compiz ran it in
+;;; degrees and in steps of its own time unit (1/75 s at its default speed of
+;;; 1.5), at most 0.6 of a unit each, with its default acceleration of 4. A
+;;; tilt within 0.1° moving under 0.2° a unit is at rest, and is exactly
+;;; level.
+(defn spring-tilt [(t Tilt) (dt f64)] (-> Tilt)
+  (let [degrees 57.29577951308232
+        amount (* dt 75.0)
+        whole (p/cast i64 (/ amount 0.6))
+        steps (if (< whole 1) 1 whole)
+        chunk (/ amount (p/cast f64 steps))
+        (mut y) (* (.angle t) degrees)
+        (mut v) (/ (* (.speed t) degrees) 75.0)
+        (mut resting) false]
+    (for [k 0 steps]
+      (when (not (load resting))
+        (set! y (+ (load y) (* (load v) chunk)))
+        (when (> (abs (load y)) 100.0)
+          (set! y (if (> (load y) 0.0) 100.0 -100.0))
+          (set! v 0.0))
+        (let [pull (* (- 0.0 (load y)) 0.2)
+              weight (max (min (abs (load y)) 30.0) 10.0)]
+          (set! v (/ (+ (* weight (load v)) pull) (+ weight 2.0))))
+        (when (and (< (abs (load y)) 0.1) (< (abs (load v)) 0.2))
+          (set! resting true)
+          (set! y 0.0)
+          (set! v 0.0))))
+    (Tilt :angle (/ (load y) degrees) :speed (/ (* (load v) 75.0) degrees))))
+
+;;; How far a ring of COUNT faces HALF-W by HALF-H, RADIUS (face-radius) from
+;;; its axis, must rise for its lowest corner to rest on the floor along its
+;;; faces' bottom edges, turned by YAW and tipped by TILT.
+(defn rise [(count i64)
+            (radius f64)
+            (half-w f64)
+            (half-h f64)
+            (yaw f64)
+            (tilt f64)] (-> f64)
+  (let [turn
+          (CATransform3DRotate (CATransform3DRotate (CATransform3DMakeTranslation 0.0
+                                                                                  0.0
+                                                                                  0.0)
+                                                    tilt
+                                                    1.0
+                                                    0.0
+                                                    0.0)
+                               yaw
+                               0.0
+                               1.0
+                               0.0)
+        (mut lowest) (- 0.0 half-h)]
+    (for [i 0 count]
+      (let [place (face-placement i count radius)]
+        (for [corner 0 4]
+          (let [y
+                  (.y (apply turn
+                             (apply place
+                                    (Vec3
+                                      :x (if (< corner 2) half-w (- 0.0 half-w))
+                                      :y
+                                        (if (= (% corner 2) 0)
+                                            half-h
+                                            (- 0.0 half-h))
+                                      :z 0.0))))]
+            (set! lowest (min (load lowest) y))))))
+    (- (- 0.0 half-h) (load lowest))))
+
+;;; Whether a face placed by PLACE turns its front to the eye, at FOCAL in
+;;; front of the stage, through CAMERA.
+(defn faces-eye? [(camera Transform) (place Transform) (focal f64)] (-> bool)
+  (let [center
+          (apply camera
+                 (apply place
+                        (Vec3
+                          :x 0.0
+                          :y 0.0
+                          :z 0.0)))
+        ahead
+          (apply camera
+                 (apply place
+                        (Vec3
+                          :x 0.0
+                          :y 0.0
+                          :z 1.0)))]
+    (> (+ (* (- (.x ahead) (.x center)) (- 0.0 (.x center)))
+          (* (- (.y ahead) (.y center)) (- 0.0 (.y center)))
+          (* (- (.z ahead) (.z center)) (- focal (.z center))))
+       0.0)))
