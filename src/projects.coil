@@ -17,7 +17,7 @@
   (let [(mut result) (nil)]
     (do
       (for [i 0 (s/count records)]
-        (if (= (id (s/at records i)) wanted) (store! result (s/at records i)) 0))
+        (if (= (id (s/at records i)) wanted) (set! result (s/at records i)) 0))
       (load result))))
 
 (defn profile [(root (ptr i8))] (-> (ptr i8))
@@ -202,7 +202,7 @@
                                   (s/kind? (s/get r c"directory") c"NSString")
                                   (and (s/kind? (s/get r c"hidden") c"NSArray")
                                        (s/numeric? r c"active")))))
-                    (store! ok false)
+                    (set! ok false)
                     0)
                 (if (!= (p/cast i64 number) 0) (s/add! seen number) 0))))))
       (load ok))))
@@ -239,8 +239,8 @@
         (let [record (s/at (list root) i)]
           (if (not (hidden? (profile root) (id record)))
               (do
-                (if (= (load at) rank) (store! found (id record)) 0)
-                (store! at (+ (load at) 1)))
+                (if (= (load at) rank) (set! found (id record)) 0)
+                (set! at (+ (load at) 1)))
               0)))
       (load found))))
 

@@ -1,0 +1,601 @@
+(module jim.widget-kit.highlight)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "jim.widget-kit.text" :as text)
+
+;;; A small lexical highlighter: comments, strings, numbers, keywords, types,
+;;; function calls and constants, by file extension. It works a line at a time;
+;;; a Lexer carries block-comment state from one line to the next.
+(const PLAIN 0)
+
+(const KEYWORD 1)
+
+(const STRING 2)
+
+(const COMMENT 3)
+
+(const NUMBER 4)
+
+(const TYPE 5)
+
+(const FUNCTION 6)
+
+(const CONSTANT 7)
+
+(const PUNCT 8)
+
+(const LANG-NONE 0)
+
+(const LANG-RUST 1)
+
+(const LANG-LISP 2)
+
+(const LANG-C 3)
+
+(const LANG-PYTHON 4)
+
+(const LANG-SHELL 5)
+
+(const LANG-JS 6)
+
+(const LANG-GO 7)
+
+(const LANG-SWIFT 8)
+
+(const LANG-ZIG 9)
+
+(const LANG-TOML 10)
+
+(defstruct Run [(at i64) (len i64) (kind i64)])
+
+(defstruct Lexer [(lang i64) (in-block bool)])
+
+(defn ext? [(path (slice u8)) (e (slice u8))] (-> bool)
+  (text/ends-with? path e))
+
+(defn language [(path (slice u8))] (-> i64)
+  (cond (ext? path ".rs") LANG-RUST
+        (or (ext? path ".coil")
+            (ext? path ".clj")
+            (ext? path ".cljs")
+            (ext? path ".el")
+            (ext? path ".scm")
+            (ext? path ".lisp")
+            (ext? path ".ft"))
+          LANG-LISP
+        (or (ext? path ".c")
+            (ext? path ".h")
+            (ext? path ".cc")
+            (ext? path ".cpp")
+            (ext? path ".hpp")
+            (ext? path ".m")
+            (ext? path ".mm")
+            (ext? path ".java")
+            (ext? path ".kt")
+            (ext? path ".cs"))
+          LANG-C
+        (ext? path ".py") LANG-PYTHON
+        (or (ext? path ".sh") (ext? path ".zsh") (ext? path ".bash")) LANG-SHELL
+        (or (ext? path ".js")
+            (ext? path ".ts")
+            (ext? path ".tsx")
+            (ext? path ".jsx")
+            (ext? path ".mjs"))
+          LANG-JS
+        (ext? path ".go") LANG-GO
+        (ext? path ".swift") LANG-SWIFT
+        (ext? path ".zig") LANG-ZIG
+        (or (ext? path ".toml") (ext? path ".yaml") (ext? path ".yml"))
+          LANG-TOML
+        :else LANG-NONE))
+
+(defn lexer [(path (slice u8))] (-> Lexer)
+  (Lexer :lang (language path) :in-block false))
+
+(defn c-like? [(lang i64)] (-> bool)
+  (or (= lang LANG-RUST)
+      (= lang LANG-C)
+      (= lang LANG-JS)
+      (= lang LANG-GO)
+      (= lang LANG-SWIFT)
+      (= lang LANG-ZIG)))
+
+(defn hash-comments? [(lang i64)] (-> bool)
+  (or (= lang LANG-PYTHON) (= lang LANG-SHELL) (= lang LANG-TOML)))
+
+(defn one-of? [(word (slice u8)) (words (slice (slice u8)))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len words)]
+      (when (= word (get words i)) (set! found true) 0))
+    (load found)))
+
+(defn keyword? [(lang i64) (w (slice u8))] (-> bool)
+  (cond (= lang LANG-RUST)
+          (one-of? w
+                   ["fn"
+                    "let"
+                    "mut"
+                    "pub"
+                    "use"
+                    "mod"
+                    "struct"
+                    "enum"
+                    "impl"
+                    "trait"
+                    "for"
+                    "in"
+                    "while"
+                    "loop"
+                    "if"
+                    "else"
+                    "match"
+                    "return"
+                    "break"
+                    "continue"
+                    "as"
+                    "ref"
+                    "move"
+                    "where"
+                    "type"
+                    "const"
+                    "static"
+                    "unsafe"
+                    "async"
+                    "await"
+                    "dyn"
+                    "crate"
+                    "self"
+                    "Self"
+                    "super"
+                    "true"
+                    "false"
+                    "extern"])
+        (= lang LANG-LISP)
+          (one-of? w
+                   ["defn"
+                    "defn*"
+                    "def"
+                    "defmacro"
+                    "defstruct"
+                    "defsum"
+                    "deftrait"
+                    "impl"
+                    "let"
+                    "if"
+                    "cond"
+                    "when"
+                    "unless"
+                    "do"
+                    "loop"
+                    "while"
+                    "for"
+                    "break"
+                    "match"
+                    "fn"
+                    "module"
+                    "import"
+                    "export"
+                    "export-c"
+                    "extern"
+                    "set!"
+                    "store!"
+                    "load"
+                    "and"
+                    "or"
+                    "not"
+                    "const"
+                    "try"
+                    "try-or!"
+                    "block"
+                    "return-from"
+                    "comptime"
+                    "defannotation"
+                    "deftest"
+                    "assert"
+                    "lambda"
+                    "define"
+                    "ns"
+                    "require"
+                    "true"
+                    "false"
+                    "nil"])
+        (= lang LANG-PYTHON)
+          (one-of? w
+                   ["def"
+                    "class"
+                    "return"
+                    "if"
+                    "elif"
+                    "else"
+                    "for"
+                    "while"
+                    "in"
+                    "import"
+                    "from"
+                    "as"
+                    "with"
+                    "try"
+                    "except"
+                    "finally"
+                    "raise"
+                    "pass"
+                    "break"
+                    "continue"
+                    "lambda"
+                    "yield"
+                    "async"
+                    "await"
+                    "not"
+                    "and"
+                    "or"
+                    "is"
+                    "None"
+                    "True"
+                    "False"
+                    "global"
+                    "nonlocal"
+                    "del"
+                    "assert"])
+        (= lang LANG-SHELL)
+          (one-of? w
+                   ["if"
+                    "then"
+                    "else"
+                    "elif"
+                    "fi"
+                    "for"
+                    "while"
+                    "do"
+                    "done"
+                    "case"
+                    "esac"
+                    "in"
+                    "function"
+                    "return"
+                    "local"
+                    "export"
+                    "set"
+                    "echo"
+                    "exit"
+                    "cd"])
+        (= lang LANG-GO)
+          (one-of? w
+                   ["func"
+                    "var"
+                    "const"
+                    "type"
+                    "struct"
+                    "interface"
+                    "map"
+                    "chan"
+                    "go"
+                    "defer"
+                    "if"
+                    "else"
+                    "for"
+                    "range"
+                    "switch"
+                    "case"
+                    "default"
+                    "return"
+                    "break"
+                    "continue"
+                    "package"
+                    "import"
+                    "select"
+                    "nil"
+                    "true"
+                    "false"])
+        (= lang LANG-ZIG)
+          (one-of? w
+                   ["fn"
+                    "const"
+                    "var"
+                    "pub"
+                    "struct"
+                    "enum"
+                    "union"
+                    "if"
+                    "else"
+                    "while"
+                    "for"
+                    "return"
+                    "try"
+                    "catch"
+                    "defer"
+                    "errdefer"
+                    "comptime"
+                    "switch"
+                    "break"
+                    "continue"
+                    "usingnamespace"
+                    "true"
+                    "false"
+                    "null"
+                    "undefined"
+                    "error"
+                    "orelse"
+                    "and"
+                    "or"
+                    "inline"
+                    "export"
+                    "extern"])
+        (= lang LANG-SWIFT)
+          (one-of? w
+                   ["func"
+                    "let"
+                    "var"
+                    "class"
+                    "struct"
+                    "enum"
+                    "protocol"
+                    "extension"
+                    "if"
+                    "else"
+                    "guard"
+                    "for"
+                    "in"
+                    "while"
+                    "return"
+                    "switch"
+                    "case"
+                    "default"
+                    "import"
+                    "self"
+                    "Self"
+                    "init"
+                    "true"
+                    "false"
+                    "nil"
+                    "try"
+                    "throw"
+                    "throws"
+                    "async"
+                    "await"
+                    "private"
+                    "public"
+                    "static"])
+        (= lang LANG-TOML) (one-of? w ["true" "false"])
+        (or (= lang LANG-C) (= lang LANG-JS))
+          (one-of? w
+                   ["if"
+                    "else"
+                    "for"
+                    "while"
+                    "do"
+                    "switch"
+                    "case"
+                    "default"
+                    "return"
+                    "break"
+                    "continue"
+                    "struct"
+                    "union"
+                    "enum"
+                    "typedef"
+                    "static"
+                    "const"
+                    "void"
+                    "int"
+                    "char"
+                    "long"
+                    "short"
+                    "unsigned"
+                    "signed"
+                    "float"
+                    "double"
+                    "bool"
+                    "sizeof"
+                    "extern"
+                    "inline"
+                    "class"
+                    "public"
+                    "private"
+                    "protected"
+                    "new"
+                    "delete"
+                    "this"
+                    "true"
+                    "false"
+                    "null"
+                    "NULL"
+                    "nullptr"
+                    "function"
+                    "var"
+                    "let"
+                    "import"
+                    "export"
+                    "from"
+                    "async"
+                    "await"
+                    "typeof"
+                    "instanceof"
+                    "interface"
+                    "type"
+                    "extends"
+                    "implements"
+                    "throw"
+                    "try"
+                    "catch"
+                    "finally"
+                    "undefined"
+                    "package"])
+        :else false))
+
+(defn letter? [(c i64)] (-> bool)
+  (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (= c 95) (>= c 128)))
+
+(defn digit? [(c i64)] (-> bool)
+  (and (>= c 48) (<= c 57)))
+
+(defn word-char? [(lang i64) (c i64)] (-> bool)
+  (or (letter? c)
+      (digit? c)
+      (and (= lang LANG-LISP)
+           (or (= c 45)
+               (= c 33)
+               (= c 63)
+               (= c 42)
+               (= c 47)
+               (= c 46)
+               (= c 62)
+               (= c 60)
+               (= c 61)
+               (= c 43)))))
+
+(defn byte-at [(line (slice u8)) (i i64)] (-> i64)
+  (if (< i (len line)) (p/cast i64 (get line i)) -1))
+
+(defn upper? [(c i64)] (-> bool)
+  (and (>= c 65) (<= c 90)))
+
+(defn all-caps? [(w (slice u8))] (-> bool)
+  (let [(mut ok) (> (len w) 1)]
+    (for [i 0 (len w)]
+      (let [c (p/cast i64 (get w i))]
+        (when (not (or (upper? c) (digit? c) (= c 95))) (set! ok false) 0)))
+    (load ok)))
+
+;;; Runs at or above FLOOR belong to the current line; only those may merge, so
+;;; lines stored back to back never share a run.
+(defn emit! [(out (ptr (ArrayList Run)))
+             (floor i64)
+             (base i64)
+             (at i64)
+             (n i64)
+             (kind i64)] (-> void)
+  (when (> n 0)
+    (let [count (len (load out))]
+      ; Merge with the previous run of the same kind on this line.
+      (if (and (> count floor)
+               (let [last (al-elem out (- count 1))]
+                 (and (= (.kind last) kind)
+                      (= (+ (.at last) (.len last)) (+ base at)))))
+          (let [last (al-elem out (- count 1))]
+            (set! (.len last) (+ (.len last) n))
+            0)
+          (do
+            (push! (mut out)
+                   (Run
+                     :at (+ base at)
+                     :len n
+                     :kind kind))
+            0)))
+    0)
+  (do))
+
+;;; Append runs covering LINE to OUT. Run offsets are BASE + index into LINE,
+;;; so a caller whose lines live in one big buffer can pass their offset.
+(defn line! [(lx (ptr Lexer))
+             (line (slice u8))
+             (base i64)
+             (out (ptr (ArrayList Run)))] (-> void)
+  (let [lang (.lang lx)
+        floor (len (load out))
+        ; Without a known language there is nothing to color.
+        n (if (= lang LANG-NONE) 0 (len line))
+        (mut i) 0
+        (mut after-paren) false]
+    (while (< (load i) n)
+      (let [start (load i)
+            c (byte-at line start)
+            c2 (byte-at line (+ start 1))]
+        (cond (.in-block lx)
+                (let [(mut j) start]
+                  (while (and (< (load j) n)
+                              (not (and (= (byte-at line (load j)) 42)
+                                        (= (byte-at line (+ (load j) 1)) 47))))
+                    (set! j (+ (load j) 1)))
+                  (when (< (load j) n)
+                    (set! (.in-block lx) false)
+                    (set! j (+ (load j) 2))
+                    0)
+                  (emit! out floor base start (- (load j) start) COMMENT)
+                  (set! i (load j)))
+              (or (and (c-like? lang) (= c 47) (= c2 47))
+                  (and (hash-comments? lang) (= c 35))
+                  (and (= lang LANG-LISP) (= c 59)))
+                (do (emit! out floor base start (- n start) COMMENT) (set! i n))
+              (and (c-like? lang) (= c 47) (= c2 42))
+                (do
+                  (set! (.in-block lx) true)
+                  (emit! out floor base start 2 COMMENT)
+                  (set! i (+ start 2)))
+              (or (= c 34)
+                  (and (= c 39) (!= lang LANG-LISP) (!= lang LANG-RUST))
+                  (and (= c 39)
+                       (= lang LANG-RUST)
+                       (= (byte-at line (+ start 2)) 39))
+                  (and (= c 96) (= lang LANG-JS)))
+                (let [(mut j) (+ start 1)]
+                  (while (and (< (load j) n) (!= (byte-at line (load j)) c))
+                    (set! j
+                          (+ (load j) (if (= (byte-at line (load j)) 92) 2 1))))
+                  (set! j (if (< (load j) n) (+ (load j) 1) n))
+                  (emit! out floor base start (- (load j) start) STRING)
+                  (set! i (load j)))
+              (and (digit? c)
+                   (or (= start 0)
+                       (not (word-char? lang (byte-at line (- start 1))))))
+                (let [(mut j) start]
+                  (while (and (< (load j) n)
+                              (let [d (byte-at line (load j))]
+                                (or (digit? d) (letter? d) (= d 46))))
+                    (set! j (+ (load j) 1)))
+                  (emit! out floor base start (- (load j) start) NUMBER)
+                  (set! i (load j)))
+              (and (= lang LANG-LISP) (= c 58) (letter? c2))
+                (let [(mut j) (+ start 1)]
+                  (while (and (< (load j) n)
+                              (word-char? lang (byte-at line (load j))))
+                    (set! j (+ (load j) 1)))
+                  (emit! out floor base start (- (load j) start) CONSTANT)
+                  (set! i (load j)))
+              (letter? c)
+                (let [(mut j) start]
+                  (while (and (< (load j) n)
+                              (word-char? lang (byte-at line (load j))))
+                    (set! j (+ (load j) 1)))
+                  (let [w (subslice line start (load j))
+                        next (byte-at line (load j))
+                        kind
+                          (cond (keyword? lang w) KEYWORD
+                                (and (= lang LANG-LISP) (load after-paren))
+                                  FUNCTION
+                                (all-caps? w) CONSTANT
+                                (and (upper? c)
+                                     (!= lang LANG-LISP)
+                                     (!= lang LANG-NONE))
+                                  TYPE
+                                (and (= next 40)
+                                     (!= lang LANG-LISP)
+                                     (!= lang LANG-NONE))
+                                  FUNCTION
+                                :else PLAIN)]
+                    (emit! out floor base start (- (load j) start) kind))
+                  (set! i (load j)))
+              :else
+                (do
+                  (emit! out
+                         floor
+                         base
+                         start
+                         1
+                         (if (or (= c 32) (= c 9) (>= c 128)) PLAIN PUNCT))
+                  (set! i (+ start 1))))
+        (set! after-paren (and (= c 40) (= lang LANG-LISP)))))
+    (do)))
+
+;;; Theme color for a run kind (0xRRGGBB), matching Jim's diff palette.
+(defn color [(kind i64)] (-> i64)
+  (cond (= kind KEYWORD) 0xc78fe6
+        (= kind STRING) 0xa6df99
+        (= kind COMMENT) 0x7b8494
+        (= kind NUMBER) 0xf29e7a
+        (= kind TYPE) 0xf0d18c
+        (= kind FUNCTION) 0x8cc7ff
+        (= kind CONSTANT) 0xf29e7a
+        (= kind PUNCT) 0xb3bdcc
+        :else 0xe6e9f0))

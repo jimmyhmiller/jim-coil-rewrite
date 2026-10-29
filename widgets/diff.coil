@@ -1,0 +1,908 @@
+(module widgets.diff)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "coil.fs" :as fs)
+(import "coil.time" :as time)
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.proc" :as proc)
+(import "jim.widget-kit.json" :as json)
+(import "jim.widget-kit.diff" :as d)
+(import "jim.widget-kit.git-view" :as gv)
+(import "jim.widget-kit.live" :as live)
+
+;;; A code diff / review pane, ported from Jim's diff.ft.
+;;;
+;;; Sources: the working tree (`git diff`), a range (`git diff BASE HEAD`), a
+;;; pull request (`gh pr diff N`), or a .diff/.patch file. Open with
+;;; "diff", "diff range main HEAD", "diff pr 123" or "diff file x.patch";
+;;; a leading "repo=PATH" diffs another repository or worktree.
+;;; Unified or side-by-side view, syntax colors, a changed-files sidebar, and
+;;; the shared review threads from `jimctl review`: click a line to comment,
+;;; resolve or reopen threads inline. Only the rows near the viewport are
+;;; built, so a large diff stays cheap to render and scroll.
+(const WORKING 0)
+
+(const RANGE 1)
+
+(const PR 2)
+
+(const FILE 3)
+
+(const UNIFIED 0)
+
+(const SPLIT 1)
+
+;;; Estimated offset of the first diff row below the pane top (toolbar, file
+;;; header); the virtualizer only needs to be close.
+(const BODY-TOP 150.0)
+
+(defstruct Reply
+  [(author-at i64) (author-len i64) (body-at i64) (body-len i64)])
+
+(defstruct Thread
+  [(id i64)
+   (file-at i64)
+   (file-len i64)
+   (line i64)
+   (resolved bool)
+   (stale bool)
+   (author-at i64)
+   (author-len i64)
+   (body-at i64)
+   (body-len i64)
+   (updated i64)
+   (replies-at i64)
+   (replies-len i64)])
+
+;;; A row of the split view: left and right line indices (NONE for blank), or
+;;; a hunk header when HUNK is set.
+(defstruct Pair [(left i64) (right i64) (hunk i64)])
+
+(defstruct Diff
+  [(model d/Model)
+   (diff-job proc/Job)
+   (review-job proc/Job)
+   (write-job proc/Job)
+   (source i64)
+   (view i64)
+   (file i64)
+   (repo (ArrayList u8))
+   (arg (ArrayList u8))
+   (project (ArrayList u8))
+   (status (ArrayList u8))
+   (strings (ArrayList u8))
+   (threads (ArrayList Thread))
+   (replies (ArrayList Reply))
+   (draft i64)
+   (draft-text (ArrayList u8))
+   (pairs (ArrayList Pair))
+   ;; The review store (~/.jim/reviews), watched alongside the repository.
+   (reviews-dir (ArrayList u8))
+   (host (dyn Host))
+   (parse (ptr Parse))
+   (parse-handle i64)
+   ;; A diff that arrived while another was being parsed.
+   (pending (ArrayList u8))
+   (diff-refresh live/Refresher)
+   (review-refresh live/Refresher)])
+
+(defn say! [(s (ptr Diff)) (message (slice u8))] (-> void)
+  (text/set-str! (field s status) message))
+
+(defn repo [(s (ptr Diff))] (-> (slice u8))
+  (cond (> (len (.repo s)) 0) (al-slice (.repo s))
+        (> (len (.project s)) 0) (al-slice (.project s))
+        :else "."))
+
+(defn now-ms [] (-> i64)
+  (try (let [v (try-or! (time/wall-now-ms) 0)] v)))
+
+;;; ---- loading ---------------------------------------------------------------
+(defn word [(s (slice u8)) (n i64)] (-> (slice u8))
+  (let [(mut spans) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut start) -1]
+    (for [i 0 (+ (len s) 1)]
+      (let [space (or (= i (len s)) (= (get s i) (p/cast u8 32)))]
+        (cond (and space (>= (load start) 0))
+                (do
+                  (push! (mut spans) (subslice s (load start) i))
+                  (set! start -1)
+                  0)
+              (and (not space) (< (load start) 0)) (do (set! start i) 0)
+              :else 0)))
+    (let [result (if (< n (len spans)) (get spans n) "")]
+      (al-free! (mut spans))
+      result)))
+
+(defn run-source! [(s (ptr Diff))] (-> void)
+  (live/started! (field s diff-refresh))
+  (let [r (repo s)
+        arg (text/trim (al-slice (.arg s)))]
+    (cond (= (.source s) FILE)
+            (let [(mut path) (al-new [u8] (alloc/malloc-allocator))]
+              (when (not (text/starts-with? arg "/"))
+                (text/push-str! (mut path) r)
+                (text/push-str! (mut path) "/")
+                0)
+              (text/push-str! (mut path) arg)
+              (try (let [raw
+                           (try-or! (fs/read-file (alloc/malloc-allocator)
+                                                  (al-slice path))
+                                    (do
+                                      (say! s "cannot read ")
+                                      (text/push-str! (field s status)
+                                                      (al-slice path))
+                                      0))]
+                     (do
+                       (load-diff! s raw)
+                       (alloc/free [u8] (alloc/malloc-allocator) raw)
+                       0)))
+              (al-free! (mut path))
+              (do))
+          (= (.source s) PR)
+            (if (= (len arg) 0)
+                (say! s "enter a PR number")
+                (do
+                  (proc/start! (field s diff-job) ["gh" "pr" "diff" arg] r 0)
+                  (say! s "loading…")))
+          (= (.source s) RANGE)
+            (let [base (if (> (len (word arg 0)) 0) (word arg 0) "HEAD~1")
+                  head (if (> (len (word arg 1)) 0) (word arg 1) "HEAD")]
+              (proc/start! (field s diff-job)
+                           ["git" "-C" r "diff" base head]
+                           r
+                           0)
+              (say! s "loading…"))
+          :else
+            (do
+              (proc/start! (field s diff-job) ["git" "-C" r "diff"] r 0)
+              (say! s "loading…")))))
+
+;;; Parsing and highlighting a large diff is slow, so it runs as a task off
+;;; Jim's main thread; the result is adopted by adopt-diff!.
+(defstruct Parse [(raw (ArrayList u8)) (model d/Model)])
+
+(impl Task Parse
+  (run [(self (ptr Parse))]
+       (-> void)
+       (d/parse-unified! (field self model) (al-slice (.raw self)))
+       (d/highlight-all! (field self model))
+       (do)))
+
+(defn parse-free! [(t (ptr Parse))] (-> void)
+  (al-free! (mut (.raw t)))
+  (d/free! (field t model))
+  (alloc/destroy [Parse] (alloc/malloc-allocator) t)
+  (do))
+
+(defn parsing? [(s (ptr Diff))] (-> bool)
+  (!= (p/cast i64 (.parse s)) 0))
+
+;;; Parse RAW in the background. A newer diff replaces one still being parsed:
+;;; that parse finishes unseen and is dropped.
+(defn load-diff! [(s (ptr Diff)) (raw (slice u8))] (-> void)
+  (if (parsing? s)
+      (text/set-str! (field s pending) raw)
+      (let [t
+              (alloc/box! (alloc/malloc-allocator)
+                          Parse
+                          (Parse :raw (text/owned raw) :model (d/model-new)))]
+        (set! (.parse s) t)
+        (set! (.parse-handle s) (start-task (.host s) t))
+        (do))))
+
+(defn adopt-diff! [(s (ptr Diff))] (-> void)
+  (let [t (.parse s)
+        old (.model s)]
+    (set! (.model s) (.model t))
+    (set! (.model t) old)
+    (release-task (.host s) (.parse-handle s))
+    (parse-free! t)
+    (set! (.parse s) (p/cast (ptr Parse) 0))
+    (when (> (len (.pending s)) 0)
+      (let [(mut next) (text/owned (al-slice (.pending s)))]
+        (al-clear! (mut (.pending s)))
+        (load-diff! s (al-slice next))
+        (al-free! (mut next))
+        0)
+      0)
+    (show-totals! s)))
+
+(defn show-totals! [(s (ptr Diff))] (-> void)
+  (let [m (field s model)]
+    (set! (.draft s) NONE)
+    (when (>= (.file s) (d/file-count m)) (set! (.file s) 0) 0)
+    (if (= (d/file-count m) 0)
+        (say! s "no changes")
+        (let [t (d/totals m)]
+          (al-clear! (mut (.status s)))
+          (text/push-i64! (field s status) (d/file-count m))
+          (text/push-str! (field s status)
+                          (if (= (d/file-count m) 1) " file  +" " files  +"))
+          (text/push-i64! (field s status) (.a t))
+          (text/push-str! (field s status) " −")
+          (text/push-i64! (field s status) (.b t))))))
+
+(defn load-reviews! [(s (ptr Diff))] (-> void)
+  (live/started! (field s review-refresh))
+  (when (not (proc/running? (field s review-job)))
+    (proc/start! (field s review-job)
+                 ["jimctl" "review" "list" "--repo" (repo s) "--status" "all"]
+                 (repo s)
+                 0)
+    0)
+  (do))
+
+(defn keep! [(s (ptr Diff)) (r (ptr json/Reply)) (i i64) (key (slice u8))] (-> i64)
+  (let [before (len (.strings s))]
+    (json/field-into! r i key (field s strings) "")
+    before))
+
+(defn kept-len [(s (ptr Diff)) (at i64)] (-> i64)
+  (- (len (.strings s)) at))
+
+(defn string-at [(s (ptr Diff)) (at i64) (n i64)] (-> (slice u8))
+  (subslice (al-slice (.strings s)) at (+ at n)))
+
+(defn read-threads! [(s (ptr Diff)) (raw (slice u8))] (-> void)
+  (let [(mut r) (json/parse raw)]
+    (if (not (json/ok? (mut r)))
+        (do (say! s "reviews: ") (json/error-into! (mut r) (field s status)) 0)
+        (let [list (json/get (mut r) (json/root (mut r)) "threads")]
+          (al-clear! (mut (.strings s)))
+          (al-clear! (mut (.threads s)))
+          (al-clear! (mut (.replies s)))
+          (for [k 0 (json/count (mut r) list)]
+            (let [t (json/nth (mut r) list k)
+                  file-at (keep! s (mut r) t "file")
+                  file-len (kept-len s file-at)
+                  author-at (keep! s (mut r) t "author")
+                  author-len (kept-len s author-at)
+                  body-at (keep! s (mut r) t "body")
+                  body-len (kept-len s body-at)
+                  status-at (keep! s (mut r) t "status")
+                  resolved
+                    (= (string-at s status-at (kept-len s status-at))
+                       "resolved")
+                  rs (json/get (mut r) t "replies")
+                  replies-at (len (.replies s))]
+              (for [j 0 (json/count (mut r) rs)]
+                (let [rep (json/nth (mut r) rs j)
+                      a-at (keep! s (mut r) rep "author")
+                      a-len (kept-len s a-at)
+                      b-at (keep! s (mut r) rep "body")
+                      b-len (kept-len s b-at)]
+                  (push! (mut (.replies s))
+                         (Reply
+                           :author-at a-at
+                           :author-len a-len
+                           :body-at b-at
+                           :body-len b-len))))
+              (push! (mut (.threads s))
+                     (Thread
+                       :id (json/field-i64 (mut r) t "id" 0)
+                       :file-at file-at
+                       :file-len file-len
+                       :line (json/field-i64 (mut r) t "line" -1)
+                       :resolved resolved
+                       :stale (json/field-bool (mut r) t "stale" false)
+                       :author-at author-at
+                       :author-len author-len
+                       :body-at body-at
+                       :body-len body-len
+                       :updated (json/field-i64 (mut r) t "updated_ms" 0)
+                       :replies-at replies-at
+                       :replies-len (- (len (.replies s)) replies-at)))))
+          0))
+    (json/free! (mut r))
+    (do)))
+
+(defn base-ref [(s (ptr Diff)) (out (ptr (ArrayList u8)))] (-> void)
+  (cond (= (.source s) RANGE)
+          (do
+            (text/push-str! out "range ")
+            (text/push-str! out (text/trim (al-slice (.arg s)))))
+        (= (.source s) PR)
+          (do
+            (text/push-str! out "pr ")
+            (text/push-str! out (text/trim (al-slice (.arg s)))))
+        :else (text/push-str! out "working")))
+
+(defn line-number [(l (ptr d/Line))] (-> i64)
+  (if (= (.tag l) d/DEL) (.old l) (.new l)))
+
+(defn current-file [(s (ptr Diff))] (-> (ptr d/File))
+  (d/file (field s model) (.file s)))
+
+(defn save-draft! [(s (ptr Diff))] (-> void)
+  (let [body (text/trim (al-slice (.draft-text s)))]
+    (if (or (= (.draft s) NONE) (= (len body) 0))
+        (set! (.draft s) NONE)
+        (let [m (field s model)
+              l (d/line m (.draft s))
+              (mut n) (al-new [u8] (alloc/malloc-allocator))
+              (mut ref) (al-new [u8] (alloc/malloc-allocator))]
+          (text/push-i64! (mut n) (line-number l))
+          (base-ref s (mut ref))
+          (proc/start! (field s write-job)
+                       ["jimctl"
+                        "review"
+                        "add"
+                        "--repo"
+                        (repo s)
+                        "--file"
+                        (d/path m (current-file s))
+                        "--line"
+                        (al-slice n)
+                        "--body"
+                        body
+                        "--base-ref"
+                        (al-slice ref)
+                        "--author"
+                        "user"]
+                       (repo s)
+                       0)
+          (al-free! (mut n))
+          (al-free! (mut ref))
+          (set! (.draft s) NONE)
+          (al-clear! (mut (.draft-text s)))
+          0))
+    (do)))
+
+(defn toggle-thread! [(s (ptr Diff)) (id i64)] (-> void)
+  (let [(mut resolved) false
+        (mut n) (al-new [u8] (alloc/malloc-allocator))]
+    (for [k 0 (len (.threads s))]
+      (let [t (al-elem (field s threads) k)]
+        (when (= (.id t) id) (set! resolved (.resolved t)) 0)))
+    (text/push-i64! (mut n) id)
+    (if (load resolved)
+        (proc/start! (field s write-job)
+                     ["jimctl"
+                      "review"
+                      "resolve"
+                      "--repo"
+                      (repo s)
+                      "--id"
+                      (al-slice n)
+                      "--reopen"]
+                     (repo s)
+                     0)
+        (proc/start! (field s write-job)
+                     ["jimctl"
+                      "review"
+                      "resolve"
+                      "--repo"
+                      (repo s)
+                      "--id"
+                      (al-slice n)]
+                     (repo s)
+                     0))
+    (al-free! (mut n))
+    (do)))
+
+(defn poll-jobs! [(s (ptr Diff)) (e (ptr Event))] (-> void)
+  (when (and (parsing? s) (task-done? (.host s) (.parse-handle s)))
+    (adopt-diff! s)
+    0)
+  (when (and (proc/running? (field s diff-job)) (proc/poll! (field s diff-job)))
+    (let [j (field s diff-job)]
+      (if (and (!= (.code j) 0) (= (len (proc/output j)) 0))
+          (do
+            (say! s "diff command failed (exit ")
+            (text/push-i64! (field s status) (.code j))
+            (text/push-str! (field s status) ")"))
+          (if (!= (.code j) 0)
+              (do
+                (say! s "")
+                (text/push-truncated! (field s status)
+                                      (text/trim (proc/output j))
+                                      160))
+              (load-diff! s (proc/output j)))))
+    0)
+  (when (and (proc/running? (field s review-job))
+             (proc/poll! (field s review-job)))
+    (read-threads! s (proc/output (field s review-job)))
+    0)
+  (when (and (proc/running? (field s write-job))
+             (proc/poll! (field s write-job)))
+    (let [(mut r) (json/parse (proc/output (field s write-job)))]
+      (if (json/ok? (mut r))
+          ; Other diff panes on this repository show the same threads.
+          (emit! e "review.changed" (repo s))
+          (do
+            (say! s "review write: ")
+            (json/error-into! (mut r) (field s status))
+            (do)))
+      (json/free! (mut r)))
+    (load-reviews! s)
+    0)
+  ; Refresh what outside changes touched, once the previous refresh is done.
+  (when (live/due? (field s diff-refresh) (proc/running? (field s diff-job)))
+    (run-source! s)
+    0)
+  (when (live/due? (field s review-refresh)
+                   (proc/running? (field s review-job)))
+    (load-reviews! s)
+    0)
+  (do))
+
+;;; Files changed under a watch: review-store changes reload threads; anything
+;;; else may change the diff.
+(defn files-changed! [(s (ptr Diff)) (e (ptr Event))] (-> void)
+  (if (live/any-under? (.text e) (al-slice (.reviews-dir s)))
+      (live/note! (field s review-refresh))
+      (live/note! (field s diff-refresh))))
+
+;;; ---- rendering -------------------------------------------------------------
+(defn threads-on [(s (ptr Diff))
+                  (path (slice u8))
+                  (l (ptr d/Line))
+                  (out (ptr (ArrayList i64)))] (-> void)
+  (al-clear! (mut out))
+  (when (!= (.tag l) d/HUNK)
+    (for [k 0 (len (.threads s))]
+      (let [t (al-elem (field s threads) k)]
+        (when (and (= (.line t) (line-number l))
+                   (= (string-at s (.file-at t) (.file-len t)) path))
+          (push! (mut out) k)
+          0)))
+    0)
+  (do))
+
+(defn author-color [(name (slice u8))] (-> i64)
+  (if (text/starts-with? name "agent:") gv/WARN gv/ACCENT))
+
+(defn thread-card! [(s (ptr Diff)) (ui (ptr Ui)) (k i64) (now i64)] (-> void)
+  (let [t (al-elem (field s threads) k)
+        author (string-at s (.author-at t) (.author-len t))
+        (mut age) (al-new [u8] (alloc/malloc-allocator))
+        (mut id) (al-new [u8] (alloc/malloc-allocator))]
+    (text/push-ago! (mut age) (.updated t) now)
+    (text/push-str! (mut id) "rv:")
+    (text/push-i64! (mut id) (.id t))
+    (vstack! ui 4.0 0.0)
+    (margin! ui 2.0 8.0 2.0 60.0)
+    (pad! ui 6.0 10.0 6.0 10.0)
+    (bg! ui gv/PANEL)
+    (radius! ui 6.0)
+    (hstack! ui 6.0 0.0)
+    (text! ui author 10.5 (author-color author) true)
+    (text! ui (al-slice age) 10.0 gv/MUTED false)
+    (text! ui (if (.stale t) "(line moved)" "") 10.0 gv/MUTED false)
+    (grow! ui 1.0)
+    (button! ui (al-slice id) (if (.resolved t) "Reopen" "Resolve"))
+    (end! ui)
+    (text! ui
+           (string-at s (.body-at t) (.body-len t))
+           12.5
+           (if (.resolved t) gv/MUTED gv/INK)
+           false)
+    (wrap! ui)
+    (for [j (.replies-at t) (+ (.replies-at t) (.replies-len t))]
+      (let [r (al-elem (field s replies) j)
+            who (string-at s (.author-at r) (.author-len r))]
+        (hstack! ui 6.0 0.0)
+        (align! ui START)
+        (text! ui "↳ " 10.5 (author-color who) false)
+        (append! ui who)
+        (text! ui (string-at s (.body-at r) (.body-len r)) 12.0 gv/INK false)
+        (wrap! ui)
+        (grow! ui 1.0)
+        (end! ui)))
+    (end! ui)
+    (al-free! (mut age))
+    (al-free! (mut id))
+    (do)))
+
+(defn draft-editor! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (vstack! ui 4.0 0.0)
+  (margin! ui 2.0 8.0 4.0 60.0)
+  (textarea! ui
+             "draft"
+             (al-slice (.draft-text s))
+             "Comment… (⌘Return to save)"
+             3)
+  (hstack! ui 6.0 0.0)
+  (button! ui "save_cmt" "Save")
+  (variant! ui PRIMARY)
+  (button! ui "cancel_cmt" "Cancel")
+  (end! ui)
+  (end! ui))
+
+(defn thread-height [(s (ptr Diff)) (k i64)] (-> f64)
+  (let [t (al-elem (field s threads) k)]
+    (+ 50.0 (* 18.0 (p/cast f64 (.replies-len t))))))
+
+;;; Height of unified row I, including its threads and any open draft.
+(defn row-height [(s (ptr Diff))
+                  (i i64)
+                  (path (slice u8))
+                  (on (ptr (ArrayList i64)))] (-> f64)
+  (let [m (field s model)
+        l (d/line m i)
+        (mut h) gv/ROW-H]
+    (threads-on s path l on)
+    (for [k 0 (len (load on))]
+      (set! h (+ (load h) (thread-height s (get (load on) k)))))
+    (when (= (.draft s) i) (set! h (+ (load h) 110.0)) 0)
+    (load h)))
+
+(defn unified-row! [(s (ptr Diff))
+                    (ui (ptr Ui))
+                    (i i64)
+                    (path (slice u8))
+                    (on (ptr (ArrayList i64)))
+                    (now i64)] (-> void)
+  (let [m (field s model)
+        l (d/line m i)]
+    (if (= (.tag l) d/HUNK)
+        (gv/hunk-row! ui (d/line-text m l))
+        (let [(mut id) (al-new [u8] (alloc/malloc-allocator))]
+          (text/push-str! (mut id) "ln:")
+          (text/push-i64! (mut id) i)
+          (threads-on s path l on)
+          (vstack! ui 0.0 0.0)
+          (gv/line-row! ui m l (al-slice id) (= (.draft s) i))
+          (for [k 0 (len (load on))]
+            (thread-card! s ui (get (load on) k) now))
+          (when (= (.draft s) i) (draft-editor! s ui) 0)
+          (end! ui)
+          (al-free! (mut id))
+          (do)))))
+
+;;; Pair deleted and added lines side by side between context lines.
+(defn build-pairs! [(s (ptr Diff)) (f (ptr d/File))] (-> void)
+  (let [m (field s model)
+        (mut dels) (al-new [i64] (alloc/malloc-allocator))
+        (mut adds) (al-new [i64] (alloc/malloc-allocator))]
+    (al-clear! (mut (.pairs s)))
+    (for [i (.lines-at f) (+ (+ (.lines-at f) (.lines-len f)) 1)]
+      (let [end (= i (+ (.lines-at f) (.lines-len f)))
+            tag (if end d/HUNK (.tag (d/line m i)))]
+        (when (or (= tag d/HUNK) (= tag d/CONTEXT))
+          (for [k 0 (if (> (len dels) (len adds)) (len dels) (len adds))]
+            (push! (mut (.pairs s))
+                   (Pair
+                     :left (if (< k (len dels)) (get dels k) NONE)
+                     :right (if (< k (len adds)) (get adds k) NONE)
+                     :hunk NONE)))
+          (al-clear! (mut dels))
+          (al-clear! (mut adds))
+          0)
+        (cond end 0
+              (= tag d/HUNK)
+                (do
+                  (push! (mut (.pairs s))
+                         (Pair
+                           :left NONE
+                           :right NONE
+                           :hunk i))
+                  0)
+              (= tag d/CONTEXT)
+                (do
+                  (push! (mut (.pairs s))
+                         (Pair
+                           :left i
+                           :right i
+                           :hunk NONE))
+                  0)
+              (= tag d/DEL) (do (push! (mut dels) i) 0)
+              :else (do (push! (mut adds) i) 0))))
+    (al-free! (mut dels))
+    (al-free! (mut adds))
+    (do)))
+
+(defn split-row! [(s (ptr Diff)) (ui (ptr Ui)) (k i64)] (-> void)
+  (let [m (field s model)
+        pair (get (.pairs s) k)]
+    (if (!= (.hunk pair) NONE)
+        (gv/hunk-row! ui (d/line-text m (d/line m (.hunk pair))))
+        (do
+          (hstack! ui 1.0 0.0)
+          (align! ui STRETCH)
+          (gv/side-cell! ui m (.left pair))
+          (gv/side-cell! ui m (.right pair))
+          (end! ui)))))
+
+;;; Rows of the current file, building only those near the viewport and
+;;; standing in for the rest with spacers of the same height.
+(defn rows! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (let [m (field s model)
+        f (current-file s)
+        path (d/path m f)
+        now (now-ms)
+        (mut on) (al-new [i64] (alloc/malloc-allocator))
+        view-top (- (- (.scroll-y ui) BODY-TOP) (* (.height ui) 0.5))
+        view-bottom (+ (- (.scroll-y ui) BODY-TOP) (* (.height ui) 1.5))
+        split (= (.view s) SPLIT)
+        count (if split (do (build-pairs! s f) (len (.pairs s))) (.lines-len f))
+        (mut y) 0.0
+        (mut skipped) 0.0]
+    (vstack! ui 0.0 0.0)
+    (for [k 0 count]
+      (let [i (+ (.lines-at f) k)
+            h (if split gv/ROW-H (row-height s i path (mut on)))]
+        (if (or (< (+ (load y) h) view-top) (> (load y) view-bottom))
+            (set! skipped (+ (load skipped) h))
+            (do
+              (when (> (load skipped) 0.0)
+                (spacer! ui (load skipped))
+                (set! skipped 0.0)
+                0)
+              (if split
+                  (split-row! s ui k)
+                  (unified-row! s ui i path (mut on) now))
+              0))
+        (set! y (+ (load y) h))))
+    (when (> (load skipped) 0.0) (spacer! ui (load skipped)) 0)
+    (end! ui)
+    (al-free! (mut on))
+    (do)))
+
+(defn file-row! [(s (ptr Diff)) (ui (ptr Ui)) (i i64)] (-> void)
+  (let [m (field s model)
+        f (d/file m i)
+        selected (= i (.file s))
+        (mut id) (al-new [u8] (alloc/malloc-allocator))]
+    (text/push-str! (mut id) "file:")
+    (text/push-i64! (mut id) i)
+    (vstack! ui 1.0 0.0)
+    (pad! ui 5.0 8.0 5.0 8.0)
+    (radius! ui 6.0)
+    (clickable! ui (al-slice id) selected)
+    (text! ui (text/basename (d/path m f)) 12.0 gv/INK selected)
+    (mono! ui)
+    (hstack! ui 6.0 0.0)
+    (gv/stat! ui (.adds f) (.dels f) 10.0)
+    (end! ui)
+    (end! ui)
+    (al-free! (mut id))
+    (do)))
+
+(defn sidebar! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (let [m (field s model)]
+    (vstack! ui 3.0 0.0)
+    (width! ui 260.0)
+    (pad! ui 2.0 6.0 2.0 0.0)
+    (text! ui "Changed files (" 11.0 gv/MUTED true)
+    (append-i64! ui (d/file-count m))
+    (append! ui ")")
+    (for [i 0 (d/file-count m)] (file-row! s ui i))
+    (end! ui)))
+
+(defn file-block! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (let [m (field s model)
+        f (current-file s)]
+    (vstack! ui 2.0 0.0)
+    (grow! ui 1.0)
+    (hstack! ui 8.0 0.0)
+    (text! ui (d/path m f) 13.0 gv/INK true)
+    (badge! ui "+" 0x1c4a30)
+    (append-i64! ui (.adds f))
+    (badge! ui "−" 0x4a1f24)
+    (append-i64! ui (.dels f))
+    (when (.binary f) (badge! ui "binary" 0x33383f) 0)
+    (end! ui)
+    (divider! ui)
+    (rows! s ui)
+    (end! ui)))
+
+(defn source-label [(s (ptr Diff))] (-> (slice u8))
+  (cond (= (.source s) RANGE) "range"
+        (= (.source s) PR) "PR"
+        (= (.source s) FILE) "file"
+        :else "working tree"))
+
+(defn arg-placeholder [(s (ptr Diff))] (-> (slice u8))
+  (cond (= (.source s) RANGE) "base head  (e.g. main HEAD)"
+        (= (.source s) PR) "PR number"
+        (= (.source s) FILE) "path to .diff"
+        :else "(working tree — no argument)"))
+
+(defn toolbar! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (hstack! ui 6.0 0.0)
+  (text! ui "▤ diff" 13.0 gv/INK true)
+  (tab! ui "src_working" "Working" (= (.source s) WORKING))
+  (tab! ui "src_range" "Range" (= (.source s) RANGE))
+  (tab! ui "src_pr" "PR" (= (.source s) PR))
+  (tab! ui "src_file" "File" (= (.source s) FILE))
+  (button! ui "view" (if (= (.view s) UNIFIED) "Split" "Unified"))
+  (button! ui "refresh" "↻")
+  (text! ui (al-slice (.status s)) 11.0 gv/MUTED false)
+  (end! ui)
+  (hstack! ui 6.0 0.0)
+  (text! ui (source-label s) 11.0 gv/MUTED false)
+  (append! ui ":")
+  (input! ui "repo" (al-slice (.repo s)) (repo s))
+  (grow! ui 1.0)
+  (input! ui "arg" (al-slice (.arg s)) (arg-placeholder s))
+  (grow! ui 2.0)
+  (button! ui "load" "Load")
+  (end! ui))
+
+(defn title-text! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (let [(mut t) (al-new [u8] (alloc/malloc-allocator))]
+    (text/push-str! (mut t) "Diff · ")
+    (text/push-str! (mut t) (source-label s))
+    (when (> (len (text/trim (al-slice (.arg s)))) 0)
+      (text/push-str! (mut t) " ")
+      (text/push-str! (mut t) (text/trim (al-slice (.arg s))))
+      0)
+    (title! ui (al-slice t))
+    (al-free! (mut t))
+    (do)))
+
+(defn set-source! [(s (ptr Diff)) (source i64)] (-> void)
+  (set! (.source s) source)
+  (if (or (= source WORKING) (> (len (text/trim (al-slice (.arg s)))) 0))
+      (run-source! s)
+      (do (d/clear! (field s model)) (say! s "enter an argument, then Load"))))
+
+(impl Widget Diff
+  (render [(self (ptr Diff)) (ui (ptr Ui))]
+          (-> void)
+          (title-text! self ui)
+          (watch! ui (repo self))
+          (watch! ui (al-slice (.reviews-dir self)))
+          (vstack! ui 10.0 14.0)
+          (toolbar! self ui)
+          (divider! ui)
+          (if (= (d/file-count (field self model)) 0)
+              (text! ui
+                     (if (or (proc/running? (field self diff-job))
+                             (parsing? self))
+                         "Loading…"
+                         "No diff loaded. Pick a source and Load.")
+                     13.0
+                     gv/MUTED
+                     false)
+              (do
+                (hstack! ui 14.0 0.0)
+                (align! ui START)
+                (sidebar! self ui)
+                (file-block! self ui)
+                (end! ui)))
+          (end! ui))
+  (event [(self (ptr Diff)) (e (ptr Event))]
+         (-> void)
+         (cond (tick? e) (poll-jobs! self e)
+               (files-changed? e) (files-changed! self e)
+               (message? e "git.changed") (live/note! (field self diff-refresh))
+               (message? e "review.changed")
+                 (live/note! (field self review-refresh))
+               (clicked? e "src_working") (set-source! self WORKING)
+               (clicked? e "src_range") (set-source! self RANGE)
+               (clicked? e "src_pr") (set-source! self PR)
+               (clicked? e "src_file") (set-source! self FILE)
+               (clicked? e "view")
+                 (set! (.view self) (if (= (.view self) UNIFIED) SPLIT UNIFIED))
+               (or (clicked? e "refresh")
+                   (clicked? e "load")
+                   (submitted? e "arg")
+                   (submitted? e "repo"))
+                 (do (run-source! self) (load-reviews! self))
+               (changed? e "repo") (text/set-str! (field self repo) (.text e))
+               (changed? e "arg") (text/set-str! (field self arg) (.text e))
+               (changed? e "draft")
+                 (text/set-str! (field self draft-text) (.text e))
+               (or (clicked? e "save_cmt") (submitted? e "draft"))
+                 (save-draft! self)
+               (clicked? e "cancel_cmt")
+                 (do
+                   (set! (.draft self) NONE)
+                   (al-clear! (mut (.draft-text self)))
+                   (do))
+               (id-prefix? e "file:")
+                 (let [i (id-number e "file:")]
+                   (when (and (>= i 0) (< i (d/file-count (field self model))))
+                     (set! (.file self) i)
+                     (set! (.draft self) NONE)
+                     0)
+                   (do))
+               (id-prefix? e "ln:")
+                 (let [i (id-number e "ln:")]
+                   (set! (.draft self) (if (= (.draft self) i) NONE i))
+                   (al-clear! (mut (.draft-text self)))
+                   (do))
+               (id-prefix? e "rv:") (toggle-thread! self (id-number e "rv:"))
+               :else (do)))
+  (save [(self (ptr Diff)) (s (ptr Snapshot))]
+        (-> void)
+        (put-i64! s "source" (.source self))
+        (put-i64! s "view" (.view self))
+        (put-i64! s "file" (.file self))
+        (put-text! s "repo" (al-slice (.repo self)))
+        (put-text! s "arg" (al-slice (.arg self))))
+  (animating? [(self (ptr Diff))]
+              (-> bool)
+              (or (proc/running? (field self diff-job))
+                  (parsing? self)
+                  (proc/running? (field self review-job))
+                  (live/waiting? (field self diff-refresh))
+                  (live/waiting? (field self review-refresh))
+                  (proc/running? (field self write-job))))
+  (destroy! [(self (ptr Diff))]
+            (-> void)
+            (d/free! (field self model))
+            (proc/free! (field self diff-job))
+            (proc/free! (field self review-job))
+            (proc/free! (field self write-job))
+            (al-free! (mut (.repo self)))
+            (al-free! (mut (.arg self)))
+            (al-free! (mut (.project self)))
+            (al-free! (mut (.status self)))
+            (al-free! (mut (.strings self)))
+            (al-free! (mut (.threads self)))
+            (al-free! (mut (.replies self)))
+            (al-free! (mut (.draft-text self)))
+            (al-free! (mut (.pairs self)))
+            (al-free! (mut (.reviews-dir self)))
+            (al-free! (mut (.pending self)))
+            ; Jim destroys a generation only after its tasks finished.
+            (when (parsing? self)
+              (release-task (.host self) (.parse-handle self))
+              (parse-free! (.parse self))
+              0)
+            (alloc/destroy [Diff] (alloc/malloc-allocator) self)
+            (do)))
+
+;;; "working" | "range BASE HEAD" | "pr N" | "file PATH" from the palette.
+(defn source-of [(word (slice u8))] (-> i64)
+  (cond (= word "range") RANGE
+        (= word "pr") PR
+        (= word "file") FILE
+        :else WORKING))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        all (text/trim (get-text saved "jim.args" ""))
+        ; An optional leading "repo=PATH" picks a repository other than the project.
+        repo-word (if (text/starts-with? (word all 0) "repo=") (word all 0) "")
+        args (text/trim (text/from all (len repo-word)))
+        first (word args 0)
+        rest (text/trim (text/from args (len first)))
+        fresh (= (get-i64 saved "source" NONE) NONE)
+        s
+          (alloc/box! a
+                      Diff
+                      (Diff
+                        :model (d/model-new)
+                        :diff-job (proc/job-new (host saved))
+                        :review-job (proc/job-new (host saved))
+                        :write-job (proc/job-new (host saved))
+                        :source
+                          (if fresh
+                              (source-of first)
+                              (get-i64 saved "source" WORKING))
+                        :view (get-i64 saved "view" UNIFIED)
+                        :file (get-i64 saved "file" 0)
+                        :repo
+                          (text/owned (if (and fresh (> (len repo-word) 0))
+                                          (text/from repo-word 5)
+                                          (get-text saved "repo" "")))
+                        :arg
+                          (text/owned (if fresh rest (get-text saved "arg" "")))
+                        :project (text/owned (get-text saved "jim.dir" "."))
+                        :status (al-new [u8] a)
+                        :strings (al-new [u8] a)
+                        :threads (al-new [Thread] a)
+                        :replies (al-new [Reply] a)
+                        :draft NONE
+                        :draft-text (al-new [u8] a)
+                        :pairs (al-new [Pair] a)
+                        :reviews-dir (al-new [u8] a)
+                        :host (host saved)
+                        :parse (p/cast (ptr Parse) 0)
+                        :parse-handle 0
+                        :pending (al-new [u8] a)
+                        :diff-refresh (live/refresher)
+                        :review-refresh (live/refresher)))]
+    (live/home-path! "/.jim/reviews" (field s reviews-dir))
+    (run-source! s)
+    (load-reviews! s)
+    (set! out s)))

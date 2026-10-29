@@ -1,0 +1,598 @@
+(module widgets.markdown)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "coil.fs" :as fs)
+(import "coil.os" :as os)
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.git-view" :as gv)
+
+;;; Renders a Markdown document, ported from Jim's markdown.ft. Open with
+;;; "markdown PATH" (relative to the project) or type a path and press Return;
+;;; without one it shows a built-in document that uses every supported block.
+;;;
+;;; Blocks: ATX headings, paragraphs (wrapped to the pane), fenced code,
+;;; blockquotes, ordered and unordered lists (nested by indentation), GitHub
+;;; pipe tables and horizontal rules. Inline: **bold**, *italic* and `code`
+;;; markers are removed when balanced (so "5 * 3" survives), [text](url)
+;;; becomes "text (url)" and ![alt](url) becomes "🖼 alt".
+(defstruct Markdown
+  [(doc (ArrayList u8))
+   (path (ArrayList u8))
+   (draft (ArrayList u8))
+   (project (ArrayList u8))
+   (status (ArrayList u8))
+   ;; The resolved path of the open file, watched so edits show up live.
+   (full (ArrayList u8))])
+
+(defn say! [(s (ptr Markdown)) (message (slice u8))] (-> void)
+  (text/set-str! (field s status) message))
+
+;;; ---- loading -----------------------------------------------------------------
+(defn resolve-path [(s (ptr Markdown))
+                    (path (slice u8))
+                    (out (ptr (ArrayList u8)))] (-> void)
+  (cond (text/starts-with? path "~/")
+          (let [home (os/getenv c"HOME")]
+            (when (!= (p/cast i64 home) 0)
+              (let [c (p/cast (ptr u8) home)
+                    (mut n) 0]
+                (while (!= (load (p/index c (load n))) (p/cast u8 0))
+                  (set! n (+ (load n) 1)))
+                (text/push-str! out (slice-new c (load n))))
+              0)
+            (text/push-str! out (text/from path 1)))
+        (text/starts-with? path "/") (text/push-str! out path)
+        :else
+          (do
+            (text/push-str! out (al-slice (.project s)))
+            (text/push-str! out "/")
+            (text/push-str! out path))))
+
+(defn load! [(s (ptr Markdown)) (path (slice u8))] (-> void)
+  (if (= (len path) 0)
+      (do
+        (text/set-str! (field s doc) (welcome))
+        (al-clear! (mut (.path s)))
+        (al-clear! (mut (.full s)))
+        (say! s "welcome"))
+      (let [(mut full) (al-new [u8] (alloc/malloc-allocator))]
+        (resolve-path s path (mut full))
+        (text/set-str! (field s full) (al-slice full))
+        (try (let [bytes
+                     (try-or! (fs/read-file (alloc/malloc-allocator)
+                                            (al-slice full))
+                              (do
+                                (text/set-str! (field s doc)
+                                               "# Could not read file\n\n`")
+                                (text/push-str! (field s doc) (al-slice full))
+                                (text/push-str! (field s doc) "`\n")
+                                (text/set-str! (field s path) path)
+                                (say! s "read failed")
+                                0))]
+               (do
+                 (text/set-str! (field s doc) bytes)
+                 (alloc/free [u8] (alloc/malloc-allocator) bytes)
+                 (text/set-str! (field s path) path)
+                 (text/set-str! (field s draft) path)
+                 (say! s "ok · ")
+                 (text/push-i64! (field s status) (len (.doc s)))
+                 (text/push-str! (field s status) " bytes")
+                 0)))
+        (al-free! (mut full))
+        (do))))
+
+;;; ---- inline cleanup --------------------------------------------------------
+
+;;; Drop MARKER where it appears an even number of times; an odd count is not
+;;; emphasis (e.g. "5 * 3"), so the text stays as written.
+(defn strip-pair [(s (slice u8)) (marker (slice u8)) (out (ptr (ArrayList u8)))] (-> void)
+  (let [(mut count) 0
+        (mut i) 0]
+    (while (<= (+ (load i) (len marker)) (len s))
+      (if (= (subslice s (load i) (+ (load i) (len marker))) marker)
+          (do
+            (set! count (+ (load count) 1))
+            (set! i (+ (load i) (len marker))))
+          (set! i (+ (load i) 1))))
+    (if (or (= (load count) 0) (!= (% (load count) 2) 0))
+        (text/push-str! out s)
+        (do
+          (set! i 0)
+          (while (< (load i) (len s))
+            (if (and (<= (+ (load i) (len marker)) (len s))
+                     (= (subslice s (load i) (+ (load i) (len marker))) marker))
+                (set! i (+ (load i) (len marker)))
+                (do
+                  (text/push-byte! out (get s (load i)))
+                  (set! i (+ (load i) 1)))))
+          (do)))))
+
+;;; [text](url) → "text (url)", ![alt](url) → "🖼 alt".
+(defn replace-links [(s (slice u8)) (out (ptr (ArrayList u8)))] (-> void)
+  (let [(mut rest) s]
+    (loop (let [r (load rest)
+                open (text/index-of r "](")]
+            (if (< open 0)
+                (do (text/push-str! out r) (break))
+                (let [(mut lb) -1]
+                  (for [k 0 open]
+                    (when (= (get r k) (p/cast u8 91)) (set! lb k) 0))
+                  (if (< (load lb) 0)
+                      (do
+                        (text/push-str! out (subslice r 0 (+ open 2)))
+                        (set! rest (text/from r (+ open 2)))
+                        0)
+                      (let [after (text/from r (+ open 2))
+                            close (text/index-of after ")")]
+                        (if (< close 0)
+                            (do (text/push-str! out r) (break))
+                            (let [label (subslice r (+ (load lb) 1) open)
+                                  url (subslice after 0 close)
+                                  image
+                                    (and (> (load lb) 0)
+                                         (= (get r (- (load lb) 1))
+                                            (p/cast u8 33)))]
+                              (text/push-str! out
+                                              (subslice r
+                                                        0
+                                                        (if image
+                                                            (- (load lb) 1)
+                                                            (load lb))))
+                              (if image
+                                  (do
+                                    (text/push-str! out "🖼 ")
+                                    (text/push-str! out label))
+                                  (do
+                                    (text/push-str! out label)
+                                    (text/push-str! out " (")
+                                    (text/push-str! out url)
+                                    (text/push-str! out ")")))
+                              (set! rest (text/from after (+ close 1)))
+                              0))))))))
+    (do)))
+
+(defn clean-inline [(s (slice u8)) (out (ptr (ArrayList u8)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        (mut one) (al-new [u8] a)
+        (mut two) (al-new [u8] a)
+        (mut three) (al-new [u8] a)]
+    (replace-links s (mut one))
+    (strip-pair (al-slice one) "**" (mut two))
+    (strip-pair (al-slice two) "*" (mut three))
+    (strip-pair (al-slice three) "`" out)
+    (al-free! (mut one))
+    (al-free! (mut two))
+    (al-free! (mut three))
+    (do)))
+
+;;; ---- block predicates ------------------------------------------------------
+(defn lead-spaces [(s (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (while (and (< (load i) (len s)) (= (get s (load i)) (p/cast u8 32)))
+      (set! i (+ (load i) 1)))
+    (load i)))
+
+(defn bullet? [(s (slice u8))] (-> bool)
+  (or (text/starts-with? s "- ")
+      (text/starts-with? s "* ")
+      (text/starts-with? s "+ ")))
+
+;;; Length of a leading "N." marker, or 0.
+(defn ordered-marker [(s (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (while (and (< (load i) (len s))
+                (let [c (p/cast i64 (get s (load i)))]
+                  (and (>= c 48) (<= c 57))))
+      (set! i (+ (load i) 1)))
+    (if (and (> (load i) 0)
+             (< (load i) (len s))
+             (= (get s (load i)) (p/cast u8 46)))
+        (+ (load i) 1)
+        0)))
+
+(defn rule? [(s (slice u8))] (-> bool)
+  (let [t (text/trim s)
+        (mut count) 0
+        (mut ok) (> (len t) 0)
+        c0 (if (> (len t) 0) (get t 0) (p/cast u8 0))]
+    (when (not (or (= c0 (p/cast u8 45))
+                   (= c0 (p/cast u8 42))
+                   (= c0 (p/cast u8 95))))
+      (set! ok false)
+      0)
+    (for [i 0 (len t)]
+      (let [c (get t i)]
+        (cond (= c c0) (set! count (+ (load count) 1))
+              (= c (p/cast u8 32)) 0
+              :else (set! ok false))))
+    (and (load ok) (>= (load count) 3))))
+
+(defn table-separator? [(s (slice u8))] (-> bool)
+  (let [t (text/trim s)
+        (mut ok) (and (> (len t) 0) (text/contains? t "-"))]
+    (for [i 0 (len t)]
+      (let [c (p/cast i64 (get t i))]
+        (when (not (or (= c 124) (= c 58) (= c 45) (= c 32))) (set! ok false) 0)))
+    (load ok)))
+
+(defn heading-level [(s (slice u8))] (-> i64)
+  (let [(mut n) 0]
+    (while (and (< (load n) (len s)) (= (get s (load n)) (p/cast u8 35)))
+      (set! n (+ (load n) 1)))
+    (if (and (>= (load n) 1)
+             (<= (load n) 6)
+             (or (= (load n) (len s)) (= (get s (load n)) (p/cast u8 32))))
+        (load n)
+        0)))
+
+(defn starts-block? [(raw (slice u8))] (-> bool)
+  (let [s (text/trim raw)]
+    (or (= (len s) 0)
+        (> (heading-level s) 0)
+        (text/starts-with? s "```")
+        (text/starts-with? s "~~~")
+        (text/starts-with? s ">")
+        (rule? s)
+        (bullet? s)
+        (> (ordered-marker s) 0))))
+
+;;; Cells of a pipe-table row, cleaned, appended to CELLS as byte ranges of OUT.
+(defn row-cells [(line (slice u8))
+                 (out (ptr (ArrayList u8)))
+                 (cells (ptr (ArrayList text/Span)))] (-> void)
+  (let [t0 (text/trim line)
+        t1 (if (text/starts-with? t0 "|") (text/from t0 1) t0)
+        t (if (text/ends-with? t1 "|") (subslice t1 0 (- (len t1) 1)) t1)
+        (mut start) 0]
+    (al-clear! (mut cells))
+    (for [i 0 (+ (len t) 1)]
+      (when (or (= i (len t)) (= (get t i) (p/cast u8 124)))
+        (let [at (len (load out))]
+          (clean-inline (text/trim (subslice t (load start) i)) out)
+          (push! (mut cells) (text/Span :at at :len (- (len (load out)) at)))
+          (set! start (+ i 1)))
+        0))
+    (do)))
+
+;;; ---- rendering ---------------------------------------------------------------
+(defn paragraph! [(ui (ptr Ui)) (raw (slice u8)) (size f64) (color i64)] (-> void)
+  (let [(mut clean) (al-new [u8] (alloc/malloc-allocator))]
+    (clean-inline raw (mut clean))
+    (text! ui (al-slice clean) size color false)
+    (wrap! ui)
+    (al-free! (mut clean))
+    (do)))
+
+(defn heading! [(ui (ptr Ui)) (level i64) (raw (slice u8))] (-> void)
+  (let [(mut clean) (al-new [u8] (alloc/malloc-allocator))
+        size
+          (cond (= level 1) 25.0
+                (= level 2) 21.0
+                (= level 3) 18.0
+                (= level 4) 16.0
+                (= level 5) 14.5
+                :else 13.0)]
+    (clean-inline raw (mut clean))
+    (vstack! ui 4.0 0.0)
+    (margin! ui (if (<= level 2) 10.0 6.0) 0.0 0.0 0.0)
+    (text! ui (al-slice clean) size gv/INK true)
+    (wrap! ui)
+    (when (<= level 2) (divider! ui) 0)
+    (end! ui)
+    (al-free! (mut clean))
+    (do)))
+
+(defn code-block! [(ui (ptr Ui)) (code (slice u8))] (-> void)
+  (vstack! ui 0.0 0.0)
+  (bg! ui gv/PANEL)
+  (radius! ui 8.0)
+  (pad! ui 10.0 12.0 10.0 12.0)
+  (clip! ui)
+  (text! ui (if (> (len code) 0) code " ") 12.5 gv/INK false)
+  (mono! ui)
+  (end! ui))
+
+(defn table-block! [(ui (ptr Ui))
+                    (doc (slice u8))
+                    (lines (ptr (ArrayList text/Span)))
+                    (first i64)
+                    (last i64)] (-> void)
+  (let [a (alloc/malloc-allocator)
+        (mut cells) (al-new [text/Span] a)
+        (mut out) (al-new [u8] a)
+        (mut columns) 0]
+    (row-cells (text/span-text doc (get (load lines) first))
+               (mut out)
+               (mut cells))
+    (set! columns (len cells))
+    (table! ui (load columns) 0.0)
+    (border! ui 0x2c323c)
+    (for [row first last]
+      (when (!= row (+ first 1))
+        (al-clear! (mut out))
+        (row-cells (text/span-text doc (get (load lines) row))
+                   (mut out)
+                   (mut cells))
+        (for [c 0 (load columns)]
+          (vstack! ui 0.0 0.0)
+          (pad! ui 5.0 10.0 5.0 10.0)
+          (bg! ui
+               (cond (= row first) 0x1e2530 (= (% row 2) 0) 0x161a21 :else NONE))
+          (text! ui
+                 (if (< c (len cells))
+                     (text/span-text (al-slice out) (get cells c))
+                     "")
+                 13.0
+                 gv/INK
+                 (= row first))
+          (wrap! ui)
+          (end! ui))
+        0))
+    (end! ui)
+    (al-free! (mut cells))
+    (al-free! (mut out))
+    (do)))
+
+(defn list-item! [(ui (ptr Ui))
+                  (indent i64)
+                  (marker (slice u8))
+                  (content (slice u8))] (-> void)
+  (hstack! ui 6.0 0.0)
+  (align! ui START)
+  (when (> indent 0) (spacer! ui (* 8.0 (p/cast f64 indent))) 0)
+  (text! ui marker 14.0 gv/ACCENT false)
+  (paragraph! ui content 14.0 gv/INK)
+  (grow! ui 1.0)
+  (end! ui))
+
+;;; Render the Markdown in DOC as a column of blocks.
+(defn blocks! [(ui (ptr Ui)) (doc (slice u8))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        (mut lines) (al-new [text/Span] a)
+        (mut buffer) (al-new [u8] a)
+        (mut i) 0]
+    (text/lines! doc (mut lines))
+    (vstack! ui 10.0 0.0)
+    (while (< (load i) (len lines))
+      (let [raw (text/span-text doc (get lines (load i)))
+            s (text/trim raw)
+            n (len lines)]
+        (cond (= (len s) 0) (set! i (+ (load i) 1))
+              (or (text/starts-with? s "```") (text/starts-with? s "~~~"))
+                (let [fence (subslice s 0 3)
+                      (mut j) (+ (load i) 1)]
+                  (al-clear! (mut buffer))
+                  (while (and (< (load j) n)
+                              (not (text/starts-with? (text/trim (text/span-text doc
+                                                                                 (get lines
+                                                                                      (load j))))
+                                                      fence)))
+                    (when (> (len buffer) 0)
+                      (text/push-str! (mut buffer) "\n")
+                      0)
+                    (text/push-str! (mut buffer)
+                                    (text/span-text doc (get lines (load j))))
+                    (set! j (+ (load j) 1)))
+                  (code-block! ui (al-slice buffer))
+                  (set! i (+ (load j) 1)))
+              (> (heading-level s) 0)
+                (let [level (heading-level s)]
+                  (heading! ui level (text/trim (text/from s level)))
+                  (set! i (+ (load i) 1)))
+              (and (text/contains? raw "|")
+                   (< (+ (load i) 1) n)
+                   (table-separator? (text/span-text doc
+                                                     (get lines (+ (load i) 1)))))
+                (let [(mut j) (+ (load i) 2)]
+                  (while (and (< (load j) n)
+                              (let [l
+                                      (text/span-text doc
+                                                      (get lines (load j)))]
+                                (and (> (len (text/trim l)) 0)
+                                     (text/contains? l "|"))))
+                    (set! j (+ (load j) 1)))
+                  (table-block! ui doc (mut lines) (load i) (load j))
+                  (set! i (load j)))
+              (rule? s) (do (divider! ui) (set! i (+ (load i) 1)))
+              (text/starts-with? s ">")
+                (let [(mut j) (load i)]
+                  (al-clear! (mut buffer))
+                  (while (and (< (load j) n)
+                              (text/starts-with? (text/trim (text/span-text doc
+                                                                            (get lines
+                                                                                 (load j))))
+                                                 ">"))
+                    (when (> (len buffer) 0)
+                      (text/push-str! (mut buffer) "\n")
+                      0)
+                    (text/push-str! (mut buffer)
+                                    (text/trim (text/from (text/trim (text/span-text doc
+                                                                                     (get lines
+                                                                                          (load j))))
+                                                          1)))
+                    (set! j (+ (load j) 1)))
+                  (hstack! ui 10.0 0.0)
+                  (align! ui STRETCH)
+                  (vstack! ui 0.0 0.0)
+                  (width! ui 3.0)
+                  (bg! ui gv/ACCENT)
+                  (radius! ui 2.0)
+                  (end! ui)
+                  (let [(mut inner) (text/owned (al-slice buffer))]
+                    (vstack! ui 0.0 0.0)
+                    (grow! ui 1.0)
+                    (blocks! ui (al-slice inner))
+                    (end! ui)
+                    (al-free! (mut inner)))
+                  (end! ui)
+                  (set! i (load j)))
+              (or (bullet? s) (> (ordered-marker s) 0))
+                (let [(mut j) (load i)]
+                  (vstack! ui 4.0 0.0)
+                  (while (and (< (load j) n)
+                              (let [s2
+                                      (text/trim (text/span-text doc
+                                                                 (get lines
+                                                                      (load j))))]
+                                (and (> (len s2) 0)
+                                     (or (bullet? s2) (> (ordered-marker s2) 0)))))
+                    (let [raw2 (text/span-text doc (get lines (load j)))
+                          s2 (text/trim raw2)
+                          indent (lead-spaces raw2)
+                          m (ordered-marker s2)]
+                      (if (bullet? s2)
+                          (list-item! ui indent "•" (text/from s2 2))
+                          (list-item! ui
+                                      indent
+                                      (subslice s2 0 m)
+                                      (text/trim (text/from s2 m)))))
+                    (set! j (+ (load j) 1)))
+                  (end! ui)
+                  (set! i (load j)))
+              :else
+                (let [(mut j) (+ (load i) 1)]
+                  (al-clear! (mut buffer))
+                  (text/push-str! (mut buffer) s)
+                  (while (and (< (load j) n)
+                              (not (starts-block? (text/span-text doc
+                                                                  (get lines
+                                                                       (load j))))))
+                    (text/push-str! (mut buffer) " ")
+                    (text/push-str! (mut buffer)
+                                    (text/trim (text/span-text doc
+                                                               (get lines
+                                                                    (load j)))))
+                    (set! j (+ (load j) 1)))
+                  (paragraph! ui (al-slice buffer) 14.0 gv/INK)
+                  (set! i (load j))))))
+    (end! ui)
+    (al-free! (mut lines))
+    (al-free! (mut buffer))
+    (do)))
+
+(impl Widget Markdown
+  (render [(self (ptr Markdown)) (ui (ptr Ui))]
+          (-> void)
+          (when (> (len (.full self)) 0) (watch! ui (al-slice (.full self))) 0)
+          (title! ui
+                  (if (> (len (.path self)) 0)
+                      (text/basename (al-slice (.path self)))
+                      "Markdown"))
+          (vstack! ui 12.0 14.0)
+          (hstack! ui 8.0 0.0)
+          (text! ui "▤ markdown" 13.0 gv/INK true)
+          (input! ui
+                  "path"
+                  (al-slice (.draft self))
+                  "path to .md … (Return to load)")
+          (grow! ui 1.0)
+          (button! ui "load" "Load")
+          (button! ui "reload" "↻")
+          (text! ui (al-slice (.status self)) 11.0 gv/MUTED false)
+          (end! ui)
+          (divider! ui)
+          (blocks! ui (al-slice (.doc self)))
+          (end! ui))
+  (event [(self (ptr Markdown)) (e (ptr Event))]
+         (-> void)
+         (cond (changed? e "path") (text/set-str! (field self draft) (.text e))
+               (files-changed? e)
+                 (let [(mut path) (text/owned (al-slice (.path self)))]
+                   (load! self (al-slice path))
+                   (al-free! (mut path))
+                   (do))
+               (or (clicked? e "load") (submitted? e "path"))
+                 (let [(mut path)
+                         (text/owned (text/trim (al-slice (.draft self))))]
+                   (load! self (al-slice path))
+                   (al-free! (mut path))
+                   (do))
+               (clicked? e "reload")
+                 (let [(mut path) (text/owned (al-slice (.path self)))]
+                   (load! self (al-slice path))
+                   (al-free! (mut path))
+                   (do))
+               :else (do)))
+  (save [(self (ptr Markdown)) (s (ptr Snapshot))]
+        (-> void)
+        (put-text! s "path" (al-slice (.path self))))
+  (animating? [(self (ptr Markdown))]
+              (-> bool)
+              false)
+  (destroy! [(self (ptr Markdown))]
+            (-> void)
+            (al-free! (mut (.doc self)))
+            (al-free! (mut (.path self)))
+            (al-free! (mut (.draft self)))
+            (al-free! (mut (.project self)))
+            (al-free! (mut (.status self)))
+            (al-free! (mut (.full self)))
+            (alloc/destroy [Markdown] (alloc/malloc-allocator) self)
+            (do)))
+
+(defn welcome [] (-> (slice u8))
+  "# Markdown widget
+
+Renders **Markdown** as widget elements, written in *Coil*. Type a path in
+the box above and press Return to open a `.md` file — the pane scrolls, so
+long documents just keep going.
+
+## Features
+
+- Headings, paragraphs, and `inline code`
+- **Bold** and *italic* (markers are stripped)
+- Ordered and unordered lists
+  - nested by indentation
+- Block quotes, code fences, tables, and rules
+
+## A list, in order
+
+1. First load a file
+2. Or open one from the palette: `markdown README.md`
+3. Then read
+
+## Code
+
+```
+(defn hello [(name (slice u8))] (-> void)
+  (println \"hi, {}\" name))
+```
+
+## Quote
+
+> The pane owns scrolling; the widget just emits a tall stack of blocks.
+> — the design
+
+## Table
+
+| block   | example        |
+| ------- | -------------- |
+| heading | # Title        |
+| list    | - item         |
+| link    | [jim](https://example.com) |
+
+---
+
+Open something real: try `README.md` in this project.
+")
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        args (text/trim (get-text saved "jim.args" ""))
+        path (if (> (len args) 0) args (get-text saved "path" ""))
+        s
+          (alloc/box! a
+                      Markdown
+                      (Markdown
+                        :doc (al-new [u8] a)
+                        :path (al-new [u8] a)
+                        :draft (text/owned path)
+                        :project (text/owned (get-text saved "jim.dir" "."))
+                        :status (al-new [u8] a)
+                        :full (al-new [u8] a)))]
+    (load! s path)
+    (set! out s)))

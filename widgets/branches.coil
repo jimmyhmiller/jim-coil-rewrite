@@ -1,0 +1,656 @@
+(module widgets.branches)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "coil.time" :as time)
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.proc" :as proc)
+(import "jim.widget-kit.json" :as json)
+(import "jim.widget-kit.git-view" :as gv)
+(import "jim.widget-kit.live" :as live)
+
+;;; Branches and worktrees with safe git actions, ported from Jim's
+;;; branches.ft. Tabs: Branches (checkout, diff against the default branch,
+;;; new branch) and Worktrees (terminal, diff, new worktree, remove). Every
+;;; mutation goes through `jimctl git …`, whose one-line JSON replies make
+;;; failures visible. Risky actions ask first: checkout with a dirty tree and
+;;; worktree removal.
+(const BRANCHES 0)
+
+(const WORKTREES 1)
+
+(const ASK-NONE 0)
+
+(const ASK-CHECKOUT 1)
+
+(const ASK-REMOVE 2)
+
+(const ASK-ADD 3)
+
+(const JOB-BRANCHES 0)
+
+(const JOB-WORKTREES 1)
+
+(const JOB-STATUS 2)
+
+(const JOB-WRITE 3)
+
+(defstruct Branch
+  [(name-at i64)
+   (name-len i64)
+   (subject-at i64)
+   (subject-len i64)
+   (stamp i64)
+   (ahead i64)
+   (behind i64)
+   (current bool)
+   (gone bool)])
+
+(defstruct Worktree
+  [(path-at i64)
+   (path-len i64)
+   (branch-at i64)
+   (branch-len i64)
+   (agent-at i64)
+   (agent-len i64)
+   (main bool)
+   (locked bool)])
+
+(defstruct Branches
+  [(jobs (array proc/Job 4))
+   (tab i64)
+   (repo (ArrayList u8))
+   (status (ArrayList u8))
+   (strings (ArrayList u8))
+   (branches (ArrayList Branch))
+   (worktrees (ArrayList Worktree))
+   (dirty i64)
+   (default-branch (ArrayList u8))
+   (ask i64)
+   (ask-arg (ArrayList u8))
+   (new-name (ArrayList u8))
+   (wt-path (ArrayList u8))
+   (wt-branch (ArrayList u8))
+   (outside live/Refresher)])
+
+(defn job [(s (ptr Branches)) (k i64)] (-> (ptr proc/Job))
+  (p/index (p/cast (ptr proc/Job) (field s jobs)) k))
+
+(defn say! [(s (ptr Branches)) (message (slice u8))] (-> void)
+  (text/set-str! (field s status) message))
+
+(defn repo [(s (ptr Branches))] (-> (slice u8))
+  (al-slice (.repo s)))
+
+(defn string-at [(s (ptr Branches)) (at i64) (n i64)] (-> (slice u8))
+  (subslice (al-slice (.strings s)) at (+ at n)))
+
+(defn now-ms [] (-> i64)
+  (try (let [v (try-or! (time/wall-now-ms) 0)] v)))
+
+(defn refresh! [(s (ptr Branches))] (-> void)
+  (live/started! (field s outside))
+  (when (not (proc/running? (job s JOB-BRANCHES)))
+    (proc/start! (job s JOB-BRANCHES)
+                 ["jimctl" "git" "branches" "--repo" (repo s)]
+                 (repo s)
+                 0)
+    0)
+  (when (not (proc/running? (job s JOB-WORKTREES)))
+    (proc/start! (job s JOB-WORKTREES)
+                 ["jimctl" "git" "worktrees" "--repo" (repo s)]
+                 (repo s)
+                 0)
+    0)
+  (when (not (proc/running? (job s JOB-STATUS)))
+    (proc/start! (job s JOB-STATUS)
+                 ["jimctl" "git" "status" "--repo" (repo s)]
+                 (repo s)
+                 0)
+    0)
+  (say! s "loading…"))
+
+(defn keep! [(s (ptr Branches)) (r (ptr json/Reply)) (i i64) (key (slice u8))] (-> i64)
+  (let [before (len (.strings s))]
+    (json/field-into! r i key (field s strings) "")
+    before))
+
+(defn kept [(s (ptr Branches)) (at i64)] (-> i64)
+  (- (len (.strings s)) at))
+
+;;; The list jimctl replied with, or -1 after reporting its error.
+(defn reply-list [(s (ptr Branches)) (r (ptr json/Reply)) (key (slice u8))] (-> i64)
+  (if (json/ok? r)
+      (json/get r (json/root r) key)
+      (do (say! s "") (json/error-into! r (field s status)) -1)))
+
+(defn read-branches! [(s (ptr Branches)) (raw (slice u8))] (-> void)
+  (let [(mut r) (json/parse raw)
+        list (reply-list s (mut r) "branches")]
+    (when (>= list 0)
+      (al-clear! (mut (.branches s)))
+      (text/set-str! (field s default-branch) "main")
+      (let [(mut saw-main) false]
+        (for [k 0 (json/count (mut r) list)]
+          (let [b (json/nth (mut r) list k)
+                name-at (keep! s (mut r) b "name")
+                name-len (kept s name-at)
+                subject-at (keep! s (mut r) b "last_subject")
+                subject-len (kept s subject-at)
+                name (string-at s name-at name-len)]
+            (when (= name "main") (set! saw-main true) 0)
+            (when (and (= name "master") (not (load saw-main)))
+              (text/set-str! (field s default-branch) "master")
+              0)
+            (push! (mut (.branches s))
+                   (Branch
+                     :name-at name-at
+                     :name-len name-len
+                     :subject-at subject-at
+                     :subject-len subject-len
+                     :stamp (json/field-i64 (mut r) b "last_ts_ms" 0)
+                     :ahead (json/field-i64 (mut r) b "ahead" 0)
+                     :behind (json/field-i64 (mut r) b "behind" 0)
+                     :current (json/field-bool (mut r) b "current" false)
+                     :gone (json/field-bool (mut r) b "upstream_gone" false)))))
+        (when (load saw-main) (text/set-str! (field s default-branch) "main") 0))
+      0)
+    (json/free! (mut r))
+    (do)))
+
+(defn read-worktrees! [(s (ptr Branches)) (raw (slice u8))] (-> void)
+  (let [(mut r) (json/parse raw)
+        list (reply-list s (mut r) "worktrees")]
+    (when (>= list 0)
+      (al-clear! (mut (.worktrees s)))
+      (for [k 0 (json/count (mut r) list)]
+        (let [w (json/nth (mut r) list k)
+              path-at (keep! s (mut r) w "path")
+              path-len (kept s path-at)
+              branch-at (keep! s (mut r) w "branch")
+              branch-len (kept s branch-at)
+              agent-at (keep! s (mut r) w "agent_id")
+              agent-len (kept s agent-at)]
+          (push! (mut (.worktrees s))
+                 (Worktree
+                   :path-at path-at
+                   :path-len path-len
+                   :branch-at branch-at
+                   :branch-len branch-len
+                   :agent-at agent-at
+                   :agent-len agent-len
+                   :main (json/field-bool (mut r) w "is_main" false)
+                   :locked (json/field-bool (mut r) w "locked" false)))))
+      0)
+    (json/free! (mut r))
+    (do)))
+
+(defn read-status! [(s (ptr Branches)) (raw (slice u8))] (-> void)
+  (let [(mut r) (json/parse raw)]
+    (when (json/ok? (mut r))
+      (let [st (json/get (mut r) (json/root (mut r)) "state")]
+        (set! (.dirty s)
+              (+ (json/field-i64 (mut r) st "staged" 0)
+                 (json/field-i64 (mut r) st "unstaged" 0))))
+      0)
+    (json/free! (mut r))
+    (do)))
+
+(defn finished? [(s (ptr Branches)) (k i64)] (-> bool)
+  (and (proc/running? (job s k)) (proc/poll! (job s k))))
+
+(defn loading? [(s (ptr Branches))] (-> bool)
+  (or (proc/running? (job s JOB-BRANCHES))
+      (proc/running? (job s JOB-WORKTREES))
+      (proc/running? (job s JOB-STATUS))))
+
+(defn poll-jobs! [(s (ptr Branches)) (e (ptr Event))] (-> void)
+  ; Strings are shared by both lists, so rebuild them together.
+  (let [branches-done (finished? s JOB-BRANCHES)
+        worktrees-done (finished? s JOB-WORKTREES)]
+    (when (or branches-done worktrees-done)
+      (when (not (or (proc/running? (job s JOB-BRANCHES))
+                     (proc/running? (job s JOB-WORKTREES))))
+        (al-clear! (mut (.strings s)))
+        (say! s "")
+        (read-branches! s (proc/output (job s JOB-BRANCHES)))
+        (read-worktrees! s (proc/output (job s JOB-WORKTREES)))
+        0)
+      0))
+  (when (finished? s JOB-STATUS)
+    (read-status! s (proc/output (job s JOB-STATUS)))
+    0)
+  (when (finished? s JOB-WRITE)
+    (let [(mut r) (json/parse (proc/output (job s JOB-WRITE)))]
+      (if (json/ok? (mut r))
+          (do (emit! e "git.changed" (repo s)) (refresh! s))
+          (do (say! s "") (json/error-into! (mut r) (field s status)) (do)))
+      (json/free! (mut r)))
+    0)
+  (when (live/due? (field s outside) (loading? s)) (refresh! s) 0)
+  (do))
+
+(defn mutate! [(s (ptr Branches))
+               (argv (slice (slice u8)))
+               (message (slice u8))] (-> void)
+  (set! (.ask s) ASK-NONE)
+  (if (proc/running? (job s JOB-WRITE))
+      (say! s "busy…")
+      (do (proc/start! (job s JOB-WRITE) argv (repo s) 0) (say! s message))))
+
+(defn branch-name [(s (ptr Branches)) (i i64)] (-> (slice u8))
+  (let [b (al-elem (field s branches) i)]
+    (string-at s (.name-at b) (.name-len b))))
+
+(defn worktree-path [(s (ptr Branches)) (i i64)] (-> (slice u8))
+  (let [w (al-elem (field s worktrees) i)]
+    (string-at s (.path-at w) (.path-len w))))
+
+(defn checkout! [(s (ptr Branches)) (name (slice u8))] (-> void)
+  (let [(mut message) (text/owned "checkout ")]
+    (text/push-str! (mut message) name)
+    (text/push-str! (mut message) "…")
+    (mutate! s
+             ["jimctl" "git" "checkout" "--repo" (repo s) "--ref" name]
+             (al-slice message))
+    (al-free! (mut message))
+    (do)))
+
+(defn open-diff! [(e (ptr Event)) (path (slice u8)) (source (slice u8))] (-> void)
+  (let [(mut spec) (text/owned "diff repo=")]
+    (text/push-str! (mut spec) path)
+    (text/push-str! (mut spec) " ")
+    (text/push-str! (mut spec) source)
+    (open-widget! e (al-slice spec))
+    (al-free! (mut spec))
+    (do)))
+
+(defn ask! [(s (ptr Branches)) (kind i64) (arg (slice u8))] (-> void)
+  (set! (.ask s) kind)
+  (text/set-str! (field s ask-arg) arg))
+
+(defn in-range? [(i i64) (n i64)] (-> bool)
+  (and (>= i 0) (< i n)))
+
+(defn act! [(s (ptr Branches)) (e (ptr Event))] (-> void)
+  (let [nb (len (.branches s))
+        nw (len (.worktrees s))]
+    (cond (id-prefix? e "co:")
+            (let [i (id-number e "co:")]
+              (when (in-range? i nb)
+                (if (> (.dirty s) 0)
+                    (ask! s ASK-CHECKOUT (branch-name s i))
+                    (checkout! s (branch-name s i)))
+                0)
+              (do))
+          (id-prefix? e "bdiff:")
+            (let [i (id-number e "bdiff:")]
+              (when (in-range? i nb)
+                (let [(mut source) (text/owned "range ")]
+                  (text/push-str! (mut source) (al-slice (.default-branch s)))
+                  (text/push-str! (mut source) " ")
+                  (text/push-str! (mut source) (branch-name s i))
+                  (open-diff! e (repo s) (al-slice source))
+                  (al-free! (mut source)))
+                0)
+              (do))
+          (id-prefix? e "wterm:")
+            (let [i (id-number e "wterm:")]
+              (when (in-range? i nw) (open-terminal! e (worktree-path s i)) 0)
+              (do))
+          (id-prefix? e "wdiff:")
+            (let [i (id-number e "wdiff:")]
+              (when (in-range? i nw)
+                (open-diff! e (worktree-path s i) "working")
+                0)
+              (do))
+          (id-prefix? e "wvs:")
+            (let [i (id-number e "wvs:")]
+              (when (in-range? i nw)
+                (let [(mut source) (text/owned "range ")]
+                  (text/push-str! (mut source) (al-slice (.default-branch s)))
+                  (text/push-str! (mut source) " HEAD")
+                  (open-diff! e (worktree-path s i) (al-slice source))
+                  (al-free! (mut source)))
+                0)
+              (do))
+          (id-prefix? e "wrm:")
+            (let [i (id-number e "wrm:")]
+              (when (in-range? i nw) (ask! s ASK-REMOVE (worktree-path s i)) 0)
+              (do))
+          :else (do))))
+
+(defn confirm! [(s (ptr Branches))] (-> void)
+  (let [arg (al-slice (.ask-arg s))]
+    (cond (= (.ask s) ASK-CHECKOUT) (checkout! s arg)
+          (= (.ask s) ASK-REMOVE)
+            (mutate! s
+                     ["jimctl"
+                      "git"
+                      "worktree-rm"
+                      "--repo"
+                      (repo s)
+                      "--path"
+                      arg]
+                     "removing worktree…")
+          :else (do))))
+
+(defn new-branch! [(s (ptr Branches))] (-> void)
+  (let [name (text/trim (al-slice (.new-name s)))]
+    (when (> (len name) 0)
+      (mutate! s
+               ["jimctl"
+                "git"
+                "checkout"
+                "--repo"
+                (repo s)
+                "--ref"
+                name
+                "--create"]
+               "creating branch…")
+      (al-clear! (mut (.new-name s)))
+      0)
+    (do)))
+
+(defn add-worktree! [(s (ptr Branches))] (-> void)
+  (let [path (text/trim (al-slice (.wt-path s)))
+        branch (text/trim (al-slice (.wt-branch s)))]
+    (if (or (= (len path) 0) (= (len branch) 0))
+        (say! s "worktree needs a path and a branch name")
+        (do
+          (mutate! s
+                   ["jimctl"
+                    "git"
+                    "worktree-add"
+                    "--repo"
+                    (repo s)
+                    "--path"
+                    path
+                    "--branch"
+                    branch
+                    "--new-branch"]
+                   "adding worktree…")
+          (al-clear! (mut (.wt-path s)))
+          (al-clear! (mut (.wt-branch s)))
+          (do)))))
+
+;;; ---- rendering -------------------------------------------------------------
+(defn counted-tab! [(ui (ptr Ui))
+                    (id (slice u8))
+                    (label (slice u8))
+                    (count i64)
+                    (selected bool)] (-> void)
+  (let [(mut text) (text/owned label)]
+    (text/push-i64! (mut text) count)
+    (text/push-str! (mut text) ")")
+    (tab! ui id (al-slice text) selected)
+    (al-free! (mut text))
+    (do)))
+
+(defn row-card! [(ui (ptr Ui))] (-> void)
+  (vstack! ui 3.0 0.0)
+  (pad! ui 6.0 8.0 6.0 8.0)
+  (radius! ui 6.0)
+  (bg! ui gv/CARD))
+
+(defn indexed [(prefix (slice u8)) (i i64) (out (ptr (ArrayList u8)))] (-> (slice u8))
+  (text/set-str! out prefix)
+  (text/push-i64! out i)
+  (al-slice (load out)))
+
+(defn branch-row! [(s (ptr Branches)) (ui (ptr Ui)) (i i64) (now i64)] (-> void)
+  (let [b (al-elem (field s branches) i)
+        name (string-at s (.name-at b) (.name-len b))
+        (mut id) (al-new [u8] (alloc/malloc-allocator))
+        (mut meta) (al-new [u8] (alloc/malloc-allocator))]
+    (row-card! ui)
+    (hstack! ui 8.0 0.0)
+    (hstack! ui 8.0 0.0)
+    (grow! ui 1.0)
+    (clip! ui)
+    (text! ui
+           (if (.current b) "● " "")
+           12.5
+           (if (.current b) gv/ACCENT gv/INK)
+           (.current b))
+    (append! ui name)
+    (mono! ui)
+    (when (or (> (.ahead b) 0) (> (.behind b) 0))
+      (text! ui "" 11.0 gv/MUTED false)
+      (mono! ui)
+      (when (> (.ahead b) 0)
+        (append! ui "↑")
+        (append-i64! ui (.ahead b))
+        (append! ui " ")
+        0)
+      (when (> (.behind b) 0) (append! ui "↓") (append-i64! ui (.behind b)) 0)
+      0)
+    (when (.gone b) (badge! ui "gone" 0x4a1f24) 0)
+    (text/push-truncated! (mut meta)
+                          (string-at s (.subject-at b) (.subject-len b))
+                          44)
+    (text/push-str! (mut meta) " · ")
+    (text/push-ago! (mut meta) (.stamp b) now)
+    (text! ui (al-slice meta) 10.5 gv/MUTED false)
+    (end! ui)
+    (when (not (.current b))
+      (button! ui (indexed "co:" i (mut id)) "Checkout")
+      0)
+    (text/set-str! (mut meta) "Diff vs ")
+    (text/push-str! (mut meta) (al-slice (.default-branch s)))
+    (button! ui (indexed "bdiff:" i (mut id)) (al-slice meta))
+    (end! ui)
+    (end! ui)
+    (al-free! (mut id))
+    (al-free! (mut meta))
+    (do)))
+
+(defn worktree-row! [(s (ptr Branches)) (ui (ptr Ui)) (i i64)] (-> void)
+  (let [w (al-elem (field s worktrees) i)
+        path (string-at s (.path-at w) (.path-len w))
+        branch (string-at s (.branch-at w) (.branch-len w))
+        agent (string-at s (.agent-at w) (.agent-len w))
+        (mut id) (al-new [u8] (alloc/malloc-allocator))
+        (mut label) (al-new [u8] (alloc/malloc-allocator))]
+    (row-card! ui)
+    (hstack! ui 8.0 0.0)
+    (hstack! ui 8.0 0.0)
+    (grow! ui 1.0)
+    (clip! ui)
+    (text! ui (text/basename path) 12.5 gv/INK (.main w))
+    (mono! ui)
+    (text! ui (if (> (len branch) 0) branch "(detached)") 11.5 gv/ACCENT false)
+    (mono! ui)
+    (when (.main w) (badge! ui "main" 0x243a5e) 0)
+    (when (.locked w) (badge! ui "locked" 0x4a3a1f) 0)
+    (when (> (len agent) 0) (badge! ui "⚡ " 0x4a3a1f) (append! ui agent) 0)
+    (end! ui)
+    (button! ui (indexed "wterm:" i (mut id)) "Terminal")
+    (button! ui (indexed "wdiff:" i (mut id)) "Diff")
+    (text/set-str! (mut label) "vs ")
+    (text/push-str! (mut label) (al-slice (.default-branch s)))
+    (button! ui (indexed "wvs:" i (mut id)) (al-slice label))
+    (when (not (.main w))
+      (button! ui (indexed "wrm:" i (mut id)) "Remove")
+      (variant! ui DANGER)
+      0)
+    (end! ui)
+    (text! ui path 10.0 gv/MUTED false)
+    (mono! ui)
+    (end! ui)
+    (al-free! (mut id))
+    (al-free! (mut label))
+    (do)))
+
+(defn dialog-view! [(s (ptr Branches)) (ui (ptr Ui))] (-> void)
+  (when (!= (.ask s) ASK-NONE)
+    (if (= (.ask s) ASK-ADD)
+        (do
+          (dialog! ui 460.0)
+          (text! ui "New worktree" 14.0 gv/INK true)
+          (input! ui "wt_path" (al-slice (.wt-path s)) "worktree path")
+          (input! ui "wt_branch" (al-slice (.wt-branch s)) "new branch name")
+          (hstack! ui 8.0 0.0)
+          (button! ui "wt_add_go" "Create")
+          (variant! ui PRIMARY)
+          (button! ui "confirm_no" "Cancel")
+          (end! ui)
+          (end! ui))
+        (let [(mut message) (al-new [u8] (alloc/malloc-allocator))]
+          (if (= (.ask s) ASK-CHECKOUT)
+              (do
+                (text/push-i64! (mut message) (.dirty s))
+                (text/push-str! (mut message)
+                                " uncommitted change(s) — checkout ")
+                (text/push-str! (mut message) (al-slice (.ask-arg s)))
+                (text/push-str! (mut message) " anyway?"))
+              (do
+                (text/push-str! (mut message) "Remove worktree ")
+                (text/push-str! (mut message) (al-slice (.ask-arg s)))
+                (text/push-str! (mut message)
+                                "? Uncommitted work there is kept only if git allows.")))
+          (dialog! ui 420.0)
+          (text! ui "Are you sure?" 14.0 gv/INK true)
+          (text! ui (al-slice message) 12.5 gv/INK false)
+          (wrap! ui)
+          (hstack! ui 8.0 0.0)
+          (button! ui "confirm_yes" "Yes")
+          (variant! ui (if (= (.ask s) ASK-REMOVE) DANGER PRIMARY))
+          (button! ui "confirm_no" "Cancel")
+          (end! ui)
+          (end! ui)
+          (al-free! (mut message))
+          (do)))
+    0)
+  (do))
+
+(impl Widget Branches
+  (render [(self (ptr Branches)) (ui (ptr Ui))]
+          (-> void)
+          (title! ui "Branches")
+          (watch! ui (repo self))
+          (vstack! ui 8.0 14.0)
+          (hstack! ui 8.0 0.0)
+          (text! ui "⑂ " 13.0 gv/INK true)
+          (append! ui (text/basename (repo self)))
+          (counted-tab! ui
+                        "tab_branches"
+                        "Branches ("
+                        (len (.branches self))
+                        (= (.tab self) BRANCHES))
+          (counted-tab! ui
+                        "tab_worktrees"
+                        "Worktrees ("
+                        (len (.worktrees self))
+                        (= (.tab self) WORKTREES))
+          (button! ui "refresh" "↻")
+          (text! ui (al-slice (.status self)) 11.0 gv/WARN false)
+          (end! ui)
+          (divider! ui)
+          (if (= (.tab self) BRANCHES)
+              (do
+                (hstack! ui 6.0 0.0)
+                (input! ui
+                        "new_name"
+                        (al-slice (.new-name self))
+                        "new branch name (from HEAD)")
+                (grow! ui 1.0)
+                (button! ui "new_branch" "+ Branch")
+                (end! ui)
+                (let [now (now-ms)]
+                  (for [i 0 (len (.branches self))] (branch-row! self ui i now)))
+                (do))
+              (do
+                (hstack! ui 6.0 0.0)
+                (button! ui "wt_new" "+ Worktree")
+                (end! ui)
+                (for [i 0 (len (.worktrees self))] (worktree-row! self ui i))
+                (do)))
+          (dialog-view! self ui)
+          (end! ui))
+  (event [(self (ptr Branches)) (e (ptr Event))]
+         (-> void)
+         (cond (tick? e) (poll-jobs! self e)
+               (or (files-changed? e) (message? e "git.changed"))
+                 (live/note! (field self outside))
+               (clicked? e "refresh") (refresh! self)
+               (clicked? e "tab_branches") (set! (.tab self) BRANCHES)
+               (clicked? e "tab_worktrees") (set! (.tab self) WORKTREES)
+               (or (clicked? e "new_branch") (submitted? e "new_name"))
+                 (new-branch! self)
+               (changed? e "new_name")
+                 (text/set-str! (field self new-name) (.text e))
+               (changed? e "wt_path")
+                 (text/set-str! (field self wt-path) (.text e))
+               (changed? e "wt_branch")
+                 (text/set-str! (field self wt-branch) (.text e))
+               (clicked? e "wt_new")
+                 (do
+                   (when (= (len (.wt-path self)) 0)
+                     (text/set-str! (field self wt-path) (repo self))
+                     (text/push-str! (field self wt-path) "-wt")
+                     0)
+                   (ask! self ASK-ADD ""))
+               (or (clicked? e "wt_add_go") (submitted? e "wt_branch"))
+                 (add-worktree! self)
+               (clicked? e "confirm_no") (set! (.ask self) ASK-NONE)
+               (clicked? e "confirm_yes") (confirm! self)
+               :else (act! self e)))
+  (save [(self (ptr Branches)) (s (ptr Snapshot))]
+        (-> void)
+        (put-i64! s "tab" (.tab self))
+        (put-text! s "new_name" (al-slice (.new-name self))))
+  (animating? [(self (ptr Branches))]
+              (-> bool)
+              (or (live/waiting? (field self outside))
+                  (proc/running? (job self JOB-BRANCHES))
+                  (proc/running? (job self JOB-WORKTREES))
+                  (proc/running? (job self JOB-STATUS))
+                  (proc/running? (job self JOB-WRITE))))
+  (destroy! [(self (ptr Branches))]
+            (-> void)
+            (for [k 0 4] (proc/free! (job self k)))
+            (al-free! (mut (.repo self)))
+            (al-free! (mut (.status self)))
+            (al-free! (mut (.strings self)))
+            (al-free! (mut (.branches self)))
+            (al-free! (mut (.worktrees self)))
+            (al-free! (mut (.default-branch self)))
+            (al-free! (mut (.ask-arg self)))
+            (al-free! (mut (.new-name self)))
+            (al-free! (mut (.wt-path self)))
+            (al-free! (mut (.wt-branch self)))
+            (alloc/destroy [Branches] (alloc/malloc-allocator) self)
+            (do)))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        args (text/trim (get-text saved "jim.args" ""))
+        s
+          (alloc/box! a
+                      Branches
+                      (Branches
+                        :jobs (p/zeroed (array proc/Job 4))
+                        :tab (get-i64 saved "tab" BRANCHES)
+                        :repo
+                          (text/owned (if (> (len args) 0)
+                                          args
+                                          (get-text saved "jim.dir" ".")))
+                        :status (al-new [u8] a)
+                        :strings (al-new [u8] a)
+                        :branches (al-new [Branch] a)
+                        :worktrees (al-new [Worktree] a)
+                        :dirty 0
+                        :default-branch (text/owned "main")
+                        :ask ASK-NONE
+                        :ask-arg (al-new [u8] a)
+                        :new-name (text/owned (get-text saved "new_name" ""))
+                        :wt-path (al-new [u8] a)
+                        :wt-branch (al-new [u8] a)
+                        :outside (live/refresher)))]
+    (for [k 0 4] (set! (job s k) (proc/job-new (host saved))))
+    (refresh! s)
+    (set! out s)))

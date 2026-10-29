@@ -81,6 +81,92 @@ The display link pauses when the overlay is hidden.
 Pane dragging and resizing use the current camera, so a held pane continues
 to follow the pointer during Command-scroll, even without mouse movement.
 
+## Widgets
+
+A widget is a Coil source file, `widgets/NAME.coil`, that Jim compiles in-process
+with Coil's JIT and hot-reloads on save. Open one with the palette action
+**Widget: Open widget** and enter `NAME ARGS…`:
+
+| Widget | Port of | Open with |
+|---|---|---|
+| `diff` | `diff.ft` | `diff`, `diff range main HEAD`, `diff pr 123`, `diff file x.patch`; a leading `repo=PATH` picks another repository |
+| `stage` | `stage.ft` | `stage [REPO]` — stage/unstage hunks or files, commit |
+| `branches` | `branches.ft` | `branches [REPO]` — checkout, new branch, worktrees, diffs |
+| `markdown` | `markdown.ft` | `markdown [PATH]` |
+| `counter` | `controls_demo.ft` | `counter` |
+| `git` | — | `git` — status and recent commits |
+
+A widget declares `(module widgets.NAME)`, imports `jim.widget-api`, implements
+its `Widget` trait (`render`, `event`, `save`, `animating?`, `destroy!`), and
+defines `boot`, which builds the widget from a saved `Snapshot` (plus Jim's
+`jim.dir` project directory and `jim.args`). `render` describes an element tree:
+`vstack!`, `hstack!`, `table!`, `dialog!` containers; `text!`, `button!`, `tab!`,
+`toggle!`, `badge!`, `divider!`, `spacer!`; native `input!` and `textarea!` fields;
+and setters for padding, margin, size, grow, alignment, colors, borders, clipping,
+monospace, wrapping and clickable rows. Jim lays it out, draws it, scrolls the
+pane (passing the offset so widgets can build only visible rows), and routes
+clicks, edits and timer ticks back as events. Events can ask Jim to open another
+widget or a terminal. Jim calls widgets only through the trait's vtable. There is
+no C interface between them.
+
+`src/widget_kit/` holds widget-side helpers compiled into each widget: text
+utilities, non-blocking child processes (`proc`), JSON replies (`json`), a
+unified-diff model and parser (`diff`), a lexical syntax highlighter
+(`highlight`), and the shared diff row primitives (`git-view`). The git widgets
+talk to git through `jimctl git …` and `jimctl review …`. Jim adopts the login
+shell's `PATH` at startup so those tools are found when launched from Finder.
+
+Widgets never block Jim's main thread for long work:
+
+- **Compiling.** On save, the new version compiles on Jim's compiler thread (the
+  only thread that touches the JIT, with its own malloc zone) while the current
+  version keeps running and responding. When it is ready, the main thread saves
+  the running widget's state, boots the new version from it and switches over;
+  that swap costs one render. Each save compiles twice: first with Coil's native
+  JIT backend, live in 0.15–0.3 s; then with its LLVM backend at `-O2`, about
+  1 s later, whose code runs 10–50× faster and replaces the native version the
+  same way. A save made during the optimized compile supersedes it. The old generation retires once any background
+  tasks it started have finished, then its session is reset, which unmaps its
+  code. A compile error or API misuse leaves the previous version running and
+  shows the error in the pane.
+- **Processes and tasks.** Widgets reach Jim through the `Host` trait
+  (`(api/host saved)`): `spawn`/`poll`/`release` run child processes, launched
+  on a background thread with non-blocking output and `GIT_OPTIONAL_LOCKS=0`;
+  `start-task`/`task-done?`/`release-task` run a widget's `Task` (for example
+  parsing and highlighting a large diff) on Jim's worker threads. A widget
+  returns true from `animating?` while any of these are outstanding so it keeps
+  receiving ticks.
+
+Jim remembers text measurements by text, font and wrap width, so a refresh that
+repeats earlier text costs tens of microseconds. For example, a README in the
+markdown widget refreshes in about 0.4 ms. With five widgets reloading every
+second, swaps between generations never took more than 5 ms of main-thread
+time. The longest passes were first opens, when all of a widget's text is new:
+up to about 14 ms for the markdown widget, under one 60 Hz frame. The first
+text field or text view a process creates sets up AppKit's text system, so Jim
+creates and discards one of each at startup, before its window opens.
+
+**Live refresh.** `watch!` in `render` names paths to watch. Jim follows them
+with FSEvents and delivers changes as `FILES-CHANGED` events. `emit!` sends a
+`MESSAGE` to every other open widget; for example, stage sends `git.changed`
+after staging or committing, and diff sends `review.changed` after editing a
+review thread. The kit's `live/Refresher` coalesces notices so a widget
+refreshes at most every 500 ms and never while a refresh is still running.
+
+**Persistence.** A widget's `save` writes named values into a `Snapshot`. Jim
+uses it both across reloads and across app restarts: the layout file stores each
+widget pane's spec and its saved state, and on relaunch the widget boots from
+that state.
+
+Editing `src/widget_api.coil` requires rebuilding Jim, and widgets refuse to
+load until then.
+
+Each open widget holds two JIT sessions, used alternately so the next version
+can compile while the current one runs. Closed widgets return their sessions to
+a pool for reuse. The first compile in a process allocates large short-lived
+compiler buffers, which raises the process footprint once; later widgets and
+reloads reuse that memory.
+
 ## Checks and scope
 
 ```sh

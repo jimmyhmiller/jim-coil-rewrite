@@ -1,0 +1,78 @@
+(module widgets.counter)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "jim.widget-api" :use *)
+
+;;; Port of Jim's controls_demo.ft: buttons, a toggle, and the last event.
+;;; Edit and save; the count and toggle survive the reload.
+(defstruct Counter [(n i64) (dark bool) (last i64)])
+
+(const LAST-NONE 0)
+
+(const LAST-INC 1)
+
+(const LAST-DEC 2)
+
+(const LAST-TOGGLE 3)
+
+(defn ink [(c (ptr Counter))] (-> i64)
+  (if (.dark c) 0x9098a4 0xcfd2d8))
+
+(impl Widget Counter
+  (render [(self (ptr Counter)) (ui (ptr Ui))]
+          (-> void)
+          (vstack! ui 10.0 16.0)
+          (text! ui "Controls demo" 15.0 (ink self) true)
+          (hstack! ui 8.0 0.0)
+          (button! ui "dec" "−")
+          (text! ui "n = " 14.0 (ink self) false)
+          (append-i64! ui (.n self))
+          (button! ui "inc" "+")
+          (end! ui)
+          (toggle! ui "dark" "Dim text" (.dark self))
+          (divider! ui)
+          (text! ui
+                 (cond (= (.last self) LAST-INC) "click: inc"
+                       (= (.last self) LAST-DEC) "click: dec"
+                       (= (.last self) LAST-TOGGLE) "toggle: dark"
+                       :else "(nothing yet)")
+                 11.0
+                 0x7f8794
+                 false)
+          (end! ui))
+  (event [(self (ptr Counter)) (e (ptr Event))]
+         (-> void)
+         (cond (clicked? e "inc")
+                 (do
+                   (set! (.n self) (+ (.n self) 1))
+                   (set! (.last self) LAST-INC))
+               (clicked? e "dec")
+                 (do
+                   (set! (.n self) (- (.n self) 1))
+                   (set! (.last self) LAST-DEC))
+               (toggled? e "dark")
+                 (do
+                   (set! (.dark self) (.checked e))
+                   (set! (.last self) LAST-TOGGLE))
+               :else (do)))
+  (save [(self (ptr Counter)) (s (ptr Snapshot))]
+        (-> void)
+        (put-i64! s "n" (.n self))
+        (put-bool! s "dark" (.dark self))
+        (put-i64! s "last" (.last self)))
+  (animating? [(self (ptr Counter))]
+              (-> bool)
+              false)
+  (destroy! [(self (ptr Counter))]
+            (-> void)
+            (alloc/destroy [Counter] (alloc/malloc-allocator) self)
+            (do)))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (set! out
+        (alloc/box! (alloc/malloc-allocator)
+                    Counter
+                    (Counter
+                      :n (get-i64 saved "n" 0)
+                      :dark (get-bool saved "dark" false)
+                      :last (get-i64 saved "last" LAST-NONE)))))

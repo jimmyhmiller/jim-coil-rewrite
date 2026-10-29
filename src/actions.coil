@@ -8,8 +8,11 @@
   (p/alloc-static (ptr i8)))
 
 ;;; Stable action IDs are shared by shortcuts and the searchable registry.
+;;; Fixed actions come first; one action per project follows.
+(const FIRST-PROJECT 29)
+
 (defn count [] (-> i64)
-  (+ 28 (storage/count (projects/list (load (model))))))
+  (+ FIRST-PROJECT (storage/count (projects/list (load (model))))))
 
 (defn title [(id i64)] (-> (ptr i8))
   (cond (= id 0) c"Terminal: New terminal"
@@ -40,13 +43,14 @@
         (= id 25) c"Profile: Next profile"
         (= id 26) c"Project: Delete current project"
         (= id 27) c"Terminal: Reconnect focused terminal"
+        (= id 28) c"Widget: Open widget"
         :else
           (utf8 (msg (ptr i8)
                      (ns c"Project: ")
                      (sel c"stringByAppendingString:")
                      [(ptr i8)]
                      (storage/get (storage/at (projects/list (load (model)))
-                                              (- id 28))
+                                              (- id FIRST-PROJECT))
                                   c"name")))))
 
 (defn shortcut [(id i64)] (-> (ptr i8))
@@ -71,6 +75,7 @@
         (= id 8) c" compiz overview workspaces"
         (= id 10) c" fps performance profiler latency frame time"
         (= id 19) c" cwd pwd working current default new terminal"
+        (= id 28) c" coil hot reload funct pane new"
         :else c""))
 
 ;;; Original Jim's subsequence score: consecutive and word-start bonuses.
@@ -101,23 +106,22 @@
                                (- at (p/cast u64 1)))
                           (p/cast u16 32))]
                 (do
-                  (store! hi (+ at (p/cast u64 1)))
+                  (set! hi (+ at (p/cast u64 1)))
                   (if (= ch hc)
                       (do
-                        (store! result
-                                (+ (load result) (+ 1 (load consecutive))))
+                        (set! result (+ (load result) (+ 1 (load consecutive))))
                         (if (or (= at (p/cast u64 0))
                                 (= prev (p/cast u16 32))
                                 (= prev (p/cast u16 95))
                                 (= prev (p/cast u16 46))
                                 (= prev (p/cast u16 47))
                                 (= prev (p/cast u16 45)))
-                            (store! result (+ (load result) 4))
+                            (set! result (+ (load result) 4))
                             0)
-                        (store! consecutive (+ (load consecutive) 1))
-                        (store! found true))
-                      (store! consecutive 0)))))
-            (if (not (load found)) (store! valid false) 0))))
+                        (set! consecutive (+ (load consecutive) 1))
+                        (set! found true))
+                      (set! consecutive 0)))))
+            (if (not (load found)) (set! valid false) 0))))
       (if (load valid) (load result) -1))))
 
 (defn match-score [(query (ptr i8)) (id i64)] (-> i64)
@@ -128,10 +132,11 @@
                [(ptr i8)]
                (ns (keywords id)))
         base
-          (if (and (>= id 28)
+          (if (and (>= id FIRST-PROJECT)
                    (projects/hidden? (projects/profile (load (model)))
                                      (projects/id (storage/at (projects/list (load (model)))
-                                                              (- id 28)))))
+                                                              (- id
+                                                                 FIRST-PROJECT)))))
               -1
               (score query hay))
         exact

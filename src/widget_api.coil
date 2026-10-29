@@ -1,0 +1,832 @@
+(module jim.widget-api)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+
+;;; The contract between Jim and hot-reloaded Coil widgets.
+;;;
+;;; This module is compiled twice: into Jim ahead of time, and into each
+;;; widget's JIT session from src/widget_api.coil on disk. Jim refuses to load
+;;; widgets when that file differs from the text it was built with, so both
+;;; copies agree on every layout. It may import only the standard library.
+;;;
+;;; Jim creates every Ui, Event, Requests and Snapshot, so their allocator
+;;; vtables point at Jim's code and outlive any widget generation. A widget
+;;; copies everything it hands over (text, ids, saved state) into these values;
+;;; nothing Jim keeps may point into a widget's code or static data, because
+;;; that code is unmapped when the widget reloads.
+;;;
+;;; Building a frame: `render` opens containers (vstack!, hstack!, table!,
+;;; dialog!), adds elements, and closes containers with end!. Style setters
+;;; (pad!, bg!, grow!, …) change the element created most recently, so style a
+;;; container right after opening it, before adding its children.
+(const VSTACK 1)
+
+(const HSTACK 2)
+
+(const TEXT 3)
+
+(const BUTTON 4)
+
+(const TOGGLE 5)
+
+(const DIVIDER 6)
+
+(const SPACER 7)
+
+(const INPUT 8)
+
+(const TEXTAREA 9)
+
+(const TABLE 10)
+
+(const DIALOG 11)
+
+(const NONE -1)
+
+;;; Cross-axis alignment of a container's children.
+(const START 0)
+
+(const CENTER 1)
+
+(const END 2)
+
+(const STRETCH 3)
+
+;;; Button variants.
+(const NORMAL 0)
+
+(const SELECTED 1)
+
+(const PRIMARY 2)
+
+(const DANGER 3)
+
+(const GHOST 4)
+
+;;; API misuse is recorded on the Ui and shown by Jim instead of the frame.
+(const FAULT-END-WITHOUT-CONTAINER 1)
+
+(const FAULT-APPEND-WITHOUT-TEXT 2)
+
+(const FAULT-UNCLOSED-CONTAINER 3)
+
+(const FAULT-SECOND-ROOT 4)
+
+(const FAULT-STYLE-WITHOUT-ELEMENT 5)
+
+(const FAULT-CHILD-OF-LEAF 6)
+
+;;; One element. Children are an intrusive list of node indices. Text, ids and
+;;; placeholders are byte ranges in Ui.bytes. Colors are 0xRRGGBB, or NONE.
+;;; Width and height 0 mean "size to content"; grow shares a row's spare width.
+(defstruct Node
+  [(kind i64)
+   (parent i64)
+   (first-child i64)
+   (last-child i64)
+   (next i64)
+   (gap f64)
+   (pad-top f64)
+   (pad-right f64)
+   (pad-bottom f64)
+   (pad-left f64)
+   (margin-top f64)
+   (margin-right f64)
+   (margin-bottom f64)
+   (margin-left f64)
+   (width f64)
+   (height f64)
+   (grow f64)
+   (align i64)
+   (background i64)
+   (border i64)
+   (radius f64)
+   (size f64)
+   (color i64)
+   (bold bool)
+   (mono bool)
+   (wrap bool)
+   (clip bool)
+   (checked bool)
+   (variant i64)
+   (columns i64)
+   (rows i64)
+   (text-at i64)
+   (text-len i64)
+   (id-at i64)
+   (id-len i64)
+   (placeholder-at i64)
+   (placeholder-len i64)])
+
+(defstruct Watch [(at i64) (len i64)])
+
+(defstruct Ui
+  [(nodes (ArrayList Node))
+   (watches (ArrayList Watch))
+   (bytes (ArrayList u8))
+   (open (ArrayList i64))
+   (width f64)
+   (height f64)
+   (scroll-y f64)
+   (title-at i64)
+   (title-len i64)
+   (fault i64)])
+
+(defn ui-new [(a (dyn Allocator))] (-> Ui)
+  (Ui
+    :nodes (al-new [Node] a)
+    :watches (al-new [Watch] a)
+    :bytes (al-new [u8] a)
+    :open (al-new [i64] a)
+    :width 0.0
+    :height 0.0
+    :scroll-y 0.0
+    :title-at 0
+    :title-len 0
+    :fault 0))
+
+(defn ui-free! [(ui (ptr Ui))] (-> void)
+  (al-free! (mut (.nodes ui)))
+  (al-free! (mut (.watches ui)))
+  (al-free! (mut (.bytes ui)))
+  (al-free! (mut (.open ui)))
+  (do))
+
+;;; Jim sets the viewport before each render: WIDTH×HEIGHT of the pane's
+;;; content, scrolled down by SCROLL-Y. Widgets may use these to virtualize.
+(defn ui-clear! [(ui (ptr Ui)) (width f64) (height f64) (scroll-y f64)] (-> void)
+  (al-clear! (mut (.nodes ui)))
+  (al-clear! (mut (.watches ui)))
+  (al-clear! (mut (.bytes ui)))
+  (al-clear! (mut (.open ui)))
+  (set! (.width ui) width)
+  (set! (.height ui) height)
+  (set! (.scroll-y ui) scroll-y)
+  (set! (.title-at ui) 0)
+  (set! (.title-len ui) 0)
+  (set! (.fault ui) 0)
+  (do))
+
+(defn node [(ui (ptr Ui)) (index i64)] (-> (ptr Node))
+  (al-elem (field ui nodes) index))
+
+(defn bytes-at [(ui (ptr Ui)) (at i64) (n i64)] (-> (slice u8))
+  (subslice (al-slice (.bytes ui)) at (+ at n)))
+
+(defn node-text [(ui (ptr Ui)) (n (ptr Node))] (-> (slice u8))
+  (bytes-at ui (.text-at n) (.text-len n)))
+
+(defn node-id [(ui (ptr Ui)) (n (ptr Node))] (-> (slice u8))
+  (bytes-at ui (.id-at n) (.id-len n)))
+
+(defn node-placeholder [(ui (ptr Ui)) (n (ptr Node))] (-> (slice u8))
+  (bytes-at ui (.placeholder-at n) (.placeholder-len n)))
+
+(defn title [(ui (ptr Ui))] (-> (slice u8))
+  (bytes-at ui (.title-at ui) (.title-len ui)))
+
+(defn container? [(kind i64)] (-> bool)
+  (or (= kind VSTACK) (= kind HSTACK) (= kind TABLE) (= kind DIALOG)))
+
+(defn fault! [(ui (ptr Ui)) (code i64)] (-> void)
+  (when (= (.fault ui) 0) (set! (.fault ui) code) 0)
+  (do))
+
+(defn copy-bytes! [(ui (ptr Ui)) (s (slice u8))] (-> i64)
+  (let [at (len (.bytes ui))]
+    (al-extend! (mut (.bytes ui)) (slice-data s) (len s))
+    at))
+
+(defn blank-node [(kind i64) (parent i64)] (-> Node)
+  (Node
+    :kind kind
+    :parent parent
+    :first-child NONE
+    :last-child NONE
+    :next NONE
+    :gap 0.0
+    :pad-top 0.0
+    :pad-right 0.0
+    :pad-bottom 0.0
+    :pad-left 0.0
+    :margin-top 0.0
+    :margin-right 0.0
+    :margin-bottom 0.0
+    :margin-left 0.0
+    :width 0.0
+    :height 0.0
+    :grow 0.0
+    :align (if (= kind HSTACK) CENTER STRETCH)
+    :background NONE
+    :border NONE
+    :radius 0.0
+    :size 13.0
+    :color 0xcfd2d8
+    :bold false
+    :mono false
+    :wrap false
+    :clip false
+    :checked false
+    :variant NORMAL
+    :columns 0
+    :rows 0
+    :text-at 0
+    :text-len 0
+    :id-at 0
+    :id-len 0
+    :placeholder-at 0
+    :placeholder-len 0))
+
+;;; Append a node under the innermost open container. Returns its index, or
+;;; NONE when the tree already has a closed root.
+(defn add! [(ui (ptr Ui)) (kind i64) (text (slice u8)) (id (slice u8))] (-> i64)
+  (if (and (= (len (.open ui)) 0) (> (len (.nodes ui)) 0))
+      (do (fault! ui FAULT-SECOND-ROOT) NONE)
+      (let [index (len (.nodes ui))
+            parent
+              (if (= (len (.open ui)) 0)
+                  NONE
+                  (get (.open ui) (- (len (.open ui)) 1)))
+            (mut n) (blank-node kind parent)]
+        (set! (.text-at n) (copy-bytes! ui text))
+        (set! (.text-len n) (len text))
+        (set! (.id-at n) (copy-bytes! ui id))
+        (set! (.id-len n) (len id))
+        (push! (mut (.nodes ui)) (load n))
+        (when (!= parent NONE)
+          (let [p (node ui parent)]
+            (if (= (.last-child p) NONE)
+                (set! (.first-child p) index)
+                (set! (.next (node ui (.last-child p))) index))
+            (set! (.last-child p) index))
+          0)
+        index)))
+
+(defn open! [(ui (ptr Ui)) (kind i64) (gap f64) (pad f64)] (-> i64)
+  (let [index (add! ui kind "" "")]
+    (when (!= index NONE)
+      (let [n (node ui index)]
+        (set! (.gap n) gap)
+        (set! (.pad-top n) pad)
+        (set! (.pad-right n) pad)
+        (set! (.pad-bottom n) pad)
+        (set! (.pad-left n) pad))
+      (push! (mut (.open ui)) index)
+      0)
+    index))
+
+;;; A column; children top to bottom, `gap` apart, inset by `pad`. Children
+;;; stretch to the column's width unless aligned otherwise.
+(defn vstack! [(ui (ptr Ui)) (gap f64) (pad f64)] (-> void)
+  (open! ui VSTACK gap pad)
+  (do))
+
+;;; A row; children left to right, vertically centered by default.
+(defn hstack! [(ui (ptr Ui)) (gap f64) (pad f64)] (-> void)
+  (open! ui HSTACK gap pad)
+  (do))
+
+;;; A grid of COLUMNS columns; its children are the cells, row by row. Column
+;;; widths fit the widest cell, shrinking wrapped text when space is short.
+(defn table! [(ui (ptr Ui)) (columns i64) (gap f64)] (-> void)
+  (let [index (open! ui TABLE gap 0.0)]
+    (when (!= index NONE) (set! (.columns (node ui index)) columns) 0)
+    (do)))
+
+;;; A modal panel centered over the pane, drawn above everything else.
+(defn dialog! [(ui (ptr Ui)) (width f64)] (-> void)
+  (let [index (open! ui DIALOG 10.0 16.0)]
+    (when (!= index NONE)
+      (let [n (node ui index)]
+        (set! (.width n) width)
+        (set! (.background n) 0x1b2029)
+        (set! (.border n) 0x3a4250)
+        (set! (.radius n) 8.0))
+      0)
+    (do)))
+
+;;; Close the innermost container.
+(defn end! [(ui (ptr Ui))] (-> void)
+  (if (= (len (.open ui)) 0)
+      (fault! ui FAULT-END-WITHOUT-CONTAINER)
+      (do (pop! (mut (.open ui))) (do))))
+
+(defn leaf! [(ui (ptr Ui)) (kind i64) (text (slice u8)) (id (slice u8))] (-> i64)
+  (if (= (len (.open ui)) 0)
+      (do (fault! ui FAULT-CHILD-OF-LEAF) NONE)
+      (add! ui kind text id)))
+
+;;; Text; `color` is 0xRRGGBB.
+(defn text! [(ui (ptr Ui))
+             (value (slice u8))
+             (size f64)
+             (color i64)
+             (bold bool)] (-> void)
+  (let [index (leaf! ui TEXT value "")]
+    (when (!= index NONE)
+      (let [n (node ui index)]
+        (set! (.size n) size)
+        (set! (.color n) color)
+        (set! (.bold n) bold))
+      0)
+    (do)))
+
+;;; Extend the text element just added by text!.
+(defn append! [(ui (ptr Ui)) (value (slice u8))] (-> void)
+  (let [count (len (.nodes ui))]
+    (if (= count 0)
+        (fault! ui FAULT-APPEND-WITHOUT-TEXT)
+        (let [n (node ui (- count 1))]
+          ; A text node's id is empty, so its text ends the byte buffer.
+          (if (or (!= (.kind n) TEXT)
+                  (!= (+ (.text-at n) (.text-len n)) (len (.bytes ui))))
+              (fault! ui FAULT-APPEND-WITHOUT-TEXT)
+              (do
+                (copy-bytes! ui value)
+                (set! (.text-len n) (+ (.text-len n) (len value)))
+                (do)))))))
+
+;;; Write VALUE in decimal into DIGITS (20 bytes); returns the used suffix.
+(defn decimal [(digits (ptr u8)) (value i64)] (-> (slice u8))
+  (let [negative (< value 0)
+        (mut n) (if negative (- 0 value) value)
+        (mut at) 20]
+    (loop (set! at (- at 1))
+      (set! (primitive/index digits (load at))
+            (primitive/cast u8 (+ 48 (% (load n) 10))))
+      (set! n (/ (load n) 10))
+      (if (= (load n) 0) (break) 0))
+    (when negative
+      (set! at (- (load at) 1))
+      (set! (primitive/index digits (load at)) (primitive/cast u8 45))
+      0)
+    (slice-new (primitive/index digits (load at)) (- 20 (load at)))))
+
+;;; Append a decimal integer to the text element just added.
+(defn append-i64! [(ui (ptr Ui)) (value i64)] (-> void)
+  (let [digits (primitive/alloc-stack (array u8 20))]
+    (append! ui (decimal (primitive/cast (ptr u8) digits) value))))
+
+;;; A push button. Clicking it delivers a CLICK event carrying `id`.
+(defn button! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8))] (-> void)
+  (leaf! ui BUTTON label id)
+  (do))
+
+;;; A tab or segmented-control button; SELECTED draws it as the active one.
+(defn tab! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8)) (selected bool)] (-> void)
+  (let [index (leaf! ui BUTTON label id)]
+    (when (and (!= index NONE) selected)
+      (set! (.variant (node ui index)) SELECTED)
+      0)
+    (do)))
+
+;;; A checkbox. Clicking it delivers a TOGGLE event with the new value.
+(defn toggle! [(ui (ptr Ui)) (id (slice u8)) (label (slice u8)) (checked bool)] (-> void)
+  (let [index (leaf! ui TOGGLE label id)]
+    (when (!= index NONE) (set! (.checked (node ui index)) checked) 0)
+    (do)))
+
+;;; A horizontal rule across the enclosing column.
+(defn divider! [(ui (ptr Ui))] (-> void)
+  (leaf! ui DIVIDER "" "")
+  (do))
+
+;;; Empty space: SIZE tall in a column, SIZE wide in a row. With grow! it takes
+;;; a row's spare width instead.
+(defn spacer! [(ui (ptr Ui)) (size f64)] (-> void)
+  (let [index (leaf! ui SPACER "" "")]
+    (when (!= index NONE)
+      (let [n (node ui index)]
+        (set! (.width n) size)
+        (set! (.height n) size))
+      0)
+    (do)))
+
+;;; A small label on a colored pill.
+(defn badge! [(ui (ptr Ui)) (value (slice u8)) (background i64)] (-> void)
+  (let [index (leaf! ui TEXT value "")]
+    (when (!= index NONE)
+      (let [n (node ui index)]
+        (set! (.size n) 10.5)
+        (set! (.color n) 0xe6e9f0)
+        (set! (.background n) background)
+        (set! (.radius n) 4.0)
+        (set! (.pad-top n) 1.0)
+        (set! (.pad-bottom n) 1.0)
+        (set! (.pad-left n) 6.0)
+        (set! (.pad-right n) 6.0))
+      0)
+    (do)))
+
+(defn field! [(ui (ptr Ui))
+              (kind i64)
+              (id (slice u8))
+              (value (slice u8))
+              (placeholder (slice u8))
+              (rows i64)] (-> void)
+  (let [index (leaf! ui kind value id)]
+    (when (!= index NONE)
+      (let [at (copy-bytes! ui placeholder)
+            n (node ui index)]
+        (set! (.placeholder-at n) at)
+        (set! (.placeholder-len n) (len placeholder))
+        (set! (.rows n) rows))
+      0)
+    (do)))
+
+;;; A native single-line text field. Editing delivers INPUT-CHANGE events and
+;;; Return delivers INPUT-SUBMIT; both carry the field's whole text. VALUE is
+;;; applied only while the field is not being edited.
+(defn input! [(ui (ptr Ui))
+              (id (slice u8))
+              (value (slice u8))
+              (placeholder (slice u8))] (-> void)
+  (field! ui INPUT id value placeholder 1))
+
+;;; A native multi-line text area, ROWS lines tall. ⌘Return submits.
+(defn textarea! [(ui (ptr Ui))
+                 (id (slice u8))
+                 (value (slice u8))
+                 (placeholder (slice u8))
+                 (rows i64)] (-> void)
+  (field! ui TEXTAREA id value placeholder rows))
+
+;;; Name the pane: the header shows TEXT instead of the widget's file name.
+(defn title! [(ui (ptr Ui)) (text (slice u8))] (-> void)
+  (set! (.title-at ui) (copy-bytes! ui text))
+  (set! (.title-len ui) (len text))
+  (do))
+
+;;; Ask to hear about changes under PATH (a file or directory, recursively). Jim
+;;; delivers a FILES-CHANGED event, batched over a fraction of a second, with the
+;;; changed paths one per line. Declare watches on every render; Jim keeps the
+;;; set in step with the latest frame.
+(defn watch! [(ui (ptr Ui)) (path (slice u8))] (-> void)
+  (let [at (copy-bytes! ui path)]
+    (push! (mut (.watches ui)) (Watch :at at :len (len path)))
+    (do)))
+
+(defn watch-path [(ui (ptr Ui)) (w Watch)] (-> (slice u8))
+  (bytes-at ui (.at w) (.len w)))
+
+;;; The element created most recently, which the setters below change.
+(defn styled [(ui (ptr Ui))] (-> (ptr Node))
+  (let [count (len (.nodes ui))]
+    (when (= count 0)
+      (fault! ui FAULT-STYLE-WITHOUT-ELEMENT)
+      ; Give the setter something harmless to write so it need not branch.
+      (push! (mut (.nodes ui)) (blank-node SPACER NONE))
+      0)
+    (node ui (- (len (.nodes ui)) 1))))
+
+(defn pad! [(ui (ptr Ui)) (top f64) (right f64) (bottom f64) (left f64)] (-> void)
+  (let [n (styled ui)]
+    (set! (.pad-top n) top)
+    (set! (.pad-right n) right)
+    (set! (.pad-bottom n) bottom)
+    (set! (.pad-left n) left)
+    (do)))
+
+(defn margin! [(ui (ptr Ui)) (top f64) (right f64) (bottom f64) (left f64)] (-> void)
+  (let [n (styled ui)]
+    (set! (.margin-top n) top)
+    (set! (.margin-right n) right)
+    (set! (.margin-bottom n) bottom)
+    (set! (.margin-left n) left)
+    (do)))
+
+(defn width! [(ui (ptr Ui)) (value f64)] (-> void)
+  (set! (.width (styled ui)) value)
+  (do))
+
+(defn height! [(ui (ptr Ui)) (value f64)] (-> void)
+  (set! (.height (styled ui)) value)
+  (do))
+
+;;; Share a row's spare width, in proportion to FACTOR.
+(defn grow! [(ui (ptr Ui)) (factor f64)] (-> void)
+  (set! (.grow (styled ui)) factor)
+  (do))
+
+;;; How a container aligns its children across its axis: START, CENTER, END
+;;; or STRETCH.
+(defn align! [(ui (ptr Ui)) (value i64)] (-> void)
+  (set! (.align (styled ui)) value)
+  (do))
+
+(defn bg! [(ui (ptr Ui)) (color i64)] (-> void)
+  (set! (.background (styled ui)) color)
+  (do))
+
+(defn border! [(ui (ptr Ui)) (color i64)] (-> void)
+  (set! (.border (styled ui)) color)
+  (do))
+
+(defn radius! [(ui (ptr Ui)) (value f64)] (-> void)
+  (set! (.radius (styled ui)) value)
+  (do))
+
+(defn color! [(ui (ptr Ui)) (value i64)] (-> void)
+  (set! (.color (styled ui)) value)
+  (do))
+
+;;; Monospaced text.
+(defn mono! [(ui (ptr Ui))] (-> void)
+  (set! (.mono (styled ui)) true)
+  (do))
+
+;;; Wrap text to the width it is given instead of one long line.
+(defn wrap! [(ui (ptr Ui))] (-> void)
+  (set! (.wrap (styled ui)) true)
+  (do))
+
+;;; Cut children off at this container's edges.
+(defn clip! [(ui (ptr Ui))] (-> void)
+  (set! (.clip (styled ui)) true)
+  (do))
+
+(defn variant! [(ui (ptr Ui)) (value i64)] (-> void)
+  (set! (.variant (styled ui)) value)
+  (do))
+
+;;; Make a container clickable, like a list item: it highlights under the
+;;; pointer and a click anywhere inside delivers CLICK with ID. With SELECTED
+;;; it draws highlighted.
+(defn clickable! [(ui (ptr Ui)) (id (slice u8)) (selected bool)] (-> void)
+  (let [n (styled ui)
+        at (copy-bytes! ui id)]
+    (set! (.id-at n) at)
+    (set! (.id-len n) (len id))
+    (set! (.checked n) selected)
+    (do)))
+
+;;; Requests a widget makes of Jim while handling an event.
+(const OPEN-WIDGET 1)
+
+(const OPEN-TERMINAL 2)
+
+(const SCROLL-TO 3)
+
+(const EMIT 4)
+
+(defstruct Request
+  [(kind i64) (at i64) (len i64) (at2 i64) (len2 i64) (value f64)])
+
+(defstruct Requests [(bytes (ArrayList u8)) (items (ArrayList Request))])
+
+(defn requests-new [(a (dyn Allocator))] (-> Requests)
+  (Requests :bytes (al-new [u8] a) :items (al-new [Request] a)))
+
+(defn requests-free! [(r (ptr Requests))] (-> void)
+  (al-free! (mut (.bytes r)))
+  (al-free! (mut (.items r)))
+  (do))
+
+(defn requests-clear! [(r (ptr Requests))] (-> void)
+  (al-clear! (mut (.bytes r)))
+  (al-clear! (mut (.items r)))
+  (do))
+
+(defn request-text [(r (ptr Requests)) (item Request)] (-> (slice u8))
+  (subslice (al-slice (.bytes r)) (.at item) (+ (.at item) (.len item))))
+
+(defn request-text2 [(r (ptr Requests)) (item Request)] (-> (slice u8))
+  (subslice (al-slice (.bytes r)) (.at2 item) (+ (.at2 item) (.len2 item))))
+
+(defn push-request! [(r (ptr Requests))
+                     (kind i64)
+                     (text (slice u8))
+                     (text2 (slice u8))
+                     (value f64)] (-> void)
+  (let [at (len (.bytes r))]
+    (al-extend! (mut (.bytes r)) (slice-data text) (len text))
+    (al-extend! (mut (.bytes r)) (slice-data text2) (len text2))
+    (push! (mut (.items r))
+           (Request
+             :kind kind
+             :at at
+             :len (len text)
+             :at2 (+ at (len text))
+             :len2 (len text2)
+             :value value))
+    (do)))
+
+(const CLICK 1)
+
+(const TOGGLE-EVENT 2)
+
+(const TICK 3)
+
+(const INPUT-CHANGE 4)
+
+(const INPUT-SUBMIT 5)
+
+;;; Another widget's emit!: `id` is the topic, `text` the payload.
+(const MESSAGE 6)
+
+;;; Files under a watch! changed: `id` is the watched path, `text` the changed
+;;; paths, one per line.
+(const FILES-CHANGED 7)
+
+;;; `id` and `text` borrow Jim's memory for the duration of the event call.
+;;; `text` is the field's contents for INPUT-CHANGE and INPUT-SUBMIT.
+(defstruct Event
+  [(kind i64)
+   (id (slice u8))
+   (text (slice u8))
+   (checked bool)
+   (dt f64)
+   (requests (ptr Requests))])
+
+(defn clicked? [(e (ptr Event)) (id (slice u8))] (-> bool)
+  (and (= (.kind e) CLICK) (= (.id e) id)))
+
+(defn toggled? [(e (ptr Event)) (id (slice u8))] (-> bool)
+  (and (= (.kind e) TOGGLE-EVENT) (= (.id e) id)))
+
+(defn changed? [(e (ptr Event)) (id (slice u8))] (-> bool)
+  (and (= (.kind e) INPUT-CHANGE) (= (.id e) id)))
+
+(defn submitted? [(e (ptr Event)) (id (slice u8))] (-> bool)
+  (and (= (.kind e) INPUT-SUBMIT) (= (.id e) id)))
+
+(defn tick? [(e (ptr Event))] (-> bool)
+  (= (.kind e) TICK))
+
+(defn message? [(e (ptr Event)) (topic (slice u8))] (-> bool)
+  (and (= (.kind e) MESSAGE) (= (.id e) topic)))
+
+(defn files-changed? [(e (ptr Event))] (-> bool)
+  (= (.kind e) FILES-CHANGED))
+
+;;; True when the event's id starts with PREFIX (for ids like "file:3").
+(defn id-prefix? [(e (ptr Event)) (prefix (slice u8))] (-> bool)
+  (and (>= (len (.id e)) (len prefix))
+       (= (subslice (.id e) 0 (len prefix)) prefix)))
+
+;;; The decimal number after PREFIX in the event's id, or -1.
+(defn id-number [(e (ptr Event)) (prefix (slice u8))] (-> i64)
+  (if (not (id-prefix? e prefix))
+      -1
+      (let [digits (subslice (.id e) (len prefix) (len (.id e)))
+            (mut n) 0
+            (mut ok) (> (len digits) 0)]
+        (for [i 0 (len digits)]
+          (let [c (primitive/cast i64 (get digits i))]
+            (if (and (>= c 48) (<= c 57))
+                (set! n (+ (* (load n) 10) (- c 48)))
+                (set! ok false))))
+        (if (load ok) (load n) -1))))
+
+;;; Open another widget pane. SPEC is "NAME ARGS…", as typed in the palette.
+(defn open-widget! [(e (ptr Event)) (spec (slice u8))] (-> void)
+  (push-request! (.requests e) OPEN-WIDGET spec "" 0.0))
+
+;;; Open a terminal pane in DIRECTORY.
+(defn open-terminal! [(e (ptr Event)) (directory (slice u8))] (-> void)
+  (push-request! (.requests e) OPEN-TERMINAL directory "" 0.0))
+
+;;; Scroll the pane so content offset Y is at the top.
+(defn scroll-to! [(e (ptr Event)) (y f64)] (-> void)
+  (push-request! (.requests e) SCROLL-TO "" "" y))
+
+;;; Send PAYLOAD on TOPIC to every other open widget, which receives a MESSAGE
+;;; event. The git widgets announce "git.changed" with the repository path.
+(defn emit! [(e (ptr Event)) (topic (slice u8)) (payload (slice u8))] (-> void)
+  (push-request! (.requests e) EMIT topic payload 0.0))
+
+(defstruct Entry
+  [(key-at i64) (key-len i64) (value i64) (text-at i64) (text-len i64)])
+
+;;; State carried from one widget generation to the next, keyed by name. A new
+;;; generation reads what it recognizes and defaults the rest. Jim adds
+;;; "jim.dir" (the project directory) and "jim.args" (text after the widget
+;;; name in the palette) to every snapshot it boots from.
+;;; A child process's result from Host/poll while it still runs.
+(const PROCESS-RUNNING -1000000000)
+
+;;; Services Jim provides to widgets. Jim implements this trait, so calls run
+;;; Jim's own code, which outlives every widget generation.
+;;;
+;;; Processes: `spawn` starts ARGV (program first, found on PATH) in CWD and
+;;; returns a handle at once; Jim launches it on a background thread, because
+;;; even posix_spawn blocks until the child has exec'd. Its stdout and stderr
+;;; share one pipe; stdin is /dev/null; GIT_OPTIONAL_LOCKS=0 is set so git
+;;; queries never rewrite the index. `poll` appends any output that is ready to
+;;; OUT and returns PROCESS-RUNNING, or the exit code once the process has
+;;; exited and all output has been delivered (-1 when it could not start, minus
+;;; the signal when killed). `release` forgets the handle, stopping the process
+;;; if it still runs; every handle must be released.
+;;;
+;;; Tasks: `start-task` runs TASK's `run` on a Jim worker thread and returns a
+;;; handle at once; `task-done?` turns true after `run` returned; then call
+;;; `release-task`. Use a task for anything slower than a millisecond or two —
+;;; parsing a large reply, building a model — because everything else a widget
+;;; does runs on Jim's main thread. A task must only touch its own data: build
+;;; results in the task object and adopt them on the main thread once done. Jim
+;;; keeps a widget generation's code mapped until its tasks finish, so a reload
+;;; never pulls code out from under a running task.
+(deftrait Host [Self]
+  (spawn [(self (ptr Self)) (argv (slice (slice u8))) (cwd (slice u8))]
+         (-> i64))
+  (poll [(self (ptr Self)) (process i64) (out (ptr (ArrayList u8)))] (-> i64))
+  (release [(self (ptr Self)) (process i64)] (-> void))
+  (start-task [(self (ptr Self)) (task (dyn Task))] (-> i64))
+  (task-done? [(self (ptr Self)) (task i64)] (-> bool))
+  (release-task [(self (ptr Self)) (task i64)] (-> void)))
+
+;;; Work a widget hands to Jim's worker threads (see Host).
+(deftrait Task [Self]
+  (run [(self (ptr Self))] (-> void)))
+
+;;; The snapshot a widget boots from also carries Jim's Host.
+(defstruct Snapshot
+  [(bytes (ArrayList u8)) (entries (ArrayList Entry)) (host (dyn Host))])
+
+(defn snapshot-new [(a (dyn Allocator))] (-> Snapshot)
+  (Snapshot
+    :bytes (al-new [u8] a)
+    :entries (al-new [Entry] a)
+    :host (primitive/zeroed (dyn Host))))
+
+;;; Jim's services, for a widget to keep from boot.
+(defn host [(s (ptr Snapshot))] (-> (dyn Host))
+  (.host s))
+
+(defn snapshot-free! [(s (ptr Snapshot))] (-> void)
+  (al-free! (mut (.bytes s)))
+  (al-free! (mut (.entries s)))
+  (do))
+
+(defn snapshot-bytes! [(s (ptr Snapshot)) (value (slice u8))] (-> i64)
+  (let [at (len (.bytes s))]
+    (al-extend! (mut (.bytes s)) (slice-data value) (len value))
+    at))
+
+(defn snapshot-slice [(s (ptr Snapshot)) (at i64) (n i64)] (-> (slice u8))
+  (subslice (al-slice (.bytes s)) at (+ at n)))
+
+(defn put-entry! [(s (ptr Snapshot))
+                  (key (slice u8))
+                  (value i64)
+                  (text (slice u8))] (-> void)
+  (let [key-at (snapshot-bytes! s key)
+        text-at (snapshot-bytes! s text)]
+    (push! (mut (.entries s))
+           (Entry
+             :key-at key-at
+             :key-len (len key)
+             :value value
+             :text-at text-at
+             :text-len (len text)))
+    (do)))
+
+(defn put-i64! [(s (ptr Snapshot)) (key (slice u8)) (value i64)] (-> void)
+  (put-entry! s key value ""))
+
+(defn put-bool! [(s (ptr Snapshot)) (key (slice u8)) (value bool)] (-> void)
+  (put-entry! s key (if value 1 0) ""))
+
+(defn put-text! [(s (ptr Snapshot)) (key (slice u8)) (value (slice u8))] (-> void)
+  (put-entry! s key 0 value))
+
+;;; The last entry named KEY, so later puts override earlier ones.
+(defn find [(s (ptr Snapshot)) (key (slice u8))] (-> i64)
+  (let [(mut found) NONE]
+    (for [i 0 (len (.entries s))]
+      (let [e (get (.entries s) i)]
+        (when (= (snapshot-slice s (.key-at e) (.key-len e)) key)
+          (set! found i))))
+    (load found)))
+
+(defn get-i64 [(s (ptr Snapshot)) (key (slice u8)) (default i64)] (-> i64)
+  (let [i (find s key)]
+    (if (= i NONE) default (.value (al-elem (field s entries) i)))))
+
+(defn get-bool [(s (ptr Snapshot)) (key (slice u8)) (default bool)] (-> bool)
+  (let [i (find s key)]
+    (if (= i NONE) default (!= (.value (al-elem (field s entries) i)) 0))))
+
+;;; Borrowed from the snapshot, which is freed after boot: copy what you keep.
+(defn get-text [(s (ptr Snapshot)) (key (slice u8)) (default (slice u8))] (-> (slice u8))
+  (let [i (find s key)]
+    (if (= i NONE)
+        default
+        (let [e (get (.entries s) i)]
+          (snapshot-slice s (.text-at e) (.text-len e))))))
+
+;;; A widget is any type implementing this trait. Each widget module defines
+;;;   (defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void))
+;;; which allocates the widget from `saved` and stores it in `out`.
+(deftrait Widget [Self]
+  (render [(self (ptr Self)) (ui (ptr Ui))] (-> void))
+  (event [(self (ptr Self)) (e (ptr Event))] (-> void))
+  (save [(self (ptr Self)) (s (ptr Snapshot))] (-> void))
+  ;; True while the widget wants TICK events (animation, clocks, running
+  ;; processes). Jim re-renders after every tick.
+  (animating? [(self (ptr Self))] (-> bool))
+  ;; Free the widget. Runs in the widget's own generation, before its code goes.
+  (destroy! [(self (ptr Self))] (-> void)))

@@ -1,0 +1,173 @@
+(module jim.widget-kit.json)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.json" :as json)
+(import "jim.widget-kit.text" :as text)
+
+;;; Reading JSON replies (jimctl prints one JSON line). Values are addressed by
+;;; token index into the parsed Doc; -1 means absent. The Doc borrows the
+;;; source text, so keep that alive while reading.
+(defstruct Reply [(doc json/Doc) (ok bool)])
+
+(defn parse [(source (slice u8))] (-> Reply)
+  (try (let [d
+               (try-or! (json/parse (alloc/malloc-allocator) (text/trim source))
+                        (Reply
+                          :doc
+                            (json/Doc :source ""
+                              :tokens
+                                (al-new [json/Token] (alloc/malloc-allocator)))
+                          :ok false))]
+         (Reply :doc d :ok true))))
+
+(defn free! [(r (ptr Reply))] (-> void)
+  (json/doc-free! (mut (.doc r)))
+  (do))
+
+(defn root [(r (ptr Reply))] (-> i64)
+  (if (.ok r) 0 -1))
+
+(defn token [(r (ptr Reply)) (i i64)] (-> json/Token)
+  (json/token (.doc r) i))
+
+(defn kind-of [(r (ptr Reply)) (i i64)] (-> i64)
+  (json/kind (token r i)))
+
+;;; Member KEY of object I, or -1.
+(defn get [(r (ptr Reply)) (i i64) (key (slice u8))] (-> i64)
+  (if (or (< i 0) (not (json/is-object? (token r i))))
+      -1
+      (json/object-get (.doc r) i key)))
+
+(defn count [(r (ptr Reply)) (i i64)] (-> i64)
+  (if (or (< i 0) (not (json/is-array? (token r i))))
+      0
+      (json/child-count (token r i))))
+
+;;; Element N of array I.
+(defn nth [(r (ptr Reply)) (i i64) (n i64)] (-> i64)
+  (json/array-nth (.doc r) i n))
+
+(defn null? [(r (ptr Reply)) (i i64)] (-> bool)
+  (or (< i 0) (json/is-null? (token r i))))
+
+(defn bool-of [(r (ptr Reply)) (i i64) (default bool)] (-> bool)
+  (if (and (>= i 0) (json/is-bool? (token r i)))
+      (json/bool (token r i))
+      default))
+
+(defn i64-of [(r (ptr Reply)) (i i64) (default i64)] (-> i64)
+  (if (and (>= i 0) (json/is-number? (token r i)))
+      (text/parse-i64 (json/number-text (.doc r) (token r i)) default)
+      default))
+
+(defn hex-digit [(b u8)] (-> i64)
+  (let [c (p/cast i64 b)]
+    (cond (and (>= c 48) (<= c 57)) (- c 48)
+          (and (>= c 97) (<= c 102)) (+ 10 (- c 97))
+          (and (>= c 65) (<= c 70)) (+ 10 (- c 65))
+          :else -1)))
+
+(defn hex4 [(s (slice u8)) (at i64)] (-> i64)
+  (if (> (+ at 4) (len s))
+      -1
+      (let [(mut v) 0
+            (mut ok) true]
+        (for [k 0 4]
+          (let [d (hex-digit (get s (+ at k)))]
+            (if (< d 0) (set! ok false) (set! v (+ (* (load v) 16) d)))))
+        (if (load ok) (load v) -1))))
+
+(defn push-code-point! [(out (ptr (ArrayList u8))) (cp i64)] (-> void)
+  (cond (< cp 128) (text/push-byte! out (p/cast u8 cp))
+        (< cp 2048)
+          (do
+            (text/push-byte! out (p/cast u8 (| 192 (/ cp 64))))
+            (text/push-byte! out (p/cast u8 (| 128 (% cp 64)))))
+        (< cp 65536)
+          (do
+            (text/push-byte! out (p/cast u8 (| 224 (/ cp 4096))))
+            (text/push-byte! out (p/cast u8 (| 128 (% (/ cp 64) 64))))
+            (text/push-byte! out (p/cast u8 (| 128 (% cp 64)))))
+        :else
+          (do
+            (text/push-byte! out (p/cast u8 (| 240 (/ cp 262144))))
+            (text/push-byte! out (p/cast u8 (| 128 (% (/ cp 4096) 64))))
+            (text/push-byte! out (p/cast u8 (| 128 (% (/ cp 64) 64))))
+            (text/push-byte! out (p/cast u8 (| 128 (% cp 64)))))))
+
+;;; Append the decoded contents of RAW (a JSON string body, escapes intact).
+(defn decode-into! [(raw (slice u8)) (out (ptr (ArrayList u8)))] (-> void)
+  (let [(mut i) 0
+        n (len raw)]
+    (while (< (load i) n)
+      (let [b (get raw (load i))]
+        (if (or (!= b (p/cast u8 92)) (>= (+ (load i) 1) n))
+            (do (text/push-byte! out b) (set! i (+ (load i) 1)))
+            (let [e (p/cast i64 (get raw (+ (load i) 1)))]
+              (cond (= e 110) (text/push-byte! out (p/cast u8 10))
+                    (= e 116) (text/push-byte! out (p/cast u8 9))
+                    (= e 114) (text/push-byte! out (p/cast u8 13))
+                    (= e 98) (text/push-byte! out (p/cast u8 8))
+                    (= e 102) (text/push-byte! out (p/cast u8 12))
+                    (= e 117)
+                      (let [hi (hex4 raw (+ (load i) 2))]
+                        (cond (< hi 0) (text/push-str! out "\\u")
+                              ; A high surrogate followed by \uDC00–\uDFFF.
+                              (and (>= hi 55296)
+                                   (<= hi 56319)
+                                   (<= (+ (load i) 12) n)
+                                   (= (get raw (+ (load i) 6)) (p/cast u8 92))
+                                   (= (get raw (+ (load i) 7)) (p/cast u8 117)))
+                                (let [lo (hex4 raw (+ (load i) 8))]
+                                  (if (and (>= lo 56320) (<= lo 57343))
+                                      (do
+                                        (push-code-point! out
+                                                          (+ 65536
+                                                             (+ (* (- hi 55296)
+                                                                   1024)
+                                                                (- lo 56320))))
+                                        (set! i (+ (load i) 6))
+                                        (do))
+                                      (push-code-point! out 65533)))
+                              (and (>= hi 55296) (<= hi 57343))
+                                (push-code-point! out 65533)
+                              :else (push-code-point! out hi))
+                        (set! i (+ (load i) 4))
+                        (do))
+                    :else (text/push-byte! out (p/cast u8 e)))
+              (set! i (+ (load i) 2))))))
+    (do)))
+
+;;; String value I decoded into OUT (appended). False when I is not a string.
+(defn string-into! [(r (ptr Reply)) (i i64) (out (ptr (ArrayList u8)))] (-> bool)
+  (if (and (>= i 0) (json/is-string? (token r i)))
+      (do (decode-into! (json/string-text (.doc r) (token r i)) out) true)
+      false))
+
+;;; Member KEY of object I decoded into OUT; appends DEFAULT when absent.
+(defn field-into! [(r (ptr Reply))
+                   (i i64)
+                   (key (slice u8))
+                   (out (ptr (ArrayList u8)))
+                   (default (slice u8))] (-> void)
+  (when (not (string-into! r (get r i key) out)) (text/push-str! out default) 0)
+  (do))
+
+(defn field-i64 [(r (ptr Reply)) (i i64) (key (slice u8)) (default i64)] (-> i64)
+  (i64-of r (get r i key) default))
+
+(defn field-bool [(r (ptr Reply)) (i i64) (key (slice u8)) (default bool)] (-> bool)
+  (bool-of r (get r i key) default))
+
+;;; jimctl's contract: `ok` is true, else `error` says why.
+(defn ok? [(r (ptr Reply))] (-> bool)
+  (and (.ok r) (field-bool r (root r) "ok" false)))
+
+;;; The reply's `error` (or a parse failure) into OUT.
+(defn error-into! [(r (ptr Reply)) (out (ptr (ArrayList u8)))] (-> void)
+  (if (.ok r)
+      (field-into! r (root r) "error" out "failed")
+      (text/push-str! out "unreadable reply")))

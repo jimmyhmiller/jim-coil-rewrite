@@ -53,14 +53,12 @@
   (let [s (state)
         v (field s pending)]
     (if (visible?)
-        (cond (= stage 0) (store! (field v input) (+ (.input v) milliseconds))
+        (cond (= stage 0) (set! (.input v) (+ (.input v) milliseconds))
               (= stage 1)
-                (store! (field v maintenance) (+ (.maintenance v) milliseconds))
-              (= stage 2)
-                (store! (field v windows) (+ (.windows v) milliseconds))
-              (= stage 3)
-                (store! (field v ghostty) (+ (.ghostty v) milliseconds))
-              :else (store! (field v overlay) (+ (.overlay v) milliseconds)))
+                (set! (.maintenance v) (+ (.maintenance v) milliseconds))
+              (= stage 2) (set! (.windows v) (+ (.windows v) milliseconds))
+              (= stage 3) (set! (.ghostty v) (+ (.ghostty v) milliseconds))
+              :else (set! (.overlay v) (+ (.overlay v) milliseconds)))
         (do))))
 
 (defn number [(value f64)] (-> (ptr i8))
@@ -127,7 +125,7 @@
                        (sel c"setFrame:")
                        [Rect]
                        (rect x (load y) 4.0 height))
-                  (store! y (+ (load y) height))))))))
+                  (set! y (+ (load y) height))))))))
       (commit!)
       (if (>= time (.next-label s))
           (do
@@ -296,25 +294,25 @@
              true)
       (for [i 0 120]
         (do
-          (store! (p/index (field s bars) i) (new-layer root 0.4 0.78 0.96))
+          (set! (p/index (field s bars) i) (new-layer root 0.4 0.78 0.96))
           (for [j 0 5]
-            (store! (p/index (field s segments) (+ (* i 5) j))
-                    (new-layer root
-                               (cond (= j 0) 0.4
-                                     (= j 1) 0.98
-                                     (= j 2) 0.6
-                                     (= j 3) 0.72
-                                     :else 0.5)
-                               (cond (= j 0) 0.78
-                                     (= j 1) 0.7
-                                     (= j 2) 0.85
-                                     (= j 3) 0.5
-                                     :else 0.55)
-                               (cond (= j 0) 0.96
-                                     (= j 1) 0.35
-                                     (= j 2) 0.5
-                                     (= j 3) 0.95
-                                     :else 0.6))))))
+            (set! (p/index (field s segments) (+ (* i 5) j))
+                  (new-layer root
+                             (cond (= j 0) 0.4
+                                   (= j 1) 0.98
+                                   (= j 2) 0.6
+                                   (= j 3) 0.72
+                                   :else 0.5)
+                             (cond (= j 0) 0.78
+                                   (= j 1) 0.7
+                                   (= j 2) 0.85
+                                   (= j 3) 0.5
+                                   :else 0.55)
+                             (cond (= j 0) 0.96
+                                   (= j 1) 0.35
+                                   (= j 2) 0.5
+                                   (= j 3) 0.95
+                                   :else 0.6))))))
       (method! cls c"display:" (p/cast (ptr i8) (p/fnptr-of display)) c"v@:@")
       (method! cls c"close:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
@@ -336,13 +334,13 @@
                [(ptr i8)]
                (ns c"Close frame timings"))
           (msg i64 root (sel c"addSubview:") [(ptr i8)] close)))
-      (store! (field s link)
-              (msg (ptr i8)
-                   owner
-                   (sel c"displayLinkWithTarget:selector:")
-                   [(ptr i8) (ptr i8)]
-                   (.target s)
-                   (sel c"display:")))
+      (set! (.link s)
+            (msg (ptr i8)
+                 owner
+                 (sel c"displayLinkWithTarget:selector:")
+                 [(ptr i8) (ptr i8)]
+                 (.target s)
+                 (sel c"display:")))
       (msg (ptr i8) (.link s) (sel c"retain") [])
       (msg i64 (.link s) (sel c"setPaused:") [i8] (p/cast i8 1))
       (msg i64

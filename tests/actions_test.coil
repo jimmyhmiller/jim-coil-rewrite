@@ -35,6 +35,6 @@
 
 (deftest palette-selection-is-consumed-exactly-once
          (let [state (palette/state)]
-           (store! (field state pending) 10)
+           (set! (.pending state) 10)
            (assert (= (palette/take-action!) 10))
            (assert (= (palette/take-action!) -1))))

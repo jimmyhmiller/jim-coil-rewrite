@@ -1,0 +1,88 @@
+(module jim.widget-kit.proc)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "jim.widget-api" :as api)
+
+;;; Child processes that never block a widget, run through Jim's api/Host.
+;;; `start!` returns at once (Jim launches on a background thread); call `poll!`
+;;; on every TICK until it returns true, then read `output` and `code`. A widget
+;;; keeps returning true from animating? while any job runs so it gets those
+;;; ticks. Get the host at boot with (api/host saved).
+(const IDLE 0)
+
+(const RUNNING 1)
+
+(const DONE 2)
+
+(defstruct Job
+  [(host (dyn api/Host))
+   (handle i64)
+   (output (ArrayList u8))
+   (state i64)
+   (code i64)
+   (tag i64)])
+
+(defn job-new [(host (dyn api/Host))] (-> Job)
+  (Job
+    :host host
+    :handle 0
+    :output (al-new [u8] (alloc/malloc-allocator))
+    :state IDLE
+    :code 0
+    :tag 0))
+
+(defn running? [(j (ptr Job))] (-> bool)
+  (= (.state j) RUNNING))
+
+(defn done? [(j (ptr Job))] (-> bool)
+  (= (.state j) DONE))
+
+(defn output [(j (ptr Job))] (-> (slice u8))
+  (al-slice (.output j)))
+
+;;; Run ARGV (program first, found on PATH) in directory CWD. TAG is yours,
+;;; e.g. which request this job answers. A job still running is stopped first.
+(defn start! [(j (ptr Job))
+              (argv (slice (slice u8)))
+              (cwd (slice u8))
+              (tag i64)] (-> void)
+  (when (running? j) (api/release (.host j) (.handle j)) 0)
+  (al-clear! (mut (.output j)))
+  (set! (.tag j) tag)
+  (set! (.code j) 0)
+  (set! (.handle j) (api/spawn (.host j) argv cwd))
+  (set! (.state j) RUNNING)
+  (do))
+
+;;; Collect output that is ready. True once the process has exited and all of
+;;; its output is in `output` (-1 as `code` when it could not start).
+(defn poll! [(j (ptr Job))] (-> bool)
+  (if (not (running? j))
+      (done? j)
+      (let [code (api/poll (.host j) (.handle j) (field j output))]
+        (if (= code api/PROCESS-RUNNING)
+            false
+            (do
+              (api/release (.host j) (.handle j))
+              (set! (.code j) code)
+              (set! (.state j) DONE)
+              true)))))
+
+;;; Forget a finished job's output so it can be reused.
+(defn reset! [(j (ptr Job))] (-> void)
+  (when (not (running? j))
+    (al-clear! (mut (.output j)))
+    (set! (.state j) IDLE)
+    0)
+  (do))
+
+;;; Stop a running job; free its buffer.
+(defn free! [(j (ptr Job))] (-> void)
+  (when (running? j)
+    (api/release (.host j) (.handle j))
+    (set! (.state j) IDLE)
+    0)
+  (al-free! (mut (.output j)))
+  (do))

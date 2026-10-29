@@ -1,6 +1,8 @@
 (module jim.canvas)
 (import "jim.native" :use *)
 (import "jim.terminal" :as terminal)
+(import "jim.widget-view" :as widget-view)
+(import "jim.widget-api" :as api)
 (import "jim.ghostty" :as g)
 (import "jim.reload" :as theme)
 (import "jim.storage" :as storage)
@@ -10,6 +12,7 @@
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
+(import "coil.slice" :use [slice-new])
 
 (defstruct Pane
   [(id i64)
@@ -20,6 +23,8 @@
    (close (ptr i8))
    (grip (ptr i8))
    (terminal (ptr terminal/Terminal))
+   ;; Exactly one of terminal and widget is set.
+   (widget (ptr widget-view/WidgetPane))
    (bounds Rect)
    (render-scale f64)
    (render-w f64)
@@ -60,13 +65,23 @@
         :zoom 1.0)))
 
 (defn count [(c (ptr Canvas))] (-> i64)
-  (al/al-len (.panes c)))
+  (len (.panes c)))
 
 (defn pane [(c (ptr Canvas)) (index i64)] (-> (ptr Pane))
-  (al/al-get [(ptr Pane)] (.panes c) index))
+  (get (.panes c) index))
 
 (defn term-of [(v (ptr Pane))] (-> (ptr terminal/Terminal))
   (.terminal v))
+
+(defn widget? [(v (ptr Pane))] (-> bool)
+  (!= (p/cast i64 (.widget v)) 0))
+
+;;; The native view that takes keyboard focus for a pane.
+(defn content-view [(v (ptr Pane))] (-> (ptr i8))
+  (if (widget? v) (.view (.widget v)) (.view (term-of v))))
+
+(defn content-bounds [(bounds Rect)] (-> Rect)
+  (rect 1.0 12.0 (- (.w bounds) 2.0) (- (.h bounds) 48.0)))
 
 (defn edge [(c (ptr Canvas)) (index i64)] (-> (ptr i8))
   (load (p/index (field c edges) index)))
@@ -103,7 +118,7 @@
          (msg (ptr i8) (.view c) (sel c"window") [])
          (sel c"makeFirstResponder:")
          [(ptr i8)]
-         (if (= (p/cast i64 chosen) 0) (nil) (.view (term-of chosen))))))
+         (if (= (p/cast i64 chosen) 0) (nil) (content-view chosen)))))
 
 (defn front! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
   (do
@@ -112,16 +127,13 @@
       (do
         (for [i 0 (count c)]
           (if (= (p/cast i64 (pane c i)) (p/cast i64 chosen))
-              (store! found i)
+              (set! found i)
               0))
         (if (>= (load found) 0)
             (do
               (for [i (load found) (- (count c) 1)]
-                (al/al-set! [(ptr Pane)]
-                            (mut (field c panes))
-                            i
-                            (pane c (+ i 1))))
-              (al/al-set! [(ptr Pane)] (mut (.panes c)) (- (count c) 1) chosen))
+                (set! (mut (.panes c)) i (pane c (+ i 1))))
+              (set! (mut (.panes c)) (- (count c) 1) chosen))
             0)))
     (msg i64
          (.view c)
@@ -241,7 +253,8 @@
                  (sel c"setHidden:")
                  [i8]
                  (p/cast i8 (if (model/visible? screen w h) 0 1)))
-            (if (!= (p/cast i64 (.surface (term-of v))) 0)
+            (if (and (not (widget? v))
+                     (!= (p/cast i64 (.surface (term-of v))) 0))
                 (g/ghostty_surface_set_occlusion (.surface (term-of v)) visible)
                 (do))
             (if (or (< (.render-scale v) scale)
@@ -251,15 +264,14 @@
                     (< (.render-h v) (.h world))
                     (> (.render-h v) (.h world)))
                 (do
-                  (terminal/resize! (term-of v)
-                                    (rect 1.0
-                                          12.0
-                                          (- (.w world) 2.0)
-                                          (- (.h world) 48.0))
-                                    scale)
-                  (store! (field v render-scale) scale)
-                  (store! (field v render-w) (.w world))
-                  (store! (field v render-h) (.h world)))
+                  (if (widget? v)
+                      (widget-view/resize! (.widget v) (content-bounds world))
+                      (terminal/resize! (term-of v)
+                                        (content-bounds world)
+                                        scale))
+                  (set! (.render-scale v) scale)
+                  (set! (.render-w v) (.w world))
+                  (set! (.render-h v) (.h world)))
                 0))))
       (commit!)
       (do))))
@@ -307,62 +319,67 @@
       (for [i 0 4]
         (let [l (msg (ptr i8) (class c"CAGradientLayer") (sel c"layer") [])]
           (do
-            (store! (p/index (field c edges) i) l)
+            (set! (p/index (field c edges) i) l)
             (msg i64 l (sel c"setZPosition:") [f64] -1.0)
             (msg i64 (layer (.view c)) (sel c"addSublayer:") [(ptr i8)] l))))
       (apply-theme! c cfg)
       c)))
 
-(defn add-session! [(c (ptr Canvas)) (bounds Rect) (session-id (ptr i8))] (-> bool)
-  (let [v (alloc/box! (alloc/malloc-allocator) Pane (p/zeroed Pane))
-        host (view (.view c) (rect 0.0 0.0 (.w bounds) (.h bounds)))
-        cwd (utf8 (.directory c))
+(defn new-pane [(c (ptr Canvas)) (bounds Rect)] (-> (ptr Pane))
+  (let [v (alloc/box! (alloc/malloc-allocator) Pane (p/zeroed Pane))]
+    (set! (.next-id c) (+ (.next-id c) 1))
+    (set! (.id v) (.next-id c))
+    (set! (.view v) (view (.view c) (rect 0.0 0.0 (.w bounds) (.h bounds))))
+    (set! (.bounds v) bounds)
+    v))
+
+;;; Header, title, close button and resize grip above the pane's content.
+(defn add-chrome! [(c (ptr Canvas)) (v (ptr Pane)) (title (ptr i8))] (-> void)
+  (let [host (.view v)
+        bounds (.bounds v)]
+    (set! (.header v)
+          (view host (rect 0.0 (- (.h bounds) 36.0) (.w bounds) 36.0)))
+    (set! (.title v)
+          (label host
+                 c"Terminal"
+                 (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0)
+                 12.0
+                 false))
+    (msg i64 (.title v) (sel c"setStringValue:") [(ptr i8)] title)
+    (set! (.close v)
+          (label host
+                 c"×"
+                 (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0)
+                 17.0
+                 true))
+    (set! (.grip v)
+          (label host
+                 c"◢"
+                 (rect (- (.w bounds) 17.0) 1.0 16.0 17.0)
+                 10.0
+                 true))
+    (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
+    (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+    (push! [(ptr Pane)] (mut (.panes c)) v)
+    (apply-theme! c (.theme c))
+    (focus! c v)))
+
+;;; A terminal pane for SESSION-ID whose shell starts in DIRECTORY.
+(defn add-session-in! [(c (ptr Canvas))
+                       (bounds Rect)
+                       (session-id (ptr i8))
+                       (directory (ptr i8))] (-> bool)
+  (let [v (new-pane c bounds)
         t
-          (terminal/create! host
-                            (rect 1.0
-                                  12.0
-                                  (- (.w bounds) 2.0)
-                                  (- (.h bounds) 48.0))
-                            cwd
+          (terminal/create! (.view v)
+                            (content-bounds bounds)
+                            (utf8 directory)
                             session-id)]
     (do
-      (set! (.next-id c) (+ (.next-id c) 1))
-      (set! (.id v) (.next-id c))
-      (set! (.view v) host)
       (set! (.terminal v) t)
-      (set! (.bounds v) bounds)
-      (set! (.header v)
-            (view host (rect 0.0 (- (.h bounds) 36.0) (.w bounds) 36.0)))
-      (set! (.title v)
-            (label host
-                   c"Terminal"
-                   (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0)
-                   12.0
-                   false))
-      (msg i64
-           (.title v)
-           (sel c"setStringValue:")
-           [(ptr i8)]
-           (indexed-string c"Terminal " (.id v) c""))
-      (set! (.close v)
-            (label host
-                   c"×"
-                   (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0)
-                   17.0
-                   true))
-      (set! (.grip v)
-            (label host
-                   c"◢"
-                   (rect (- (.w bounds) 17.0) 1.0 16.0 17.0)
-                   10.0
-                   true))
-      (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
-      (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
-      (al/al-push! [(ptr Pane)] (mut (.panes c)) v)
-      (apply-theme! c (.theme c))
-      (focus! c v)
+      (add-chrome! c v (indexed-string c"Terminal " (.id v) c""))
       (set! (.message v)
-            (label host
+            (label (.view v)
                    c"Session unavailable. Use Terminal: Reconnect in the action palette."
                    (rect 16.0 40.0 (- (.w bounds) 32.0) 48.0)
                    12.0
@@ -374,7 +391,99 @@
            (p/cast i8 (if (= (p/cast i64 (.surface t)) 0) 0 1)))
       true)))
 
+(defn add-session! [(c (ptr Canvas)) (bounds Rect) (session-id (ptr i8))] (-> bool)
+  (add-session-in! c bounds session-id (.directory c)))
+
+(defn bytes-of [(s (ptr i8))] (-> (slice u8))
+  (let [bytes (utf8 s)]
+    (slice-new (p/cast (ptr u8) bytes) (p/cast i64 (strlen bytes)))))
+
+(defn widget-title [(v (ptr Pane))] (-> (ptr i8))
+  (let [chosen (widget-view/title (.widget v))]
+    (if (> (len chosen) 0)
+        (widget-view/string chosen)
+        (msg (ptr i8)
+             (ns c"Widget · ")
+             (sel c"stringByAppendingString:")
+             [(ptr i8)]
+             (widget-view/string (widget-view/name (.widget v)))))))
+
+;;; A pane running SPEC, "NAME ARGS…" for widgets/NAME.coil. A widget that
+;;; fails to load still gets its pane, which shows the diagnostic and loads the
+;;; next saved edit.
+(defn add-widget! [(c (ptr Canvas))
+                   (bounds Rect)
+                   (spec (ptr i8))
+                   (state (ptr i8))] (-> bool)
+  (let [v (new-pane c bounds)]
+    (set! (.widget v)
+          (widget-view/create! (.view v)
+                               (content-bounds bounds)
+                               (bytes-of spec)
+                               (bytes-of (.directory c))
+                               state))
+    (widget-view/take-title-change! (.widget v))
+    (add-chrome! c v (widget-title v))
+    true))
+
+(defn next-bounds [(c (ptr Canvas)) (width f64) (height f64)] (-> Rect)
+  (let [camera (.camera c)
+        offset (* (p/cast f64 (% (count c) 5)) 28.0)]
+    (rect (+ (.x camera) (+ 36.0 offset))
+          (+ (.y camera) (+ 36.0 offset))
+          width
+          height)))
+
+(defn add-widget-visible! [(c (ptr Canvas)) (spec (ptr i8))] (-> bool)
+  (add-widget! c (next-bounds c 760.0 600.0) spec (nil)))
+
+;;; Carry out what a widget asked for while handling its events.
+(defn serve-requests! [(c (ptr Canvas)) (v (ptr Pane))] (-> void)
+  (let [w (.widget v)
+        r (widget-view/requests w)
+        count (len (.items r))]
+    (for [k 0 count]
+      (let [item (get (.items r) k)
+            text (api/request-text r item)
+            kind (.kind item)]
+        (cond (= kind api/OPEN-WIDGET)
+                (do (add-widget-visible! c (widget-view/string text)) 0)
+              (= kind api/OPEN-TERMINAL)
+                (do
+                  (add-session-in! c
+                                   (next-bounds c 640.0 430.0)
+                                   (sessions/identifier)
+                                   (widget-view/string text))
+                  0)
+              (= kind api/SCROLL-TO)
+                (do (widget-view/scroll-to! w (.value item)) 0)
+              (= kind api/EMIT)
+                (do
+                  (widget-view/broadcast! w text (api/request-text2 r item))
+                  0)
+              :else 0)))
+    (api/requests-clear! r)
+    (when (widget-view/take-title-change! w)
+      (msg i64 (.title v) (sel c"setStringValue:") [(ptr i8)] (widget-title v))
+      0)
+    ; Widget state is saved with the layout, so a state change dirties it.
+    (when (widget-view/take-state-dirty! w) (set! (.dirty c) true) 0)
+    (do)))
+
+;;; Serve what this canvas's widgets asked for. Compiles, reloads and ticks for
+;;; every widget happen once per pass in widget-view/maintain!.
+(defn widgets-serve! [(c (ptr Canvas))] (-> void)
+  ; Serving a request can add panes, so walk the panes that existed before.
+  (let [n (count c)]
+    (for [i 0 n]
+      (let [v (pane c i)]
+        (when (widget? v) (serve-requests! c v) 0))))
+  (do))
+
 (defn reconnect! [(c (ptr Canvas)) (v (ptr Pane))] (-> bool)
+  (if (widget? v) false (reconnect-terminal! c v)))
+
+(defn reconnect-terminal! [(c (ptr Canvas)) (v (ptr Pane))] (-> bool)
   (let [old (term-of v)
         bounds (.bounds v)
         t
@@ -408,6 +517,15 @@
                 640.0
                 430.0))))
 
+;;; Closing a terminal pane ends its session; app shutdown only detaches.
+(defn free-content! [(v (ptr Pane)) (closing bool)] (-> void)
+  (if (widget? v)
+      (widget-view/free! (.widget v))
+      (do
+        (when closing (sessions/kill! (.session-id (term-of v))) 0)
+        (terminal/free! (term-of v))))
+  (do))
+
 (defn close! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
   (do
     (if (= (p/cast i64 (.drag-pane c)) (p/cast i64 chosen))
@@ -417,18 +535,14 @@
       (do
         (for [i 0 (count c)]
           (if (= (p/cast i64 (pane c i)) (p/cast i64 chosen))
-              (store! found i)
+              (set! found i)
               0))
         (if (>= (load found) 0)
             (do
               (for [i (load found) (- (count c) 1)]
-                (al/al-set! [(ptr Pane)]
-                            (mut (field c panes))
-                            i
-                            (pane c (+ i 1))))
-              (al/al-pop! [(ptr Pane)] (mut (.panes c)))
-              (sessions/kill! (.session-id (term-of chosen)))
-              (terminal/free! (term-of chosen))
+                (set! (mut (.panes c)) i (pane c (+ i 1))))
+              (pop! [(ptr Pane)] (mut (.panes c)))
+              (free-content! chosen true)
               (msg i64 (.view chosen) (sel c"removeFromSuperview") [])
               (alloc/destroy [Pane] (alloc/malloc-allocator) chosen)
               (focus! c (if (> (count c) 0) (pane c (- (count c) 1)) (no-pane))))
@@ -440,7 +554,7 @@
     (do
       (for [i 0 (count c)]
         (if (model/contains? (.bounds (pane c i)) world)
-            (store! found (pane c i))
+            (set! found (pane c i))
             0))
       (load found))))
 
@@ -459,13 +573,13 @@
           (for [i 1 (count c)]
             (let [r (.bounds (pane c i))]
               (do
-                (if (< (.x r) (load x)) (store! x (.x r)) 0)
-                (if (< (.y r) (load y)) (store! y (.y r)) 0)
+                (if (< (.x r) (load x)) (set! x (.x r)) 0)
+                (if (< (.y r) (load y)) (set! y (.y r)) 0)
                 (if (> (+ (.x r) (.w r)) (load right))
-                    (store! right (+ (.x r) (.w r)))
+                    (set! right (+ (.x r) (.w r)))
                     0)
                 (if (> (+ (.y r) (.h r)) (load bottom))
-                    (store! bottom (+ (.y r) (.h r)))
+                    (set! bottom (+ (.y r) (.h r)))
                     0))))
           (let [zx (/ (- (.width c) 64.0) (- (load right) (load x)))
                 zy (/ (- (.height c) 64.0) (- (load bottom) (load y)))
@@ -514,26 +628,26 @@
                         (do
                           (if (= (.gesture c) 1)
                               (do
-                                (store! (field c camera)
-                                        (model/pan-by (.camera c)
-                                                      (- (.x screen)
-                                                         (.x (.start c)))
-                                                      (- (.y screen)
-                                                         (.y (.start c)))))
-                                (store! (field c start) screen))
+                                (set! (.camera c)
+                                      (model/pan-by (.camera c)
+                                                    (- (.x screen)
+                                                       (.x (.start c)))
+                                                    (- (.y screen)
+                                                       (.y (.start c)))))
+                                (set! (.start c) screen))
                               0)
                           (project! c)
                           true)
                       (and (or (= kind 2) (= kind 26)) (> (.gesture c) 0))
                         (do
-                          (store! (field c gesture) 0)
-                          (store! (field c drag-pane) (no-pane))
+                          (set! (.gesture c) 0)
+                          (set! (.drag-pane c) (no-pane))
                           true)
                       (not inside) false
                       (or (= kind 1) (= kind 25))
                         (do
-                          (store! (field c start) screen)
-                          (store! (field c start-world) world)
+                          (set! (.start c) screen)
+                          (set! (.start-world c) world)
                           (cond (or (.space-held c)
                                     (and (= kind 25)
                                          (= (msg i64
@@ -541,7 +655,7 @@
                                                  (sel c"buttonNumber")
                                                  [])
                                             2)))
-                                  (do (store! (field c gesture) 1) true)
+                                  (do (set! (.gesture c) 1) true)
                                 (= (p/cast i64 v) 0) false
                                 :else
                                   (let [r (.bounds v)
@@ -563,54 +677,52 @@
                                                       (< (+ (* dx dx) (* dy dy))
                                                          64.0)))
                                             (do
-                                              (store! (field c last-click) 0.0)
+                                              (set! (.last-click c) 0.0)
                                               (if (or (< (.zoom (.camera c))
                                                          0.999)
                                                       (> (.zoom (.camera c))
                                                          1.001))
                                                   (do
-                                                    (store! (field c camera)
-                                                            (model/jump-to-pane r))
+                                                    (set! (.camera c)
+                                                          (model/jump-to-pane r))
                                                     (project! c))
                                                   (do)))
                                             (do
-                                              (store! (field c last-click) now)
-                                              (store! (field c click-point)
-                                                      screen)
-                                              (store! (field c click-pane) v)
+                                              (set! (.last-click c) now)
+                                              (set! (.click-point c) screen)
+                                              (set! (.click-pane c) v)
                                               (do))))
-                                      (store! (field c start-world)
-                                              (model/screen-to-world (display-camera c)
-                                                                     screen))
-                                      (store! (field c start-bounds) r)
-                                      (store! (field c drag-pane) v)
+                                      (set! (.start-world c)
+                                            (model/screen-to-world (display-camera c)
+                                                                   screen))
+                                      (set! (.start-bounds c) r)
+                                      (set! (.drag-pane c) v)
                                       (cond (and (< local-y 36.0)
                                                  (> local-x (- (.w r) 36.0)))
                                               (do
-                                                (store! (field c drag-pane)
-                                                        (no-pane))
+                                                (set! (.drag-pane c) (no-pane))
                                                 (close! c v)
                                                 true)
                                             (< local-y 36.0)
                                               (do
-                                                (store! (field c gesture) 2)
+                                                (set! (.gesture c) 2)
                                                 true)
                                             (and (> local-y (- (.h r) 20.0))
                                                  (> local-x (- (.w r) 20.0)))
                                               (do
-                                                (store! (field c gesture) 3)
+                                                (set! (.gesture c) 3)
                                                 true)
                                             :else false)))))
                       (= kind 30)
                         (if (.zoom-enabled c)
                             (do
-                              (store! (field c camera)
-                                      (model/zoom-at (.camera c)
-                                                     screen
-                                                     (model/pinch-factor (msg f64
-                                                                              event
-                                                                              (sel c"magnification")
-                                                                              []))))
+                              (set! (.camera c)
+                                    (model/zoom-at (.camera c)
+                                                   screen
+                                                   (model/pinch-factor (msg f64
+                                                                            event
+                                                                            (sel c"magnification")
+                                                                            []))))
                               (project! c)
                               true)
                             false)
@@ -634,16 +746,16 @@
                                                    (.zoom-enabled c))]
                           (cond (= route 2)
                                   (do
-                                    (store! (field c camera)
-                                            (model/zoom-at (.camera c)
-                                                           screen
-                                                           (model/wheel-factor dy)))
+                                    (set! (.camera c)
+                                          (model/zoom-at (.camera c)
+                                                         screen
+                                                         (model/wheel-factor dy)))
                                     (project! c)
                                     true)
                                 (= route 1)
                                   (do
-                                    (store! (field c camera)
-                                            (model/pan-by (.camera c) dx dy))
+                                    (set! (.camera c)
+                                          (model/pan-by (.camera c) dx dy))
                                     (project! c)
                                     true)
                                 :else false))
@@ -665,7 +777,7 @@
     (for [i 0 (count c)]
       (let [v (pane c i)]
         (do
-          (terminal/free! (term-of v))
+          (free-content! v false)
           (msg i64 (.view v) (sel c"removeFromSuperview") [])
           (alloc/destroy [Pane] (alloc/malloc-allocator) v))))
     (al/al-free! [(ptr Pane)] (mut (.panes c)))
@@ -687,7 +799,16 @@
           (do
             (storage/put! item c"x" (storage/number (.x r)))
             (storage/put! item c"y" (storage/number (.y r)))
-            (storage/put! item c"session" (.session-id (term-of v)))
+            (if (widget? v)
+                (let [state (widget-view/state-array (.widget v))]
+                  (storage/put! item
+                                c"widget"
+                                (widget-view/spec-string (.widget v)))
+                  (when (!= (p/cast i64 state) 0)
+                    (storage/put! item c"state" state)
+                    0)
+                  0)
+                (storage/put! item c"session" (.session-id (term-of v))))
             (storage/put! item c"width" (storage/number (.w r)))
             (storage/put! item c"height" (storage/number (.h r)))
             (storage/add! panes item)
@@ -726,7 +847,7 @@
                                   (theme/bounded? (storage/value r c"height")
                                                   180.0
                                                   4096.0)))))
-              (store! valid false)
+              (set! valid false)
               0)))
       (load valid))))
 
@@ -743,17 +864,26 @@
                   :zoom (storage/value dict c"zoom")))
           (for [i 0 (storage/count panes)]
             (let [r (storage/at panes i)]
-              (if (not (add-session! c
-                                     (rect (storage/value r c"x")
-                                           (storage/value r c"y")
-                                           (storage/value r c"width")
-                                           (storage/value r c"height"))
-                                     (let [id (storage/get r c"session")]
-                                       (if (and (storage/kind? id c"NSString")
-                                                (sessions/valid-id? id))
-                                           id
-                                           (sessions/identifier)))))
-                  (store! ok false)
+              (if (not (let [bounds
+                               (rect (storage/value r c"x")
+                                     (storage/value r c"y")
+                                     (storage/value r c"width")
+                                     (storage/value r c"height"))
+                             widget (storage/get r c"widget")]
+                         (if (storage/kind? widget c"NSString")
+                             (add-widget! c
+                                          bounds
+                                          widget
+                                          (storage/get r c"state"))
+                             (add-session! c
+                                           bounds
+                                           (let [id (storage/get r c"session")]
+                                             (if (and (storage/kind? id
+                                                                     c"NSString")
+                                                      (sessions/valid-id? id))
+                                                 id
+                                                 (sessions/identifier)))))))
+                  (set! ok false)
                   0)))
           (let [focused (storage/value dict c"focused")]
             (if (and (>= focused 0.0) (< focused (p/cast f64 (count c))))

@@ -5,7 +5,7 @@ source-roots = ["src", "tests"]
 exclude = ["src/session/server.coil"]
 
 [link]
-frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers"]
+frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers", "CoreServices"]
 libs = ["objc", "c++"]
 
 [native-dependencies]

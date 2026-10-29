@@ -1,0 +1,220 @@
+(module widgets.git)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.proc" :as proc)
+(import "jim.widget-kit.live" :as live)
+
+;;; Git status for the project: branch, changed files and recent commits. With
+;;; Live on it follows the repository as it changes — edits, commits, checkouts
+;;; made anywhere — by watching its files; git runs in the background.
+(const MAX-FILES 12)
+
+(defstruct Git
+  [(status-job proc/Job)
+   (log-job proc/Job)
+   (status (ArrayList u8))
+   (log (ArrayList u8))
+   (repo (ArrayList u8))
+   (live bool)
+   (outside live/Refresher)
+   (refreshes i64)])
+
+(defn refresh! [(g (ptr Git))] (-> void)
+  (live/started! (field g outside))
+  (when (not (proc/running? (field g status-job)))
+    (proc/start! (field g status-job)
+                 ["git" "status" "--porcelain=v1" "--branch"]
+                 (al-slice (.repo g))
+                 0)
+    0)
+  (when (not (proc/running? (field g log-job)))
+    (proc/start! (field g log-job)
+                 ["git" "log" "-6" "--format=%h %s"]
+                 (al-slice (.repo g))
+                 0)
+    0)
+  (set! (.refreshes g) (+ (.refreshes g) 1))
+  (do))
+
+(defn running? [(g (ptr Git))] (-> bool)
+  (or (proc/running? (field g status-job)) (proc/running? (field g log-job))))
+
+(defn poll! [(g (ptr Git))] (-> void)
+  (when (and (proc/running? (field g status-job))
+             (proc/poll! (field g status-job)))
+    (text/set-str! (field g status) (proc/output (field g status-job)))
+    0)
+  (when (and (proc/running? (field g log-job)) (proc/poll! (field g log-job)))
+    (text/set-str! (field g log) (proc/output (field g log-job)))
+    0)
+  (when (live/due? (field g outside) (running? g)) (refresh! g) 0)
+  (do))
+
+;;; Number of newline-terminated lines in TEXT.
+(defn line-count [(text (slice u8))] (-> i64)
+  (let [(mut n) 0]
+    (for [i 0 (len text)]
+      (when (= (get text i) (p/cast u8 10)) (set! n (+ (load n) 1))))
+    (load n)))
+
+(defn line [(text (slice u8)) (index i64)] (-> (slice u8))
+  (let [(mut start) 0
+        (mut seen) 0
+        (mut end) (len text)]
+    (for [i 0 (len text)]
+      (when (= (get text i) (p/cast u8 10))
+        (cond (= (load seen) index)
+                (do (set! end i) (set! seen (+ (load seen) 1)) 0)
+              (< (load seen) index)
+                (do (set! start (+ i 1)) (set! seen (+ (load seen) 1)) 0)
+              :else 0)))
+    (subslice text
+              (load start)
+              (if (< (load end) (load start)) (load start) (load end)))))
+
+(defn status-color [(code (slice u8))] (-> i64)
+  (let [x (get code 0)
+        y (get code 1)]
+    (cond (= x (p/cast u8 63)) 0x9098a4
+          (or (= x (p/cast u8 68)) (= y (p/cast u8 68))) 0xe08a8a
+          (or (= x (p/cast u8 65)) (= x (p/cast u8 82))) 0x8fd18f
+          :else 0xc79bf2)))
+
+(defn status-label [(code (slice u8))] (-> (slice u8))
+  (let [x (get code 0)
+        y (get code 1)]
+    (cond (= x (p/cast u8 63)) "new  "
+          (or (= x (p/cast u8 68)) (= y (p/cast u8 68))) "del  "
+          (= x (p/cast u8 65)) "add  "
+          (= x (p/cast u8 82)) "ren  "
+          :else "mod  ")))
+
+(defn render-files! [(g (ptr Git)) (ui (ptr Ui))] (-> void)
+  (let [text (al-slice (.status g))
+        lines (line-count text)
+        files (if (> lines 0) (- lines 1) 0)]
+    (if (= files 0)
+        (do (text! ui "Working tree clean" 12.0 0x8fd18f false) 0)
+        (do
+          (text! ui "" 11.0 0x9098a4 false)
+          (append-i64! ui files)
+          (append! ui (if (= files 1) " changed file" " changed files"))
+          (for [i 1 (+ 1 (if (> files MAX-FILES) MAX-FILES files))]
+            (let [l (line text i)]
+              (when (> (len l) 3)
+                (let [code (subslice l 0 2)]
+                  (hstack! ui 6.0 0.0)
+                  (text! ui (status-label code) 11.0 (status-color code) true)
+                  (text! ui
+                         (subslice l 3 (len l))
+                         12.0
+                         0xcfd2d8
+                         false)
+                  (end! ui)
+                  0))
+              0))
+          (when (> files MAX-FILES)
+            (text! ui "… and " 11.0 0x7f8794 false)
+            (append-i64! ui (- files MAX-FILES))
+            (append! ui " more")
+            0)
+          0))
+    (do)))
+
+(defn render-log! [(g (ptr Git)) (ui (ptr Ui))] (-> void)
+  (let [text (al-slice (.log g))]
+    (text! ui "Recent commits (last 6)" 11.0 0x9098a4 true)
+    (for [i 0 (line-count text)]
+      (let [l (line text i)]
+        (when (> (len l) 8)
+          (hstack! ui 8.0 0.0)
+          (text! ui (subslice l 0 7) 12.0 0x66c7f5 false)
+          (text! ui
+                 (subslice l 8 (len l))
+                 12.0
+                 0xcfd2d8
+                 false)
+          (end! ui)
+          0)
+        0))
+    (do)))
+
+(impl Widget Git
+  (render [(self (ptr Git)) (ui (ptr Ui))]
+          (-> void)
+          (let [status (al-slice (.status self))
+                branch (line status 0)]
+            (title! ui "git")
+            (when (.live self) (watch! ui (al-slice (.repo self))) 0)
+            (vstack! ui 8.0 14.0)
+            (hstack! ui 10.0 0.0)
+            (text! ui "⎇ git status" 15.0 0xcfd2d8 true)
+            (text! ui
+                   (if (> (slice-len branch) 3)
+                       (subslice branch 3 (slice-len branch))
+                       "(no branch)")
+                   13.0
+                   0x66c7f5
+                   false)
+            (end! ui)
+            (hstack! ui 10.0 0.0)
+            (button! ui "refresh" "Refresh")
+            (toggle! ui "live" "Live" (.live self))
+            (text! ui "refreshed " 11.0 0x7f8794 false)
+            (append-i64! ui (.refreshes self))
+            (append! ui "×")
+            (end! ui)
+            (divider! ui)
+            (render-files! self ui)
+            (divider! ui)
+            (render-log! self ui)
+            (end! ui)))
+  (event [(self (ptr Git)) (e (ptr Event))]
+         (-> void)
+         (cond (tick? e) (poll! self)
+               (clicked? e "refresh") (refresh! self)
+               (toggled? e "live") (set! (.live self) (.checked e))
+               (or (files-changed? e) (message? e "git.changed"))
+                 (when (.live self) (live/note! (field self outside)) 0)
+               :else (do)))
+  (save [(self (ptr Git)) (s (ptr Snapshot))]
+        (-> void)
+        (put-bool! s "live" (.live self))
+        (put-i64! s "refreshes" (.refreshes self)))
+  (animating? [(self (ptr Git))]
+              (-> bool)
+              (or (running? self) (live/waiting? (field self outside))))
+  (destroy! [(self (ptr Git))]
+            (-> void)
+            (proc/free! (field self status-job))
+            (proc/free! (field self log-job))
+            (al-free! (mut (.status self)))
+            (al-free! (mut (.log self)))
+            (al-free! (mut (.repo self)))
+            (alloc/destroy [Git] (alloc/malloc-allocator) self)
+            (do)))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        args (text/trim (get-text saved "jim.args" ""))
+        g
+          (alloc/box! a
+                      Git
+                      (Git
+                        :status-job (proc/job-new (host saved))
+                        :log-job (proc/job-new (host saved))
+                        :status (al-new [u8] a)
+                        :log (al-new [u8] a)
+                        :repo
+                          (text/owned (if (> (len args) 0)
+                                          args
+                                          (get-text saved "jim.dir" ".")))
+                        :live (get-bool saved "live" true)
+                        :outside (live/refresher)
+                        :refreshes (get-i64 saved "refreshes" 0)))]
+    (refresh! g)
+    (set! out g)))

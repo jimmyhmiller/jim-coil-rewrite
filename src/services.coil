@@ -1,0 +1,162 @@
+(module jim.services)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.thread" :as thread)
+(import "coil.sync" :as sync)
+(import "coil.atomic" :as atomic)
+(import "jim.widget-api" :as api)
+(import "jim.processes" :as processes)
+
+;;; What Jim offers a widget generation, as api/Host: child processes (see
+;;; jim.processes) and background tasks. Each generation gets its own Services,
+;;; which counts that generation's unfinished tasks so the runtime can keep its
+;;; code mapped until they end.
+(const WORKERS 2)
+
+;;; Task states. A task released before it finishes is freed by its worker.
+(const PENDING 0)
+
+(const FINISHED 1)
+
+(const ABANDONED 2)
+
+(defstruct Services [(running i64)])
+
+(defstruct Record [(task (dyn api/Task)) (owner (ptr Services)) (state i64)])
+
+(defstruct Pool
+  [(lock sync/Mutex)
+   (wake sync/Condition)
+   (queue (ArrayList (ptr Record)))
+   (workers (array thread/Thread 2))
+   (started bool)])
+
+(defn pool-cell [] (-> (ptr Pool))
+  (p/alloc-static Pool))
+
+(defn lock! [(pool (ptr Pool))] (-> void)
+  (try (let [_ (try-or! (sync/mutex-lock! (field pool lock)) 0)] 0))
+  (do))
+
+(defn unlock! [(pool (ptr Pool))] (-> void)
+  (try (let [_ (try-or! (sync/mutex-unlock! (field pool lock)) 0)] 0))
+  (do))
+
+(defn free-record! [(record (ptr Record))] (-> void)
+  (alloc/destroy [Record] (alloc/malloc-allocator) record)
+  (do))
+
+(extern pthread_set_qos_class_self_np :cc c [u32 i32] (-> i32))
+
+;;; QOS_CLASS_USER_INITIATED
+(const QOS-USER-INITIATED 25)
+
+(defn worker [(arg (ptr i8))] (-> (ptr i8))
+  (let [pool (p/cast (ptr Pool) arg)]
+    ; Below the main thread, which runs user-interactive: never compete with it.
+    (pthread_set_qos_class_self_np (p/cast u32 QOS-USER-INITIATED)
+                                   (p/cast i32 0))
+    (loop (lock! pool)
+      (while (= (len (.queue pool)) 0)
+        (try (let [_
+                     (try-or! (sync/condition-wait! (field pool wake)
+                                                    (field pool lock))
+                              0)]
+               0)))
+      (let [record (get (.queue pool) 0)]
+        (for [i 1 (len (.queue pool))]
+          (set! (al-elem (field pool queue) (- i 1)) (get (.queue pool) i)))
+        (set! (.len (field pool queue)) (- (len (.queue pool)) 1))
+        (unlock! pool)
+        (api/run (.task record))
+        (let [owner (.owner record)]
+          (when (!= (atomic/atomic-cas (field record state) PENDING FINISHED)
+                    PENDING)
+            ; Released while running: nobody will ask about it again.
+            (free-record! record)
+            0)
+          ; Last, so the owner's count reaches zero only after the task's code is done.
+          (atomic/atomic-sub (field owner running) 1))))
+    (p/cast (ptr i8) 0)))
+
+(defn pool [] (-> (ptr Pool))
+  (let [pool (pool-cell)]
+    (when (not (.started pool))
+      (sync/mutex-init (field pool lock))
+      (sync/condition-init (field pool wake))
+      (set! (.queue pool) (al-new [(ptr Record)] (alloc/malloc-allocator)))
+      (set! (.started pool) true)
+      (for [i 0 WORKERS]
+        (thread/thread-spawn-configured (p/index (p/cast (ptr thread/Thread)
+                                                         (field pool workers))
+                                                 i)
+                                        (p/fnptr-of worker)
+                                        (p/cast (ptr i8) pool)
+                                        (thread/thread-config (* 64 1048576)
+                                                              65536)))
+      0)
+    pool))
+
+(defn start-task [(s (ptr Services)) (task (dyn api/Task))] (-> i64)
+  (let [pool (pool)
+        record
+          (alloc/box! (alloc/malloc-allocator)
+                      Record
+                      (Record
+                        :task task
+                        :owner s
+                        :state PENDING))]
+    (atomic/atomic-add (field s running) 1)
+    (lock! pool)
+    (push! (mut (.queue pool)) record)
+    (try (let [_ (try-or! (sync/condition-notify-one! (field pool wake)) 0)] 0))
+    (unlock! pool)
+    (p/cast i64 record)))
+
+(defn task-done? [(handle i64)] (-> bool)
+  (= (atomic/atomic-load (field (p/cast (ptr Record) handle) state)) FINISHED))
+
+(defn release-task [(handle i64)] (-> void)
+  (let [record (p/cast (ptr Record) handle)]
+    ; Still running: the worker frees it when it finishes.
+    (when (!= (atomic/atomic-cas (field record state) PENDING ABANDONED)
+              PENDING)
+      (free-record! record)
+      0)
+    (do)))
+
+(impl api/Host Services
+  (spawn [(self (ptr Services)) (argv (slice (slice u8))) (cwd (slice u8))]
+         (-> i64)
+         (processes/spawn-process argv cwd))
+  (poll [(self (ptr Services)) (process i64) (out (ptr (ArrayList u8)))]
+        (-> i64)
+        (processes/poll-process process out))
+  (release [(self (ptr Services)) (process i64)]
+           (-> void)
+           (processes/release-process process))
+  (start-task [(self (ptr Services)) (task (dyn api/Task))]
+              (-> i64)
+              (start-task self task))
+  (task-done? [(self (ptr Services)) (task i64)]
+              (-> bool)
+              (task-done? task))
+  (release-task [(self (ptr Services)) (task i64)]
+                (-> void)
+                (release-task task)))
+
+(defn services-new [] (-> (ptr Services))
+  (alloc/box! (alloc/malloc-allocator) Services (Services :running 0)))
+
+(defn host [(s (ptr Services))] (-> (dyn api/Host))
+  (p/make-dyn api/Host s))
+
+;;; True while any task this generation started is unfinished.
+(defn busy? [(s (ptr Services))] (-> bool)
+  (> (atomic/atomic-load (field s running)) 0))
+
+(defn free! [(s (ptr Services))] (-> void)
+  (alloc/destroy [Services] (alloc/malloc-allocator) s)
+  (do))

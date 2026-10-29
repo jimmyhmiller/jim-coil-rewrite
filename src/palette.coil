@@ -80,7 +80,7 @@
   (let [id (.submission (state))] (do (set! (.submission (state)) -1) id)))
 
 (defn match-at [(i i64)] (-> Match)
-  (al/al-get [Match] (.matches (state)) i))
+  (get (.matches (state)) i))
 
 (defn choose! [] (-> void)
   (let [s (state)]
@@ -151,22 +151,20 @@
               (if (>= score 0)
                   (let [(mut at) (.count s)]
                     (do
-                      (al/al-push! [Match]
-                                   (mut (.matches s))
-                                   (Match :id id :score score))
+                      (push! [Match]
+                             (mut (.matches s))
+                             (Match :id id :score score))
                       (while (and (> (load at) 0)
                                   (let [previous (match-at (- (load at) 1))]
                                     (> score (.score previous))))
                         (do
-                          (al/al-set! [Match]
-                                      (mut (.matches s))
-                                      (load at)
-                                      (match-at (- (load at) 1)))
-                          (store! at (- (load at) 1))))
-                      (al/al-set! [Match]
-                                  (mut (.matches s))
-                                  (load at)
-                                  (Match :id id :score score))
+                          (set! (mut (.matches s))
+                                (load at)
+                                (match-at (- (load at) 1)))
+                          (set! at (- (load at) 1))))
+                      (set! (mut (.matches s))
+                            (load at)
+                            (Match :id id :score score))
                       (set! (.count s) (+ (.count s) 1))
                       (do)))
                   (do))))
@@ -178,8 +176,8 @@
 
 (defn clicked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
   (do
-    (store! (field (state) selected)
-            (+ (.offset (state)) (msg i64 sender (sel c"tag") [])))
+    (set! (.selected (state))
+          (+ (.offset (state)) (msg i64 sender (sel c"tag") [])))
     (choose!)))
 
 (defn hovered [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
@@ -237,11 +235,11 @@
   (let [s (state)
         content (msg (ptr i8) (.owner s) (sel c"contentView") [])]
     (do
-      (store! (field s previous-responder)
-              (msg (ptr i8)
-                   (msg (ptr i8) (.owner s) (sel c"firstResponder") [])
-                   (sel c"retain")
-                   []))
+      (set! (.previous-responder s)
+            (msg (ptr i8)
+                 (msg (ptr i8) (.owner s) (sel c"firstResponder") [])
+                 (sel c"retain")
+                 []))
       (set! (.pending s) -1)
       (set! (.prompt s) -1)
       (msg i64
@@ -382,12 +380,12 @@
       (method! cls c"choose:" (p/cast (ptr i8) (p/fnptr-of clicked)) c"v@:@")
       (objc_registerClassPair cls)
       (set! (.target s) (new c"JimPaletteActions"))
-      (store! (field s search)
-              (msg (ptr i8)
-                   (msg (ptr i8) (class c"NSSearchField") (sel c"alloc") [])
-                   (sel c"initWithFrame:")
-                   [Rect]
-                   (rect 18.0 408.0 584.0 32.0)))
+      (set! (.search s)
+            (msg (ptr i8)
+                 (msg (ptr i8) (class c"NSSearchField") (sel c"alloc") [])
+                 (sel c"initWithFrame:")
+                 [Rect]
+                 (rect 18.0 408.0 584.0 32.0)))
       (msg i64
            (.search s)
            (sel c"setPlaceholderString:")
@@ -398,7 +396,7 @@
       (for [i 0 10]
         (let [b (controls/button c"" (.target s) (sel c"choose:"))]
           (do
-            (store! (p/index (field s buttons) i) b)
+            (set! (p/index (field s buttons) i) b)
             (frame! b (rect 18.0 (- 365.0 (* (p/cast f64 i) 34.0)) 584.0 32.0))
             (msg i64 b (sel c"setTag:") [i64] i)
             (msg i64 b (sel c"setBordered:") [i8] (p/cast i8 0))

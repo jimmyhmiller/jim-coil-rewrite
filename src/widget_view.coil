@@ -1,0 +1,1961 @@
+(module jim.widget-view)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "coil.hashmap" :use *)
+(import "jim.widget-api" :as api)
+(import "jim.widgets" :as widgets)
+(import "coil.thread" :as thread)
+
+;;; A canvas pane showing one hot-reloaded widget. Jim owns layout, drawing,
+;;; scrolling, hit testing and native text fields; the widget only describes
+;;; its element tree (jim.widget-api).
+;;;
+;;; Layout is two passes over the flat node array. `size!` gives every node a
+;;; border-box size from the width its parent offers; `place!` then assigns
+;;; positions in content coordinates (the pane's scroll offset is applied when
+;;; drawing). Children always follow their parent in the array, so a reverse
+;;; sweep sees every child before its container.
+(defstruct Field
+  [(id (ArrayList u8)) (view (ptr i8)) (editor (ptr i8)) (kind i64) (seen bool)])
+
+(defstruct WidgetPane
+  [(view (ptr i8))
+   (runtime (ptr widgets/Runtime))
+   (natural (ArrayList f64))
+   ;; Single-line label heights, measured with the natural widths.
+   (line-heights (ArrayList f64))
+   (sizes (ArrayList Size))
+   (boxes (ArrayList Rect))
+   (clips (ArrayList Rect))
+   (fields (ArrayList Field))
+   (title (ArrayList u8))
+   (title-dirty bool)
+   (shown bool)
+   (pressed i64)
+   (hovered i64)
+   (dialog i64)
+   (scroll f64)
+   (content-h f64)
+   (last-tick f64)
+   (stream (ptr i8))
+   (watch-key (ArrayList u8))
+   (state-dirty bool)])
+
+(defn pane-key [] (-> (ptr i8))
+  (p/alloc-static i8))
+
+(defn id-key [] (-> (ptr i8))
+  (p/alloc-static i8))
+
+(defn pane-of [(view (ptr i8))] (-> (ptr WidgetPane))
+  (p/cast (ptr WidgetPane) (objc_getAssociatedObject view (pane-key))))
+
+(defn live-pane? [(w (ptr WidgetPane))] (-> bool)
+  (!= (p/cast i64 w) 0))
+
+;;; ---- AppKit helpers --------------------------------------------------------
+(defn string [(bytes (slice u8))] (-> (ptr i8))
+  (msg (ptr i8)
+       (msg (ptr i8)
+            (msg (ptr i8) (class c"NSString") (sel c"alloc") [])
+            (sel c"initWithBytes:length:encoding:")
+            [(ptr u8) u64 u64]
+            (slice-data bytes)
+            (p/cast u64 (len bytes))
+            (p/cast u64 4))
+       (sel c"autorelease")
+       []))
+
+(defn string-bytes [(s (ptr i8))] (-> (slice u8))
+  (let [c (utf8 s)]
+    (if (= (p/cast i64 c) 0)
+        ""
+        (slice-new (p/cast (ptr u8) c) (p/cast i64 (strlen c))))))
+
+(defn rgb [(value i64)] (-> (ptr i8))
+  (color (/ (p/cast f64 (% (/ value 65536) 256)) 255.0)
+         (/ (p/cast f64 (% (/ value 256) 256)) 255.0)
+         (/ (p/cast f64 (% value 256)) 255.0)
+         1.0))
+
+(defstruct FontEntry [(key i64) (font (ptr i8))])
+
+(defn font-cache [] (-> (ptr (ArrayList FontEntry)))
+  (let [cell (p/alloc-static (ArrayList FontEntry))]
+    (when (= (p/cast i64 (.data cell)) 0)
+      (set! cell (al-new [FontEntry] (alloc/malloc-allocator)))
+      0)
+    cell))
+
+;;; System or monospaced font, cached for the life of the process.
+(defn font [(size f64) (bold bool) (mono bool)] (-> (ptr i8))
+  (let [key (+ (* (p/cast i64 (* size 4.0)) 4) (+ (if bold 1 0) (if mono 2 0)))
+        cache (font-cache)
+        (mut found) (nil)]
+    (for [i 0 (len (load cache))]
+      (let [e (get (load cache) i)]
+        (when (= (.key e) key) (set! found (.font e)) 0)))
+    (if (!= (p/cast i64 (load found)) 0)
+        (load found)
+        (let [f
+                (msg (ptr i8)
+                     (msg (ptr i8)
+                          (class c"NSFont")
+                          (if mono
+                              (sel c"monospacedSystemFontOfSize:weight:")
+                              (sel c"systemFontOfSize:weight:"))
+                          [f64 f64]
+                          size
+                          (if bold 0.4 0.0))
+                     (sel c"retain")
+                     [])]
+          (push! (mut cache) (FontEntry :key key :font f))
+          f))))
+
+(defn attributes [(f (ptr i8)) (ink (ptr i8))] (-> (ptr i8))
+  (let [dict
+          (msg (ptr i8) (class c"NSMutableDictionary") (sel c"dictionary") [])]
+    (msg i64
+         dict
+         (sel c"setObject:forKey:")
+         [(ptr i8) (ptr i8)]
+         f
+         (ns c"NSFont"))
+    (msg i64
+         dict
+         (sel c"setObject:forKey:")
+         [(ptr i8) (ptr i8)]
+         ink
+         (ns c"NSColor"))
+    dict))
+
+;;; Attribute dictionaries are cached by font and color: layout measures
+;;; thousands of strings and building a dictionary (and a color) for each one
+;;; dominated its cost.
+(defstruct AttrEntry [(font (ptr i8)) (color i64) (dict (ptr i8))])
+
+(defn attr-cache [] (-> (ptr (ArrayList AttrEntry)))
+  (let [cell (p/alloc-static (ArrayList AttrEntry))]
+    (when (= (p/cast i64 (.data cell)) 0)
+      (set! cell (al-new [AttrEntry] (alloc/malloc-allocator)))
+      0)
+    cell))
+
+(defn attrs [(f (ptr i8)) (color i64)] (-> (ptr i8))
+  (let [cache (attr-cache)
+        (mut found) (nil)]
+    (for [i 0 (len (load cache))]
+      (let [e (al-elem cache i)]
+        (when (and (= (p/cast i64 (.font e)) (p/cast i64 f))
+                   (= (.color e) color))
+          (set! found (.dict e))
+          0)))
+    (if (!= (p/cast i64 (load found)) 0)
+        (load found)
+        (let [dict (msg (ptr i8) (attributes f (rgb color)) (sel c"retain") [])]
+          (push! (mut cache)
+                 (AttrEntry
+                   :font f
+                   :color color
+                   :dict dict))
+          dict))))
+
+(defn node-font [(n (ptr api/Node))] (-> (ptr i8))
+  (font (.size n) (.bold n) (.mono n)))
+
+(defn measure-line [(text (slice u8)) (f (ptr i8))] (-> Size)
+  (msg Size (string text) (sel c"sizeWithAttributes:") [(ptr i8)] (attrs f 0)))
+
+(defn text-w [(text (slice u8)) (f (ptr i8))] (-> f64)
+  (let [s (line-size text f)] (.w s)))
+
+(defn text-h [(text (slice u8)) (f (ptr i8))] (-> f64)
+  (let [s (line-size text f)] (.h s)))
+
+(defn rect-h [(r Rect)] (-> f64)
+  (.h r))
+
+;;; Height of TEXT wrapped to WIDTH (at least 1).
+(defn measure-wrapped [(text (slice u8)) (f (ptr i8)) (width f64)] (-> f64)
+  (let [r
+          (msg Rect
+               (string text)
+               (sel c"boundingRectWithSize:options:attributes:")
+               [Size u64 (ptr i8)]
+               (Size :w (if (> width 1.0) width 1.0) :h 100000.0)
+               (p/cast u64 3)
+               (attrs f 0))]
+    (+ (.h r) 1.0)))
+
+;;; ---- remembered measurements ----------------------------------------------------
+
+;;; Measuring text through AppKit is most of a layout's cost, and a widget's
+;;; refresh mostly repeats the text of the one before. Sizes are remembered by
+;;; text, font and wrap width (NO-WRAP for one line). A hit compares the stored
+;;; bytes and width exactly, so a hash collision measures again instead of
+;;; answering wrongly. Main thread only.
+(const NO-WRAP -1.0)
+
+;;; Past either limit the cache starts over.
+(const MEASURE-ENTRIES-LIMIT 50000)
+
+(const MEASURE-BYTES-LIMIT 8388608)
+
+(defstruct Measured
+  [(font i64) (width f64) (text-at i64) (text-len i64) (w f64) (h f64)])
+
+(defstruct MeasureCache
+  [(index (HashMap i64 i64))
+   (entries (ArrayList Measured))
+   (bytes (ArrayList u8))
+   (ready bool)])
+
+(defn measure-cache [] (-> (ptr MeasureCache))
+  (let [c (p/alloc-static MeasureCache)]
+    (when (not (.ready c))
+      (set! (.index c) (hm-new-scalar [i64 i64] (alloc/malloc-allocator)))
+      (set! (.entries c) (al-new [Measured] (alloc/malloc-allocator)))
+      (set! (.bytes c) (al-new [u8] (alloc/malloc-allocator)))
+      (set! (.ready c) true)
+      0)
+    c))
+
+;;; FNV-1a over TEXT, mixed with the font and the width to 1/64 point.
+(defn measure-key [(text (slice u8)) (f (ptr i8)) (width f64)] (-> i64)
+  (let [(mut h) -3750763034362895579]
+    (for [i 0 (len text)]
+      (set! h
+            (* (^ (load h) (p/cast i64 (get text i))) 1099511628211)))
+    (set! h (* (^ (load h) (p/cast i64 f)) 1099511628211))
+    (* (^ (load h) (p/cast i64 (* width 64.0))) 1099511628211)))
+
+(defn measured-matches? [(c (ptr MeasureCache))
+                         (m (ptr Measured))
+                         (text (slice u8))
+                         (f (ptr i8))
+                         (width f64)] (-> bool)
+  (and (= (.font m) (p/cast i64 f))
+       (p/fcmp-eq (.width m) width)
+       (= (.text-len m) (len text))
+       (= (subslice (al-slice (.bytes c))
+                    (.text-at m)
+                    (+ (.text-at m) (.text-len m)))
+          text)))
+
+;;; TEXT's size in font F: one line when WIDTH is NO-WRAP, else wrapped to
+;;; WIDTH (only the height is meaningful then).
+(defn text-size [(text (slice u8)) (f (ptr i8)) (width f64)] (-> Size)
+  (let [c (measure-cache)
+        key (measure-key text f width)
+        hit
+          (match (get (.index c) key)
+            (Some [at]
+                  (let [m (al-elem (field c entries) at)]
+                    (if (measured-matches? c m text f width) at -1)))
+            (None [] -1))]
+    (if (>= hit 0)
+        (let [m (get (.entries c) hit)] (Size :w (.w m) :h (.h m)))
+        (let [size
+                (if (< width 0.0)
+                    (measure-line text f)
+                    (Size :w width :h (measure-wrapped text f width)))]
+          (when (or (>= (len (.entries c)) MEASURE-ENTRIES-LIMIT)
+                    (> (+ (len (.bytes c)) (len text))
+                       MEASURE-BYTES-LIMIT))
+            (hm-clear! (mut (.index c)))
+            (al-clear! (mut (.entries c)))
+            (al-clear! (mut (.bytes c)))
+            0)
+          (let [at (len (.bytes c))]
+            (al-extend! (mut (.bytes c)) (slice-data text) (len text))
+            (set! (mut (.index c)) key (len (.entries c)))
+            (push! (mut (.entries c))
+                   (Measured
+                     :font (p/cast i64 f)
+                     :width width
+                     :text-at at
+                     :text-len (len text)
+                     :w (.w size)
+                     :h (.h size))))
+          size))))
+
+(defn line-size [(text (slice u8)) (f (ptr i8))] (-> Size)
+  (text-size text f NO-WRAP))
+
+;;; Height of TEXT wrapped to WIDTH.
+(defn wrapped-height [(text (slice u8)) (f (ptr i8)) (width f64)] (-> f64)
+  (.h (text-size text f width)))
+
+;;; ---- warming text rendering ------------------------------------------------------
+(defn warm [(arg (ptr i8))] (-> (ptr i8))
+  (let [pool (new c"NSAutoreleasePool")
+        sizes
+          [10.0
+           10.5
+           11.0
+           11.5
+           12.0
+           12.5
+           13.0
+           14.0
+           14.5
+           15.0
+           16.0
+           18.0
+           21.0
+           25.0]]
+    (for [i 0 (len sizes)]
+      (for [variant 0 4]
+        (let [bold (!= (% variant 2) 0)
+              mono (>= variant 2)
+              f
+                (msg (ptr i8)
+                     (class c"NSFont")
+                     (if mono
+                         (sel c"monospacedSystemFontOfSize:weight:")
+                         (sel c"systemFontOfSize:weight:"))
+                     [f64 f64]
+                     (get sizes i)
+                     (if bold 0.4 0.0))]
+          (measure-line "The quick brown fox — (jumps) 0123456789 +−↻⎇▤…"
+                        f)
+          0)))
+    (release pool)
+    (p/cast (ptr i8) 0)))
+
+;;; The first font creation and text measurement in a process cost tens of
+;;; milliseconds. Pay them on a background thread at startup (CoreText is
+;;; thread-safe) so the first widget does not stall the main thread.
+;;; The first text field and text view in a process set up AppKit's text
+;;; system, 2-5 ms. Pay that here, at startup, rather than when a widget first
+;;; shows an input. Main thread only: views are AppKit objects.
+(defn warm-fields! [] (-> void)
+  (let [f
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSTextField") (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               (rect 0.0 0.0 INPUT-W INPUT-H))
+        tv
+          (msg (ptr i8)
+               (msg (ptr i8) (text-view-class) (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               (rect 0.0 0.0 (* INPUT-W 1.5) 60.0))]
+    (msg i64 f (sel c"setFont:") [(ptr i8)] (font 13.0 false false))
+    (msg i64 f (sel c"setStringValue:") [(ptr i8)] (ns c"warm"))
+    (msg i64 tv (sel c"setFont:") [(ptr i8)] (font 13.0 false false))
+    (msg i64 tv (sel c"setString:") [(ptr i8)] (ns c"warm"))
+    (release f)
+    (release tv)
+    (do)))
+
+;;; Warm text measurement on a background thread and native fields here.
+(defn prewarm! [] (-> void)
+  (let [started (p/alloc-static bool)]
+    (when (not (load started))
+      (set! started true)
+      (let [th (p/alloc-static thread/Thread)]
+        (thread/thread-spawn th (p/fnptr-of warm) (nil)))
+      (warm-fields!)
+      0)
+    (do)))
+
+;;; ---- geometry --------------------------------------------------------------
+(const BUTTON-PAD-X 10.0)
+
+(const BUTTON-PAD-Y 4.0)
+
+(const TOGGLE-BOX 14.0)
+
+(const TOGGLE-GAP 6.0)
+
+(const INPUT-H 24.0)
+
+(const INPUT-W 180.0)
+
+(const LINE-H 17.0)
+
+(defn ui [(w (ptr WidgetPane))] (-> (ptr api/Ui))
+  (field (.runtime w) ui))
+
+(defn node-count [(w (ptr WidgetPane))] (-> i64)
+  (len (.nodes (ui w))))
+
+(defn nd [(w (ptr WidgetPane)) (i i64)] (-> (ptr api/Node))
+  (api/node (ui w) i))
+
+(defn size-of [(w (ptr WidgetPane)) (i i64)] (-> (ptr Size))
+  (al-elem (field w sizes) i))
+
+(defn box-of [(w (ptr WidgetPane)) (i i64)] (-> (ptr Rect))
+  (al-elem (field w boxes) i))
+
+(defn pad-x [(n (ptr api/Node))] (-> f64)
+  (+ (.pad-left n) (.pad-right n)))
+
+(defn pad-y [(n (ptr api/Node))] (-> f64)
+  (+ (.pad-top n) (.pad-bottom n)))
+
+(defn margin-x [(n (ptr api/Node))] (-> f64)
+  (+ (.margin-left n) (.margin-right n)))
+
+(defn margin-y [(n (ptr api/Node))] (-> f64)
+  (+ (.margin-top n) (.margin-bottom n)))
+
+(defn max-f [(a f64) (b f64)] (-> f64)
+  (if (> a b) a b))
+
+(defn min-f [(a f64) (b f64)] (-> f64)
+  (if (< a b) a b))
+
+(defn max-i [(a i64) (b i64)] (-> i64)
+  (if (> a b) a b))
+
+(defn parent-kind [(w (ptr WidgetPane)) (n (ptr api/Node))] (-> i64)
+  (if (= (.parent n) api/NONE) api/NONE (.kind (nd w (.parent n)))))
+
+(defn in-flow? [(w (ptr WidgetPane)) (i i64)] (-> bool)
+  (!= (.kind (nd w i)) api/DIALOG))
+
+;;; Leaves that keep their natural width instead of stretching to a column.
+(defn intrinsic? [(n (ptr api/Node))] (-> bool)
+  (let [kind (.kind n)]
+    (or (= kind api/BUTTON)
+        (= kind api/TOGGLE)
+        (= kind api/TABLE)
+        (and (= kind api/TEXT) (!= (.background n) api/NONE)))))
+
+(defn natural [(w (ptr WidgetPane)) (i i64)] (-> f64)
+  (get (.natural w) i))
+
+(defn children-natural [(w (ptr WidgetPane)) (node (ptr api/Node)) (row bool)] (-> f64)
+  (let [(mut sum) 0.0
+        (mut widest) 0.0
+        (mut count) 0
+        (mut c) (.first-child node)]
+    (while (!= (load c) api/NONE)
+      (when (in-flow? w (load c))
+        (let [want (+ (natural w (load c)) (margin-x (nd w (load c))))]
+          (set! sum (+ (load sum) want))
+          (set! widest (max-f (load widest) want))
+          (set! count (+ (load count) 1)))
+        0)
+      (set! c (.next (nd w (load c)))))
+    (if row
+        (+ (load sum)
+           (if (> (load count) 1)
+               (* (.gap node) (p/cast f64 (- (load count) 1)))
+               0.0))
+        (load widest))))
+
+;;; A label's one-line size, or zero for elements without one.
+(defn label-size [(u (ptr api/Ui)) (node (ptr api/Node))] (-> Size)
+  (let [kind (.kind node)]
+    (if (or (= kind api/TEXT) (= kind api/BUTTON) (= kind api/TOGGLE))
+        (line-size (api/node-text u node) (node-font node))
+        (Size :w 0.0 :h 0.0))))
+
+;;; Natural border-box widths, children before parents.
+(defn measure-natural! [(w (ptr WidgetPane))] (-> void)
+  (let [n (node-count w)
+        u (ui w)]
+    (al-clear! (mut (.natural w)))
+    (al-clear! (mut (.line-heights w)))
+    (for [i 0 n]
+      (push! (mut (.natural w)) 0.0)
+      (push! (mut (.line-heights w)) 0.0))
+    (for [k 0 n]
+      (let [i (- (- n 1) k)
+            node (nd w i)
+            kind (.kind node)
+            ; One measurement per label: its height is kept for size!.
+            label (label-size u node)
+            _ (do (set! (al-elem (field w line-heights) i) (.h label)) 0)
+            content
+              (cond (= kind api/TEXT) (.w label)
+                    (= kind api/BUTTON) (+ (.w label) (* 2.0 BUTTON-PAD-X))
+                    (= kind api/TOGGLE) (+ (+ TOGGLE-BOX TOGGLE-GAP) (.w label))
+                    (= kind api/SPACER) (.width node)
+                    (= kind api/INPUT) INPUT-W
+                    (= kind api/TEXTAREA) (* INPUT-W 1.5)
+                    (= kind api/HSTACK) (children-natural w node true)
+                    (= kind api/TABLE) (table-natural w i)
+                    (api/container? kind) (children-natural w node false)
+                    :else 0.0)]
+        (set! (al-elem (field w natural) i)
+              (if (and (> (.width node) 0.0) (!= kind api/SPACER))
+                  (.width node)
+                  (+ content (pad-x node))))))
+    (do)))
+
+;;; Column widths of table I, from the widest cell in each column.
+(defn column-widths! [(w (ptr WidgetPane)) (i i64) (out (ptr (ArrayList f64)))] (-> void)
+  (let [node (nd w i)
+        columns (if (> (.columns node) 0) (.columns node) 1)
+        (mut c) (.first-child node)
+        (mut k) 0]
+    (al-clear! (mut out))
+    (for [j 0 columns] (push! (mut out) 0.0))
+    (while (!= (load c) api/NONE)
+      (let [col (% (load k) columns)
+            want (+ (natural w (load c)) (margin-x (nd w (load c))))]
+        (when (> want (get (load out) col)) (set! (al-elem out col) want) 0)
+        (set! k (+ (load k) 1))
+        (set! c (.next (nd w (load c))))))
+    (do)))
+
+(defn table-natural [(w (ptr WidgetPane)) (i i64)] (-> f64)
+  (let [(mut widths) (al-new [f64] (alloc/malloc-allocator))
+        node (nd w i)
+        (mut sum) 0.0]
+    (column-widths! w i (mut widths))
+    (for [j 0 (len widths)] (set! sum (+ (load sum) (get widths j))))
+    (let [gaps (* (.gap node) (p/cast f64 (max-i 0 (- (len widths) 1))))]
+      (al-free! (mut widths))
+      (+ (load sum) gaps))))
+
+;;; Give node I the border-box width WIDTH and size its subtree.
+(defn size! [(w (ptr WidgetPane)) (i i64) (width f64)] (-> void)
+  (let [node (nd w i)
+        kind (.kind node)
+        u (ui w)
+        own-w
+          (if (and (> (.width node) 0.0) (!= kind api/SPACER))
+              (.width node)
+              width)
+        inner (max-f 0.0 (- own-w (pad-x node)))
+        content-h
+          (cond (= kind api/TEXT)
+                  (if (.wrap node)
+                      (wrapped-height (api/node-text u node)
+                                      (node-font node)
+                                      inner)
+                      (get (.line-heights w) i))
+                (= kind api/BUTTON)
+                  (+ (get (.line-heights w) i)
+                     (* 2.0 BUTTON-PAD-Y))
+                (= kind api/TOGGLE)
+                  (max-f TOGGLE-BOX
+                         (get (.line-heights w) i))
+                (= kind api/DIVIDER) 1.0
+                (= kind api/SPACER)
+                  (if (= (parent-kind w node) api/HSTACK) 0.0 (.height node))
+                (= kind api/INPUT) INPUT-H
+                (= kind api/TEXTAREA)
+                  (+ 8.0
+                     (* LINE-H
+                        (p/cast f64 (if (> (.rows node) 0) (.rows node) 3))))
+                (= kind api/HSTACK) (size-row! w i inner)
+                (= kind api/TABLE) (size-table! w i inner)
+                (api/container? kind) (size-column! w i inner)
+                :else 0.0)
+        own-h
+          (if (and (> (.height node) 0.0) (!= kind api/SPACER))
+              (.height node)
+              (+ content-h (pad-y node)))]
+    (set! (al-elem (field w sizes) i)
+          (Size :w
+                  (if (and (= kind api/SPACER)
+                           (= (parent-kind w node) api/HSTACK))
+                      (.width node)
+                      own-w)
+            :h own-h))
+    (do)))
+
+;;; Width a column offers child C, whose parent has INNER width and ALIGN.
+(defn column-child-width [(w (ptr WidgetPane)) (c i64) (inner f64) (align i64)] (-> f64)
+  (let [child (nd w c)
+        room (max-f 0.0 (- inner (margin-x child)))]
+    (if (or (intrinsic? child) (!= align api/STRETCH))
+        (min-f (natural w c) room)
+        room)))
+
+(defn size-column! [(w (ptr WidgetPane)) (i i64) (inner f64)] (-> f64)
+  (let [node (nd w i)
+        (mut total) 0.0
+        (mut count) 0
+        (mut c) (.first-child node)]
+    (while (!= (load c) api/NONE)
+      (when (in-flow? w (load c))
+        (size! w (load c) (column-child-width w (load c) inner (.align node)))
+        (set! total
+              (+ (load total)
+                 (+ (.h (size-of w (load c))) (margin-y (nd w (load c))))))
+        (set! count (+ (load count) 1))
+        0)
+      (set! c (.next (nd w (load c)))))
+    (+ (load total)
+       (if (> (load count) 1)
+           (* (.gap node) (p/cast f64 (- (load count) 1)))
+           0.0))))
+
+(defn size-row! [(w (ptr WidgetPane)) (i i64) (inner f64)] (-> f64)
+  (let [node (nd w i)
+        (mut fixed) 0.0
+        (mut grow) 0.0
+        (mut count) 0
+        (mut c) (.first-child node)]
+    (while (!= (load c) api/NONE)
+      (let [child (nd w (load c))]
+        (when (in-flow? w (load c))
+          (set! fixed (+ (load fixed) (margin-x child)))
+          (if (> (.grow child) 0.0)
+              (set! grow (+ (load grow) (.grow child)))
+              (set! fixed (+ (load fixed) (natural w (load c)))))
+          (set! count (+ (load count) 1))
+          0)
+        (set! c (.next child))))
+    (let [gaps
+            (if (> (load count) 1)
+                (* (.gap node) (p/cast f64 (- (load count) 1)))
+                0.0)
+          spare (max-f 0.0 (- (- inner (load fixed)) gaps))
+          (mut tallest) 0.0]
+      (set! c (.first-child node))
+      (while (!= (load c) api/NONE)
+        (let [child (nd w (load c))]
+          (when (in-flow? w (load c))
+            (size! w
+                   (load c)
+                   (if (> (.grow child) 0.0)
+                       (* spare (/ (.grow child) (load grow)))
+                       (natural w (load c))))
+            (set! tallest
+                  (max-f (load tallest)
+                         (+ (.h (size-of w (load c))) (margin-y child))))
+            0)
+          (set! c (.next child))))
+      (when (= (.align node) api/STRETCH)
+        (set! c (.first-child node))
+        (while (!= (load c) api/NONE)
+          (let [child (nd w (load c))]
+            (when (and (in-flow? w (load c)) (<= (.height child) 0.0))
+              (set! (.h (size-of w (load c)))
+                    (- (load tallest) (margin-y child)))
+              0)
+            (set! c (.next child))))
+        0)
+      (load tallest))))
+
+(defn size-table! [(w (ptr WidgetPane)) (i i64) (inner f64)] (-> f64)
+  (let [node (nd w i)
+        columns (if (> (.columns node) 0) (.columns node) 1)
+        (mut widths) (al-new [f64] (alloc/malloc-allocator))
+        (mut sum) 0.0]
+    (column-widths! w i (mut widths))
+    (for [j 0 columns] (set! sum (+ (load sum) (get widths j))))
+    (let [gaps (* (.gap node) (p/cast f64 (- columns 1)))
+          scale
+            (if (and (> (load sum) 0.0) (> (+ (load sum) gaps) inner))
+                (/ (max-f 0.0 (- inner gaps)) (load sum))
+                1.0)
+          (mut total) 0.0
+          (mut row-h) 0.0
+          (mut k) 0
+          (mut c) (.first-child node)]
+      (while (!= (load c) api/NONE)
+        (let [col (% (load k) columns)
+              child (nd w (load c))]
+          (size! w
+                 (load c)
+                 (max-f 0.0 (- (* scale (get widths col)) (margin-x child))))
+          (set! row-h
+                (max-f (load row-h)
+                       (+ (.h (size-of w (load c))) (margin-y child))))
+          (when (or (= col (- columns 1)) (= (.next child) api/NONE))
+            (set! total (+ (load total) (+ (load row-h) (.gap node))))
+            (set! row-h 0.0)
+            0)
+          (set! k (+ (load k) 1))
+          (set! c (.next child))))
+      (al-free! (mut widths))
+      (max-f 0.0 (- (load total) (.gap node))))))
+
+(defn intersect [(a Rect) (b Rect)] (-> Rect)
+  (let [x (max-f (.x a) (.x b))
+        y (max-f (.y a) (.y b))
+        right (min-f (+ (.x a) (.w a)) (+ (.x b) (.w b)))
+        bottom (min-f (+ (.y a) (.h a)) (+ (.y b) (.h b)))]
+    (rect x y (max-f 0.0 (- right x)) (max-f 0.0 (- bottom y)))))
+
+(defn unbounded [] (-> Rect)
+  (rect -1000000.0 -1000000.0 2000000.0 2000000.0))
+
+;;; Position node I's border box at X,Y; CLIP bounds what it may draw.
+(defn place! [(w (ptr WidgetPane)) (i i64) (x f64) (y f64) (clip Rect)] (-> void)
+  (let [node (nd w i)
+        s (load (size-of w i))
+        box (rect x y (.w s) (.h s))
+        kind (.kind node)
+        inner-clip (if (.clip node) (intersect clip box) (intersect clip clip))
+        inner-w (- (.w s) (pad-x node))
+        inner-h (- (.h s) (pad-y node))]
+    (set! (al-elem (field w boxes) i) box)
+    (set! (al-elem (field w clips) i) clip)
+    (cond (= kind api/HSTACK)
+            (let [(mut cx) (+ x (.pad-left node))
+                  (mut c) (.first-child node)]
+              (while (!= (load c) api/NONE)
+                (let [child (nd w (load c))
+                      cs (load (size-of w (load c)))
+                      free (- (- inner-h (.h cs)) (margin-y child))
+                      offset
+                        (cond (= (.align node) api/CENTER) (/ free 2.0)
+                              (= (.align node) api/END) free
+                              :else 0.0)]
+                  (when (in-flow? w (load c))
+                    (place! w
+                            (load c)
+                            (+ (load cx) (.margin-left child))
+                            (+ (+ y (.pad-top node))
+                               (+ (.margin-top child) offset))
+                            inner-clip)
+                    (set! cx
+                          (+ (load cx)
+                             (+ (+ (.w cs) (margin-x child)) (.gap node))))
+                    0)
+                  (set! c (.next child))))
+              (do))
+          (= kind api/TABLE) (place-table! w i x y inner-clip)
+          (api/container? kind)
+            (let [(mut cy) (+ y (.pad-top node))
+                  (mut c) (.first-child node)]
+              (while (!= (load c) api/NONE)
+                (let [child (nd w (load c))
+                      cs (load (size-of w (load c)))
+                      free (- (- inner-w (.w cs)) (margin-x child))
+                      offset
+                        (cond (= (.align node) api/CENTER) (/ free 2.0)
+                              (= (.align node) api/END) free
+                              :else 0.0)]
+                  (when (in-flow? w (load c))
+                    (place! w
+                            (load c)
+                            (+ (+ x (.pad-left node))
+                               (+ (.margin-left child) offset))
+                            (+ (load cy) (.margin-top child))
+                            inner-clip)
+                    (set! cy
+                          (+ (load cy)
+                             (+ (+ (.h cs) (margin-y child)) (.gap node))))
+                    0)
+                  (set! c (.next child))))
+              (do))
+          :else (do))
+    (do)))
+
+(defn place-table! [(w (ptr WidgetPane)) (i i64) (x f64) (y f64) (clip Rect)] (-> void)
+  (let [node (nd w i)
+        columns (if (> (.columns node) 0) (.columns node) 1)
+        (mut cx) (+ x (.pad-left node))
+        (mut cy) (+ y (.pad-top node))
+        (mut row-h) 0.0
+        (mut k) 0
+        (mut c) (.first-child node)]
+    (while (!= (load c) api/NONE)
+      (let [col (% (load k) columns)
+            child (nd w (load c))
+            cs (load (size-of w (load c)))]
+        (when (= col 0) (set! cx (+ x (.pad-left node))) 0)
+        (place! w
+                (load c)
+                (+ (load cx) (.margin-left child))
+                (+ (load cy) (.margin-top child))
+                clip)
+        (set! row-h (max-f (load row-h) (+ (.h cs) (margin-y child))))
+        ; Every cell in a column has that column's width, so the cell's own
+        ; width advances to the next column.
+        (set! cx (+ (load cx) (+ (+ (.w cs) (margin-x child)) (.gap node))))
+        (when (or (= col (- columns 1)) (= (.next child) api/NONE))
+          (set! cy (+ (load cy) (+ (load row-h) (.gap node))))
+          (set! row-h 0.0)
+          0)
+        (set! k (+ (load k) 1))
+        (set! c (.next child))))
+    (do)))
+
+(defn view-bounds [(w (ptr WidgetPane))] (-> Rect)
+  (msg Rect (.view w) (sel c"bounds") []))
+
+(defn max-scroll [(w (ptr WidgetPane))] (-> f64)
+  (max-f 0.0 (- (.content-h w) (rect-h (view-bounds w)))))
+
+(defn clamp-scroll! [(w (ptr WidgetPane))] (-> void)
+  (set! (.scroll w) (min-f (max-f 0.0 (.scroll w)) (max-scroll w)))
+  (do))
+
+(defn layout! [(w (ptr WidgetPane))] (-> void)
+  (let [n (node-count w)
+        bounds (view-bounds w)]
+    (measure-natural! w)
+    (al-clear! (mut (.sizes w)))
+    (al-clear! (mut (.boxes w)))
+    (al-clear! (mut (.clips w)))
+    (for [i 0 n]
+      (push! (mut (.sizes w)) (Size :w 0.0 :h 0.0))
+      (push! (mut (.boxes w)) (rect 0.0 0.0 0.0 0.0))
+      (push! (mut (.clips w)) (unbounded)))
+    (set! (.dialog w) api/NONE)
+    (when (> n 0)
+      (let [root (nd w 0)]
+        (size! w 0 (max-f 0.0 (- (.w bounds) (margin-x root))))
+        (place! w 0 (.margin-left root) (.margin-top root) (unbounded))
+        (set! (.content-h w) (+ (.h (size-of w 0)) (margin-y root))))
+      0)
+    ; Dialogs sit outside the flow, centered in the visible part of the pane.
+    (for [i 0 n]
+      (when (= (.kind (nd w i)) api/DIALOG)
+        (let [dw (min-f (natural w i) (- (.w bounds) 40.0))]
+          (size! w i dw)
+          (let [dh (.h (size-of w i))]
+            (place! w
+                    i
+                    (/ (- (.w bounds) dw) 2.0)
+                    (+ (.scroll w) (max-f 20.0 (/ (- (.h bounds) dh) 2.0)))
+                    (unbounded))))
+        (set! (.dialog w) i)
+        0))
+    (do)))
+
+;;; ---- text fields -----------------------------------------------------------
+(defn field-delegate-class [] (-> (ptr i8))
+  (let [existing (class c"JimWidgetFieldDelegate")]
+    (if (!= (p/cast i64 existing) 0)
+        existing
+        (let [cls
+                (objc_allocateClassPair (class c"NSObject")
+                                        c"JimWidgetFieldDelegate"
+                                        0)]
+          (method! cls
+                   c"controlTextDidChange:"
+                   (p/cast (ptr i8) (p/fnptr-of field-changed))
+                   c"v@:@")
+          (method! cls
+                   c"control:textView:doCommandBySelector:"
+                   (p/cast (ptr i8) (p/fnptr-of field-command))
+                   c"c@:@@:")
+          (method! cls
+                   c"textDidChange:"
+                   (p/cast (ptr i8) (p/fnptr-of text-changed))
+                   c"v@:@")
+          (objc_registerClassPair cls)
+          cls))))
+
+(defn field-delegate [] (-> (ptr i8))
+  (let [cell (p/alloc-static (ptr i8))]
+    (when (= (p/cast i64 (load cell)) 0)
+      (set! cell
+            (msg (ptr i8)
+                 (msg (ptr i8) (field-delegate-class) (sel c"alloc") [])
+                 (sel c"init")
+                 []))
+      0)
+    (load cell)))
+
+(defstruct ObjcSuper [(receiver (ptr i8)) (super-class (ptr i8))])
+
+(extern objc_msgSendSuper :cc c [(ptr ObjcSuper) (ptr i8) (ptr i8)] (-> void))
+
+;;; ⌘Return submits a text area; every other key goes to NSTextView.
+(defn text-view-key [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [flags (msg u64 event (sel c"modifierFlags") [])
+        key (msg u16 event (sel c"keyCode") [])]
+    (if (and (!= (& flags 1048576) (p/cast u64 0)) (= key (p/cast u16 36)))
+        (deliver-field! self (msg (ptr i8) self (sel c"string") []) true)
+        (let [(mut sup)
+                (ObjcSuper :receiver self :super-class (class c"NSTextView"))]
+          (objc_msgSendSuper (mut sup) cmd event)))
+    (do)))
+
+(defn text-view-class [] (-> (ptr i8))
+  (let [existing (class c"JimWidgetTextView")]
+    (if (!= (p/cast i64 existing) 0)
+        existing
+        (let [cls
+                (objc_allocateClassPair (class c"NSTextView")
+                                        c"JimWidgetTextView"
+                                        0)]
+          (method! cls
+                   c"keyDown:"
+                   (p/cast (ptr i8) (p/fnptr-of text-view-key))
+                   c"v@:@")
+          (objc_registerClassPair cls)
+          cls))))
+
+;;; Deliver an edit from native view V (a field or text view carrying the pane
+;;; and element id), then re-render.
+(defn deliver-field! [(v (ptr i8)) (text (ptr i8)) (submit bool)] (-> void)
+  (let [w (p/cast (ptr WidgetPane) (objc_getAssociatedObject v (pane-key)))
+        id (objc_getAssociatedObject v (id-key))]
+    (when (and (live-pane? w) (!= (p/cast i64 id) 0))
+      (widgets/input! (.runtime w) (string-bytes id) (string-bytes text) submit)
+      (set! (.state-dirty w) true)
+      (refresh! w)
+      0)
+    (do)))
+
+(defn field-changed [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (let [v (msg (ptr i8) note (sel c"object") [])]
+    (deliver-field! v (msg (ptr i8) v (sel c"stringValue") []) false)))
+
+(defn text-changed [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (let [v (msg (ptr i8) note (sel c"object") [])]
+    (deliver-field! v (msg (ptr i8) v (sel c"string") []) false)))
+
+(defn field-command [(self (ptr i8))
+                     (cmd (ptr i8))
+                     (control (ptr i8))
+                     (text-view (ptr i8))
+                     (command (ptr i8))] (-> i8)
+  (if (= (p/cast i64 command) (p/cast i64 (sel c"insertNewline:")))
+      (do
+        (deliver-field! control
+                        (msg (ptr i8) control (sel c"stringValue") [])
+                        true)
+        (p/cast i8 1))
+      (p/cast i8 0)))
+
+(defn tag-view! [(w (ptr WidgetPane)) (v (ptr i8)) (id (slice u8))] (-> void)
+  (objc_setAssociatedObject v (pane-key) (p/cast (ptr i8) w) 0)
+  ; OBJC_ASSOCIATION_RETAIN_NONATOMIC: the view keeps its id string.
+  (objc_setAssociatedObject v (id-key) (string id) 1)
+  (do))
+
+(defn make-field! [(w (ptr WidgetPane)) (kind i64) (id (slice u8))] (-> Field)
+  (let [a (alloc/malloc-allocator)
+        (mut owned) (al-new [u8] a)]
+    (al-extend! (mut owned) (slice-data id) (len id))
+    (if (= kind api/INPUT)
+        (let [f
+                (msg (ptr i8)
+                     (msg (ptr i8) (class c"NSTextField") (sel c"alloc") [])
+                     (sel c"initWithFrame:")
+                     [Rect]
+                     (rect 0.0 0.0 INPUT-W INPUT-H))]
+          (msg i64 f (sel c"setBezelStyle:") [u64] (p/cast u64 1))
+          (msg i64 f (sel c"setUsesSingleLineMode:") [i8] (p/cast i8 1))
+          (let [cell (msg (ptr i8) f (sel c"cell") [])]
+            (msg i64 cell (sel c"setWraps:") [i8] (p/cast i8 0))
+            (msg i64 cell (sel c"setScrollable:") [i8] (p/cast i8 1)))
+          (msg i64 f (sel c"setFont:") [(ptr i8)] (font 13.0 false false))
+          (msg i64 f (sel c"setDelegate:") [(ptr i8)] (field-delegate))
+          (tag-view! w f id)
+          (msg i64 (.view w) (sel c"addSubview:") [(ptr i8)] f)
+          (Field
+            :id (load owned)
+            :view f
+            :editor f
+            :kind kind
+            :seen true))
+        (let [scroll
+                (msg (ptr i8)
+                     (msg (ptr i8) (class c"NSScrollView") (sel c"alloc") [])
+                     (sel c"initWithFrame:")
+                     [Rect]
+                     (rect 0.0 0.0 (* INPUT-W 1.5) 60.0))
+              tv
+                (msg (ptr i8)
+                     (msg (ptr i8) (text-view-class) (sel c"alloc") [])
+                     (sel c"initWithFrame:")
+                     [Rect]
+                     (rect 0.0 0.0 (* INPUT-W 1.5) 60.0))]
+          (msg i64 scroll (sel c"setHasVerticalScroller:") [i8] (p/cast i8 1))
+          (msg i64 scroll (sel c"setBorderType:") [u64] (p/cast u64 2))
+          (msg i64 tv (sel c"setRichText:") [i8] (p/cast i8 0))
+          (msg i64 tv (sel c"setFont:") [(ptr i8)] (font 13.0 false false))
+          (msg i64 tv (sel c"setVerticallyResizable:") [i8] (p/cast i8 1))
+          (msg i64 tv (sel c"setHorizontallyResizable:") [i8] (p/cast i8 0))
+          (msg i64 tv (sel c"setAutoresizingMask:") [u64] (p/cast u64 2))
+          (msg i64
+               tv
+               (sel c"setTextContainerInset:")
+               [Size]
+               (Size :w 2.0 :h 4.0))
+          (msg i64
+               (msg (ptr i8) tv (sel c"textContainer") [])
+               (sel c"setWidthTracksTextView:")
+               [i8]
+               (p/cast i8 1))
+          (msg i64 tv (sel c"setDelegate:") [(ptr i8)] (field-delegate))
+          (msg i64 scroll (sel c"setDocumentView:") [(ptr i8)] tv)
+          (tag-view! w tv id)
+          (msg i64 (.view w) (sel c"addSubview:") [(ptr i8)] scroll)
+          (release tv)
+          (Field
+            :id (load owned)
+            :view scroll
+            :editor tv
+            :kind kind
+            :seen true)))))
+
+(defn find-field [(w (ptr WidgetPane)) (kind i64) (id (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (len (.fields w))]
+      (let [f (al-elem (field w fields) i)]
+        (when (and (= (.kind f) kind) (= (al-slice (.id f)) id))
+          (set! found i)
+          0)))
+    (load found)))
+
+(defn editing? [(w (ptr WidgetPane)) (f (ptr Field))] (-> bool)
+  (let [window (msg (ptr i8) (.view w) (sel c"window") [])
+        responder
+          (if (= (p/cast i64 window) 0)
+              (nil)
+              (msg (ptr i8) window (sel c"firstResponder") []))]
+    (if (= (.kind f) api/INPUT)
+        (!= (p/cast i64 (msg (ptr i8) (.editor f) (sel c"currentEditor") [])) 0)
+        (= (p/cast i64 responder) (p/cast i64 (.editor f))))))
+
+(defn free-field! [(f (ptr Field))] (-> void)
+  (objc_setAssociatedObject (.editor f) (pane-key) (nil) 0)
+  (msg i64 (.view f) (sel c"removeFromSuperview") [])
+  (release (.view f))
+  (al-free! (mut (.id f)))
+  (do))
+
+(defn same-string? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (!= (msg i8 a (sel c"isEqualToString:") [(ptr i8)] b) (p/cast i8 0)))
+
+;;; Create, move and update the native views for the current frame's fields;
+;;; remove the ones the frame no longer has.
+(defn sync-fields! [(w (ptr WidgetPane))] (-> void)
+  (let [u (ui w)]
+    (for [i 0 (len (.fields w))]
+      (set! (.seen (al-elem (field w fields) i)) false))
+    (when (.shown w)
+      (for [i 0 (node-count w)]
+        (let [n (nd w i)
+              kind (.kind n)]
+          (when (or (= kind api/INPUT) (= kind api/TEXTAREA))
+            (let [id (api/node-id u n)
+                  existing (find-field w kind id)
+                  index
+                    (if (>= existing 0)
+                        existing
+                        (do
+                          (push! (mut (.fields w)) (make-field! w kind id))
+                          (- (len (.fields w)) 1)))
+                  f (al-elem (field w fields) index)
+                  b (load (box-of w i))
+                  clip (get (.clips w) i)
+                  ; Native views draw above the widget, so a dialog hides the
+                  ; fields beneath it rather than being covered by them.
+                  visible
+                    (and (> (rect-h (intersect b clip)) 0.0)
+                         (or (= (.dialog w) api/NONE) (inside-dialog? w i)))
+                  value (string (api/node-text u n))]
+              (set! (.seen f) true)
+              (frame! (.view f)
+                      (rect (.x b) (- (.y b) (.scroll w)) (.w b) (.h b)))
+              (msg i64
+                   (.view f)
+                   (sel c"setHidden:")
+                   [i8]
+                   (p/cast i8 (if visible 0 1)))
+              (when (not (editing? w f))
+                (if (= kind api/INPUT)
+                    (when (not (same-string? (msg (ptr i8)
+                                                  (.editor f)
+                                                  (sel c"stringValue")
+                                                  [])
+                                             value))
+                      (msg i64
+                           (.editor f)
+                           (sel c"setStringValue:")
+                           [(ptr i8)]
+                           value)
+                      0)
+                    (when (not (same-string? (msg (ptr i8)
+                                                  (.editor f)
+                                                  (sel c"string")
+                                                  [])
+                                             value))
+                      (msg i64 (.editor f) (sel c"setString:") [(ptr i8)] value)
+                      0))
+                0)
+              ; NSTextView takes a placeholder only on systems that support it.
+              (when (!= (msg i8
+                             (.editor f)
+                             (sel c"respondsToSelector:")
+                             [(ptr i8)]
+                             (sel c"setPlaceholderString:"))
+                        (p/cast i8 0))
+                (msg i64
+                     (.editor f)
+                     (sel c"setPlaceholderString:")
+                     [(ptr i8)]
+                     (string (api/node-placeholder u n)))
+                0))
+            0))))
+    ; Drop fields the frame no longer mentions, keeping order for the rest.
+    (let [(mut k) 0]
+      (for [i 0 (len (.fields w))]
+        (let [f (get (.fields w) i)]
+          (if (.seen f)
+              (do
+                (set! (al-elem (field w fields) (load k)) f)
+                (set! k (+ (load k) 1))
+                0)
+              (do (free-field! (al-elem (field w fields) i)) 0))))
+      (set! (.len (field w fields)) (load k)))
+    (do)))
+
+;;; ---- rendering -------------------------------------------------------------
+(defn note-title! [(w (ptr WidgetPane))] (-> void)
+  (let [t (api/title (ui w))]
+    (when (not (= t (al-slice (.title w))))
+      (al-clear! (mut (.title w)))
+      (al-extend! (mut (.title w)) (slice-data t) (len t))
+      (set! (.title-dirty w) true)
+      0)
+    (do)))
+
+;;; Re-render the widget at the view's current size and scroll, and redraw.
+(defn refresh! [(w (ptr WidgetPane))] (-> void)
+  (let [bounds (view-bounds w)]
+    (clamp-scroll! w)
+    (set! (.shown w)
+          (widgets/render! (.runtime w) (.w bounds) (.h bounds) (.scroll w)))
+    (when (.shown w)
+      (layout! w)
+      (clamp-scroll! w)
+      (note-title! w)
+      0)
+    (when (>= (.hovered w) (node-count w)) (set! (.hovered w) api/NONE) 0)
+    (when (>= (.pressed w) (node-count w)) (set! (.pressed w) api/NONE) 0)
+    (sync-fields! w)
+    (when (.shown w) (sync-watches! w) 0)
+    (msg i64 (.view w) (sel c"setNeedsDisplay:") [i8] (p/cast i8 1))
+    (do)))
+
+(defn fill! [(r Rect) (ink (ptr i8)) (radius f64)] (-> void)
+  (msg i64 ink (sel c"set") [])
+  (msg i64
+       (msg (ptr i8)
+            (class c"NSBezierPath")
+            (sel c"bezierPathWithRoundedRect:xRadius:yRadius:")
+            [Rect f64 f64]
+            r
+            radius
+            radius)
+       (sel c"fill")
+       [])
+  (do))
+
+(defn stroke! [(r Rect) (ink (ptr i8)) (radius f64)] (-> void)
+  (msg i64 ink (sel c"set") [])
+  (let [path
+          (msg (ptr i8)
+               (class c"NSBezierPath")
+               (sel c"bezierPathWithRoundedRect:xRadius:yRadius:")
+               [Rect f64 f64]
+               (rect (+ (.x r) 0.5)
+                     (+ (.y r) 0.5)
+                     (- (.w r) 1.0)
+                     (- (.h r) 1.0))
+               radius
+               radius)]
+    (msg i64 path (sel c"setLineWidth:") [f64] 1.0)
+    (msg i64 path (sel c"stroke") []))
+  (do))
+
+(defn draw-text! [(text (slice u8)) (at Point) (f (ptr i8)) (color i64)] (-> void)
+  (msg i64
+       (string text)
+       (sel c"drawAtPoint:withAttributes:")
+       [Point (ptr i8)]
+       at
+       (attrs f color))
+  (do))
+
+(defn draw-wrapped! [(text (slice u8)) (r Rect) (f (ptr i8)) (color i64)] (-> void)
+  (msg i64
+       (string text)
+       (sel c"drawInRect:withAttributes:")
+       [Rect (ptr i8)]
+       r
+       (attrs f color))
+  (do))
+
+(defn button-fill [(n (ptr api/Node)) (hot bool) (pressed bool)] (-> i64)
+  (let [variant (.variant n)]
+    (cond pressed 0x4a90c8
+          (= variant api/SELECTED) (if hot 0x46699a 0x3b5b86)
+          (= variant api/PRIMARY) (if hot 0x3a8260 0x2f6f4f)
+          (= variant api/DANGER) (if hot 0x7d333a 0x6b2a30)
+          (= variant api/GHOST) (if hot 0x2b3340 api/NONE)
+          :else (if hot 0x353f4f 0x2b3340))))
+
+(defn content-rect [(n (ptr api/Node)) (b Rect)] (-> Rect)
+  (rect (+ (.x b) (.pad-left n))
+        (+ (.y b) (.pad-top n))
+        (max-f 0.0 (- (.w b) (pad-x n)))
+        (max-f 0.0 (- (.h b) (pad-y n)))))
+
+(defn draw-node! [(w (ptr WidgetPane)) (i i64)] (-> void)
+  (let [u (ui w)
+        n (nd w i)
+        b (load (box-of w i))
+        kind (.kind n)
+        c (content-rect n b)
+        hot (= (.hovered w) i)
+        clickable (and (api/container? kind) (> (.id-len n) 0))
+        fill
+          (cond (and clickable (.checked n))
+                  (if (!= (.background n) api/NONE) (.background n) 0x243142)
+                (and clickable hot) 0x222a36
+                :else (.background n))]
+    (when (and (!= fill api/NONE) (!= kind api/BUTTON))
+      (fill! b (rgb fill) (.radius n))
+      0)
+    (when (!= (.border n) api/NONE) (stroke! b (rgb (.border n)) (.radius n)) 0)
+    (cond (= kind api/TEXT)
+            (if (.wrap n)
+                (draw-wrapped! (api/node-text u n)
+                               c
+                               (node-font n)
+                               (.color n))
+                (draw-text! (api/node-text u n)
+                            (Point :x (.x c) :y (.y c))
+                            (node-font n)
+                            (.color n)))
+          (= kind api/BUTTON)
+            (let [bf (button-fill n hot (= (.pressed w) i))]
+              (when (!= bf api/NONE) (fill! b (rgb bf) 5.0) 0)
+              (draw-text! (api/node-text u n)
+                          (Point :x (+ (.x c) BUTTON-PAD-X)
+                            :y (+ (.y c) BUTTON-PAD-Y))
+                          (node-font n)
+                          0xe1e6ee))
+          (= kind api/TOGGLE)
+            (let [box
+                    (rect (.x c)
+                          (+ (.y c) (/ (- (.h c) TOGGLE-BOX) 2.0))
+                          TOGGLE-BOX
+                          TOGGLE-BOX)]
+              (fill! box (rgb (if hot 0x6d7789 0x5a6372)) 3.0)
+              (fill! (rect (+ (.x box) 1.5)
+                           (+ (.y box) 1.5)
+                           (- TOGGLE-BOX 3.0)
+                           (- TOGGLE-BOX 3.0))
+                     (rgb (if (.checked n) 0x66c7f5 0x1b2029))
+                     2.0)
+              (draw-text! (api/node-text u n)
+                          (Point :x (+ (.x c) (+ TOGGLE-BOX TOGGLE-GAP))
+                            :y (.y c))
+                          (node-font n)
+                          (.color n)))
+          (= kind api/DIVIDER) (fill! b (rgb 0x2c323c) 0.0)
+          :else (do))
+    (do)))
+
+(defn inside-dialog? [(w (ptr WidgetPane)) (i i64)] (-> bool)
+  (let [(mut at) i
+        (mut found) false]
+    (while (!= (load at) api/NONE)
+      (when (= (.kind (nd w (load at))) api/DIALOG) (set! found true) 0)
+      (set! at (.parent (nd w (load at)))))
+    (load found)))
+
+(defn gsave! [] (-> void)
+  (msg i64 (class c"NSGraphicsContext") (sel c"saveGraphicsState") [])
+  (do))
+
+(defn grestore! [] (-> void)
+  (msg i64 (class c"NSGraphicsContext") (sel c"restoreGraphicsState") [])
+  (do))
+
+(extern NSRectClip :cc c [Rect] (-> void))
+
+(defn draw-pass! [(w (ptr WidgetPane)) (dialogs bool) (visible Rect)] (-> void)
+  (for [i 0 (node-count w)]
+    (when (= (inside-dialog? w i) dialogs)
+      (let [clip (get (.clips w) i)
+            shown (intersect (intersect (load (box-of w i)) clip) visible)]
+        (when (and (> (.w shown) 0.0) (> (.h shown) 0.0))
+          (let [limited (< (.w clip) 1000000.0)]
+            (when limited (gsave!) (NSRectClip clip) 0)
+            (draw-node! w i)
+            (when limited (grestore!) 0))
+          0))
+      0))
+  (do))
+
+(defn draw [(self (ptr i8)) (cmd (ptr i8)) (dirty Rect)] (-> void)
+  (let [w (pane-of self)
+        bounds (msg Rect self (sel c"bounds") [])]
+    (when (live-pane? w)
+      (let [diagnostic (widgets/diagnostic (.runtime w))]
+        (if (.shown w)
+            (let [visible (rect 0.0 (.scroll w) (.w bounds) (.h bounds))
+                  t
+                    (msg (ptr i8)
+                         (class c"NSAffineTransform")
+                         (sel c"transform")
+                         [])]
+              (gsave!)
+              (msg i64
+                   t
+                   (sel c"translateXBy:yBy:")
+                   [f64 f64]
+                   0.0
+                   (- 0.0 (.scroll w)))
+              (msg i64 t (sel c"concat") [])
+              (draw-pass! w false visible)
+              (when (!= (.dialog w) api/NONE)
+                (fill! visible (color 0.0 0.0 0.0 0.45) 0.0)
+                (draw-pass! w true visible)
+                0)
+              (grestore!)
+              ; The last good generation keeps running; say why the edit did not load.
+              (when (> (len diagnostic) 0)
+                (let [band (rect 0.0 (- (.h bounds) 64.0) (.w bounds) 64.0)]
+                  (fill! band (rgb 0x3a1f24) 0.0)
+                  (draw-wrapped! diagnostic
+                                 (rect 10.0
+                                       (+ (.y band) 6.0)
+                                       (- (.w bounds) 20.0)
+                                       52.0)
+                                 (font 11.0 false false)
+                                 0xf0b4b4))
+                0)
+              0)
+            (do
+              (draw-wrapped! (if (> (len diagnostic) 0)
+                                 diagnostic
+                                 "Loading widget…")
+                             (rect 14.0
+                                   14.0
+                                   (- (.w bounds) 28.0)
+                                   (- (.h bounds) 28.0))
+                             (font 12.0 false false)
+                             0xf0b4b4)
+              0)))
+      0)
+    (do)))
+
+(export-c [draw :as "jim_widget_draw"])
+
+(defn flipped [(self (ptr i8)) (cmd (ptr i8))] (-> i8)
+  (p/cast i8 1))
+
+(defn accepts [(self (ptr i8)) (cmd (ptr i8))] (-> i8)
+  (p/cast i8 1))
+
+;;; ---- pointer ---------------------------------------------------------------
+(defn contains? [(r Rect) (pt Point)] (-> bool)
+  (and (>= (.x pt) (.x r))
+       (< (.x pt) (+ (.x r) (.w r)))
+       (>= (.y pt) (.y r))
+       (< (.y pt) (+ (.y r) (.h r)))))
+
+;;; The deepest element under content point PT that reacts to clicks. While a
+;;; dialog is open only its elements do.
+(defn hit [(w (ptr WidgetPane)) (pt Point)] (-> i64)
+  (let [(mut found) api/NONE]
+    (when (.shown w)
+      (for [i 0 (node-count w)]
+        (when (and (widgets/active? (.runtime w) i)
+                   (contains? (intersect (load (box-of w i))
+                                         (get (.clips w) i))
+                              pt)
+                   (or (= (.dialog w) api/NONE) (inside-dialog? w i)))
+          (set! found i)
+          0))
+      0)
+    (load found)))
+
+(defn local [(self (ptr i8)) (event (ptr i8))] (-> Point)
+  (let [w (pane-of self)
+        pt
+          (msg Point
+               self
+               (sel c"convertPoint:fromView:")
+               [Point (ptr i8)]
+               (msg Point event (sel c"locationInWindow") [])
+               (nil))]
+    (Point :x (.x pt) :y (+ (.y pt) (if (live-pane? w) (.scroll w) 0.0)))))
+
+(defn mouse-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [w (pane-of self)]
+    (when (live-pane? w)
+      (set! (.pressed w) (hit w (local self event)))
+      (msg i64 self (sel c"setNeedsDisplay:") [i8] (p/cast i8 1))
+      0)
+    (do)))
+
+;;; Activate on release over the pressed element, like AppKit buttons.
+(defn mouse-up [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [w (pane-of self)]
+    (when (live-pane? w)
+      (let [pressed (.pressed w)]
+        (set! (.pressed w) api/NONE)
+        (when (and (!= pressed api/NONE) (= (hit w (local self event)) pressed))
+          (widgets/activate! (.runtime w) pressed)
+          (set! (.state-dirty w) true)
+          0)
+        (refresh! w))
+      0)
+    (do)))
+
+(defn mouse-moved [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [w (pane-of self)]
+    (when (live-pane? w)
+      (let [h (hit w (local self event))]
+        (when (!= h (.hovered w))
+          (set! (.hovered w) h)
+          (msg i64 self (sel c"setNeedsDisplay:") [i8] (p/cast i8 1))
+          0))
+      0)
+    (do)))
+
+(defn mouse-exited [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [w (pane-of self)]
+    (when (and (live-pane? w) (!= (.hovered w) api/NONE))
+      (set! (.hovered w) api/NONE)
+      (msg i64 self (sel c"setNeedsDisplay:") [i8] (p/cast i8 1))
+      0)
+    (do)))
+
+(defn scroll-wheel [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
+  (let [w (pane-of self)]
+    (when (live-pane? w)
+      (let [precise
+              (!= (msg i8 event (sel c"hasPreciseScrollingDeltas") [])
+                  (p/cast i8 0))
+            dy
+              (* (msg f64 event (sel c"scrollingDeltaY") [])
+                 (if precise 1.0 16.0))
+            before (.scroll w)]
+        (set! (.scroll w) (- (.scroll w) dy))
+        (clamp-scroll! w)
+        (when (or (< before (.scroll w)) (> before (.scroll w))) (refresh! w) 0))
+      0)
+    (do)))
+
+(defn view-class [] (-> (ptr i8))
+  (let [existing (class c"JimWidgetView")]
+    (if (!= (p/cast i64 existing) 0)
+        existing
+        (let [cls (objc_allocateClassPair (class c"NSView") c"JimWidgetView" 0)]
+          (method! cls
+                   c"drawRect:"
+                   (p/cast (ptr i8) (p/fnptr-of draw))
+                   c"v@:{CGRect={CGPoint=dd}{CGSize=dd}}")
+          (method! cls
+                   c"isFlipped"
+                   (p/cast (ptr i8) (p/fnptr-of flipped))
+                   c"c@:")
+          (method! cls
+                   c"acceptsFirstResponder"
+                   (p/cast (ptr i8) (p/fnptr-of accepts))
+                   c"c@:")
+          (method! cls
+                   c"acceptsFirstMouse:"
+                   (p/cast (ptr i8) (p/fnptr-of accepts))
+                   c"c@:@")
+          (method! cls
+                   c"mouseDown:"
+                   (p/cast (ptr i8) (p/fnptr-of mouse-down))
+                   c"v@:@")
+          (method! cls
+                   c"mouseUp:"
+                   (p/cast (ptr i8) (p/fnptr-of mouse-up))
+                   c"v@:@")
+          (method! cls
+                   c"mouseMoved:"
+                   (p/cast (ptr i8) (p/fnptr-of mouse-moved))
+                   c"v@:@")
+          (method! cls
+                   c"mouseExited:"
+                   (p/cast (ptr i8) (p/fnptr-of mouse-exited))
+                   c"v@:@")
+          (method! cls
+                   c"scrollWheel:"
+                   (p/cast (ptr i8) (p/fnptr-of scroll-wheel))
+                   c"v@:@")
+          (objc_registerClassPair cls)
+          cls))))
+
+;;; ---- the compile worker wakes the main loop -----------------------------------
+
+;;; Runs on the compile worker after each job: post an application-defined
+;;; event so the main loop, which may be waiting in nextEvent, runs at once.
+(defn wake-main [] (-> void)
+  (let [pool (new c"NSAutoreleasePool")
+        event
+          (msg (ptr i8)
+               (class c"NSEvent")
+               (sel c"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:")
+               [u64 Point u64 f64 i64 (ptr i8) i16 i64 i64]
+               (p/cast u64 15)
+               (Point :x 0.0 :y 0.0)
+               (p/cast u64 0)
+               0.0
+               0
+               (nil)
+               (p/cast i16 0)
+               0
+               0)]
+    (msg i64
+         (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") [])
+         (sel c"postEvent:atStart:")
+         [(ptr i8) i8]
+         event
+         (p/cast i8 0))
+    (release pool)
+    (do)))
+
+;;; ---- file watches ----------------------------------------------------------------
+(defstruct FSContext
+  [(version i64)
+   (info (ptr i8))
+   (retain (ptr i8))
+   (release (ptr i8))
+   (describe (ptr i8))])
+
+(extern FSEventStreamCreate
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr FSContext) (ptr i8) u64 f64 u32]
+        (-> (ptr i8)))
+
+(extern FSEventStreamScheduleWithRunLoop
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr i8)]
+        (-> void))
+
+(extern FSEventStreamStart :cc c [(ptr i8)] (-> i8))
+
+(extern FSEventStreamStop :cc c [(ptr i8)] (-> void))
+
+(extern FSEventStreamInvalidate :cc c [(ptr i8)] (-> void))
+
+(extern FSEventStreamRelease :cc c [(ptr i8)] (-> void))
+
+(extern CFRunLoopGetMain :cc c [] (-> (ptr i8)))
+
+;;; kFSEventStreamEventIdSinceNow, all bits set
+(const SINCE-NOW -1)
+
+;;; kFSEventStreamCreateFlagFileEvents
+(const FILE-EVENTS 16)
+
+(defn stop-watching! [(w (ptr WidgetPane))] (-> void)
+  (when (!= (p/cast i64 (.stream w)) 0)
+    (FSEventStreamStop (.stream w))
+    (FSEventStreamInvalidate (.stream w))
+    (FSEventStreamRelease (.stream w))
+    (set! (.stream w) (nil))
+    0)
+  (do))
+
+(defn line-at [(text (slice u8)) (n i64)] (-> (slice u8))
+  (let [(mut start) 0
+        (mut seen) 0
+        (mut found) ""]
+    (for [i 0 (+ (len text) 1)]
+      (when (or (= i (len text)) (= (get text i) (p/cast u8 10)))
+        (when (= (load seen) n) (set! found (subslice text (load start) i)) 0)
+        (set! seen (+ (load seen) 1))
+        (set! start (+ i 1))
+        0))
+    (load found)))
+
+(defn starts-with? [(s (slice u8)) (prefix (slice u8))] (-> bool)
+  (and (>= (len s) (len prefix)) (= (subslice s 0 (len prefix)) prefix)))
+
+;;; FSEvents callback, on the main run loop: tell the widget which paths
+;;; changed, then re-render.
+(defn files-changed [(stream (ptr i8))
+                     (info (ptr i8))
+                     (count u64)
+                     (paths (ptr (ptr i8)))
+                     (flags (ptr u32))
+                     (ids (ptr u64))] (-> void)
+  (let [w (p/cast (ptr WidgetPane) info)
+        n (p/cast i64 count)
+        (mut changed) (al-new [u8] (alloc/malloc-allocator))]
+    (for [k 0 (if (< n 64) n 64)]
+      (let [c (load (p/index paths k))]
+        (when (> k 0) (push! (mut changed) (p/cast u8 10)) 0)
+        (al-extend! (mut changed) (p/cast (ptr u8) c) (p/cast i64 (strlen c)))))
+    ; Name the watch that covers the first change.
+    (let [first (line-at (al-slice changed) 0)
+          key (al-slice (.watch-key w))
+          (mut watched) (line-at key 0)
+          (mut k) 0]
+      (loop (let [candidate (line-at key (load k))]
+              (cond (= (len candidate) 0) (break)
+                    (starts-with? first candidate)
+                      (do (set! watched candidate) (break))
+                    :else (set! k (+ (load k) 1)))))
+      (widgets/files-changed! (.runtime w) (load watched) (al-slice changed)))
+    (al-free! (mut changed))
+    (set! (.state-dirty w) true)
+    (refresh! w)
+    (do)))
+
+(export-c [files-changed :as "jim_widget_files_changed"])
+
+;;; Keep one FSEvents stream covering exactly the paths the last frame watched.
+(defn sync-watches! [(w (ptr WidgetPane))] (-> void)
+  (let [u (ui w)
+        (mut key) (al-new [u8] (alloc/malloc-allocator))]
+    (for [i 0 (len (.watches u))]
+      (when (> i 0) (push! (mut key) (p/cast u8 10)) 0)
+      (let [path (api/watch-path u (get (.watches u) i))]
+        (al-extend! (mut key) (slice-data path) (len path))))
+    (when (not (= (al-slice key) (al-slice (.watch-key w))))
+      (stop-watching! w)
+      (al-clear! (mut (.watch-key w)))
+      (al-extend! (mut (.watch-key w)) (slice-data (al-slice key)) (len key))
+      (when (> (len (.watches u)) 0)
+        (let [paths (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
+              (mut context)
+                (FSContext
+                  :version 0
+                  :info (p/cast (ptr i8) w)
+                  :retain (nil)
+                  :release (nil)
+                  :describe (nil))]
+          (for [i 0 (len (.watches u))]
+            (msg i64
+                 paths
+                 (sel c"addObject:")
+                 [(ptr i8)]
+                 (string (api/watch-path u (get (.watches u) i)))))
+          (set! (.stream w)
+                (FSEventStreamCreate (nil)
+                                     (p/cast (ptr i8)
+                                             (p/fnptr-of files-changed))
+                                     (mut context)
+                                     paths
+                                     (p/cast u64 SINCE-NOW)
+                                     0.25
+                                     (p/cast u32 FILE-EVENTS)))
+          (when (!= (p/cast i64 (.stream w)) 0)
+            (FSEventStreamScheduleWithRunLoop (.stream w)
+                                              (CFRunLoopGetMain)
+                                              (ns c"kCFRunLoopDefaultMode"))
+            (FSEventStreamStart (.stream w))
+            0))
+        0)
+      0)
+    (al-free! (mut key))
+    (do)))
+
+;;; ---- the pane registry ---------------------------------------------------------
+(defn panes [] (-> (ptr (ArrayList (ptr WidgetPane))))
+  (let [cell (p/alloc-static (ArrayList (ptr WidgetPane)))]
+    (when (= (p/cast i64 (.data cell)) 0)
+      (set! cell (al-new [(ptr WidgetPane)] (alloc/malloc-allocator)))
+      (widgets/set-notifier! (p/cast (ptr i8) (p/fnptr-of wake-main)))
+      0)
+    cell))
+
+;;; Once per main-loop pass: apply finished compiles, reload edited sources
+;;; (when POLL), refresh changed panes and deliver ticks. Returns how many
+;;; widgets went live with a new generation, or -1 if an edit was rejected.
+(defn maintain! [(now f64) (poll bool)] (-> i64)
+  (widgets/service-poll!)
+  (let [all (panes)
+        (mut result) 0]
+    (for [i 0 (len (load all))]
+      (let [w (get (load all) i)
+            r (.runtime w)]
+        (when (and poll (widgets/changed? r)) (widgets/reload! r) 0)
+        (let [u (widgets/take-update! r)]
+          (cond (< u 0) (do (set! result -1) (refresh! w) 0)
+                (> u 0)
+                  (do
+                    (when (>= (load result) 0)
+                      (set! result (+ (load result) 1))
+                      0)
+                    (refresh! w)
+                    0)
+                :else 0))
+        (tick! w now)))
+    (load result)))
+
+;;; Deliver TOPIC/PAYLOAD from widget SENDER to every other open widget.
+(defn broadcast! [(sender (ptr WidgetPane))
+                  (topic (slice u8))
+                  (payload (slice u8))] (-> void)
+  (let [all (panes)]
+    (for [i 0 (len (load all))]
+      (let [w (get (load all) i)]
+        (when (!= (p/cast i64 w) (p/cast i64 sender))
+          (widgets/message! (.runtime w) topic payload)
+          (refresh! w)
+          0))))
+  (do))
+
+;;; ---- saved state -----------------------------------------------------------------
+
+;;; True once after an event that may have changed the widget's state.
+(defn take-state-dirty! [(w (ptr WidgetPane))] (-> bool)
+  (let [dirty (.state-dirty w)]
+    (set! (.state-dirty w) false)
+    dirty))
+
+;;; The widget's saved state as an NSArray of {k, v, t} dictionaries, or nil
+;;; while no generation is live.
+(defn state-array [(w (ptr WidgetPane))] (-> (ptr i8))
+  (let [a (alloc/malloc-allocator)
+        (mut s) (api/snapshot-new a)]
+    (if (not (widgets/save-state! (.runtime w) (mut s)))
+        (do (api/snapshot-free! (mut s)) (nil))
+        (let [out (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])]
+          (for [k 0 (len (.entries s))]
+            (let [e (get (.entries s) k)
+                  key (api/snapshot-slice (mut s) (.key-at e) (.key-len e))
+                  item
+                    (msg (ptr i8)
+                         (class c"NSMutableDictionary")
+                         (sel c"dictionary")
+                         [])]
+              (when (not (starts-with? key "jim."))
+                (msg i64
+                     item
+                     (sel c"setObject:forKey:")
+                     [(ptr i8) (ptr i8)]
+                     (string key)
+                     (ns c"k"))
+                (msg i64
+                     item
+                     (sel c"setObject:forKey:")
+                     [(ptr i8) (ptr i8)]
+                     (msg (ptr i8)
+                          (class c"NSNumber")
+                          (sel c"numberWithLongLong:")
+                          [i64]
+                          (.value e))
+                     (ns c"v"))
+                (msg i64
+                     item
+                     (sel c"setObject:forKey:")
+                     [(ptr i8) (ptr i8)]
+                     (string (api/snapshot-slice (mut s)
+                                                 (.text-at e)
+                                                 (.text-len e)))
+                     (ns c"t"))
+                (msg i64 out (sel c"addObject:") [(ptr i8)] item)
+                0)))
+          (api/snapshot-free! (mut s))
+          out))))
+
+(defn kind-of? [(value (ptr i8)) (name (ptr i8))] (-> bool)
+  (and (!= (p/cast i64 value) 0)
+       (!= (msg i8 value (sel c"isKindOfClass:") [(ptr i8)] (class name))
+           (p/cast i8 0))))
+
+;;; A Snapshot from STATE, an array written by state-array; malformed entries
+;;; are skipped.
+(defn snapshot-of [(state (ptr i8))] (-> api/Snapshot)
+  (let [(mut s) (api/snapshot-new (alloc/malloc-allocator))]
+    (when (kind-of? state c"NSArray")
+      (for [k 0 (p/cast i64 (msg u64 state (sel c"count") []))]
+        (let [item
+                (msg (ptr i8)
+                     state
+                     (sel c"objectAtIndex:")
+                     [u64]
+                     (p/cast u64 k))]
+          (when (kind-of? item c"NSDictionary")
+            (let [key
+                    (msg (ptr i8)
+                         item
+                         (sel c"objectForKey:")
+                         [(ptr i8)]
+                         (ns c"k"))
+                  value
+                    (msg (ptr i8)
+                         item
+                         (sel c"objectForKey:")
+                         [(ptr i8)]
+                         (ns c"v"))
+                  text
+                    (msg (ptr i8)
+                         item
+                         (sel c"objectForKey:")
+                         [(ptr i8)]
+                         (ns c"t"))]
+              (when (and (kind-of? key c"NSString")
+                         (kind-of? value c"NSNumber")
+                         (kind-of? text c"NSString"))
+                (api/put-entry! (mut s)
+                                (string-bytes key)
+                                (msg i64 value (sel c"longLongValue") [])
+                                (string-bytes text))
+                0))
+            0)))
+      0)
+    (load s)))
+
+;;; ---- lifecycle -------------------------------------------------------------------
+
+;;; SPEC is "NAME ARGS…"; the name ends at the first space.
+(defn spec-name [(spec (slice u8))] (-> (slice u8))
+  (let [(mut end) (len spec)]
+    (for [i 0 (len spec)]
+      (when (and (= (load end) (len spec)) (= (get spec i) (p/cast u8 32)))
+        (set! end i)
+        0))
+    (subslice spec 0 (load end))))
+
+(defn spec-args [(spec (slice u8))] (-> (slice u8))
+  (let [name (spec-name spec)]
+    (if (>= (+ (len name) 1) (len spec))
+        ""
+        (subslice spec (+ (len name) 1) (len spec)))))
+
+;;; A pane for SPEC ("NAME ARGS…") inside PARENT. PROJECT is the project
+;;; directory the widget sees as "jim.dir"; STATE is state saved by an earlier
+;;; run (see state-array) or nil. The widget compiles in the background; the pane
+;;; shows "Loading widget…" until it is live.
+(defn create! [(parent (ptr i8))
+               (bounds Rect)
+               (spec (slice u8))
+               (project (slice u8))
+               (state (ptr i8))] (-> (ptr WidgetPane))
+  (let [a (alloc/malloc-allocator)
+        v
+          (msg (ptr i8)
+               (msg (ptr i8) (view-class) (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               bounds)
+        w (alloc/box! a WidgetPane (p/zeroed WidgetPane))]
+    (set! (.view w) v)
+    (set! (.runtime w)
+          (widgets/create (spec-name spec) project (spec-args spec)))
+    (when (kind-of? state c"NSArray")
+      (widgets/restore-state! (.runtime w) (snapshot-of state))
+      0)
+    (set! (.natural w) (al-new [f64] a))
+    (set! (.line-heights w) (al-new [f64] a))
+    (set! (.sizes w) (al-new [Size] a))
+    (set! (.boxes w) (al-new [Rect] a))
+    (set! (.clips w) (al-new [Rect] a))
+    (set! (.fields w) (al-new [Field] a))
+    (set! (.title w) (al-new [u8] a))
+    (set! (.watch-key w) (al-new [u8] a))
+    (set! (.stream w) (nil))
+    (set! (.pressed w) api/NONE)
+    (set! (.hovered w) api/NONE)
+    (set! (.dialog w) api/NONE)
+    (msg i64 v (sel c"setWantsLayer:") [i8] (p/cast i8 1))
+    (msg i64 (layer v) (sel c"setMasksToBounds:") [i8] (p/cast i8 1))
+    (let [area
+            (msg (ptr i8)
+                 (msg (ptr i8) (class c"NSTrackingArea") (sel c"alloc") [])
+                 (sel c"initWithRect:options:owner:userInfo:")
+                 [Rect u64 (ptr i8) (ptr i8)]
+                 (rect 0.0 0.0 0.0 0.0)
+                 ; MouseEnteredAndExited | MouseMoved | ActiveInKeyWindow | InVisibleRect
+                 (p/cast u64 (+ (+ 1 2) (+ 32 512)))
+                 v
+                 (nil))]
+      (msg i64 v (sel c"addTrackingArea:") [(ptr i8)] area)
+      (release area))
+    (objc_setAssociatedObject v (pane-key) (p/cast (ptr i8) w) 0)
+    (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
+    (push! (mut (panes)) w)
+    (widgets/reload! (.runtime w))
+    (refresh! w)
+    w))
+
+(defn name [(w (ptr WidgetPane))] (-> (slice u8))
+  (al-slice (.name (.runtime w))))
+
+;;; The pane's spec, "NAME ARGS…", as an NSString for the saved layout.
+(defn spec-string [(w (ptr WidgetPane))] (-> (ptr i8))
+  (let [args (al-slice (.args (.runtime w)))]
+    (if (= (len args) 0)
+        (string (name w))
+        (msg (ptr i8)
+             (msg (ptr i8)
+                  (string (name w))
+                  (sel c"stringByAppendingString:")
+                  [(ptr i8)]
+                  (ns c" "))
+             (sel c"stringByAppendingString:")
+             [(ptr i8)]
+             (string args)))))
+
+;;; The title the widget chose, or "" before it chose one.
+(defn title [(w (ptr WidgetPane))] (-> (slice u8))
+  (al-slice (.title w)))
+
+;;; True once after the widget changes its title.
+(defn take-title-change! [(w (ptr WidgetPane))] (-> bool)
+  (let [dirty (.title-dirty w)]
+    (set! (.title-dirty w) false)
+    dirty))
+
+(defn resize! [(w (ptr WidgetPane)) (bounds Rect)] (-> void)
+  (frame! (.view w) bounds)
+  (refresh! w))
+
+(defn scroll-to! [(w (ptr WidgetPane)) (y f64)] (-> void)
+  (set! (.scroll w) y)
+  (refresh! w))
+
+(defn requests [(w (ptr WidgetPane))] (-> (ptr api/Requests))
+  (widgets/requests (.runtime w)))
+
+(defn animating? [(w (ptr WidgetPane))] (-> bool)
+  (widgets/animating? (.runtime w)))
+
+(defn any-animating? [] (-> bool)
+  (let [all (panes)
+        (mut any) false]
+    (for [i 0 (len (load all))]
+      (when (animating? (get (load all) i)) (set! any true) 0))
+    (load any)))
+
+(defn tick! [(w (ptr WidgetPane)) (now f64)] (-> void)
+  (if (animating? w)
+      (do
+        (widgets/tick! (.runtime w)
+                       (if (> (.last-tick w) 0.0) (- now (.last-tick w)) 0.0))
+        (set! (.last-tick w) now)
+        (refresh! w))
+      (do (set! (.last-tick w) 0.0) (do)))
+  (do))
+
+(defn free! [(w (ptr WidgetPane))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        all (panes)
+        (mut k) 0]
+    (for [i 0 (len (load all))]
+      (let [other (get (load all) i)]
+        (when (!= (p/cast i64 other) (p/cast i64 w))
+          (set! (al-elem all (load k)) other)
+          (set! k (+ (load k) 1))
+          0)))
+    (set! (.len all) (load k))
+    (stop-watching! w)
+    (for [i 0 (len (.fields w))] (free-field! (al-elem (field w fields) i)))
+    (objc_setAssociatedObject (.view w) (pane-key) (nil) 0)
+    (msg i64 (.view w) (sel c"removeFromSuperview") [])
+    (release (.view w))
+    (widgets/free! (.runtime w))
+    (al-free! (mut (.natural w)))
+    (al-free! (mut (.line-heights w)))
+    (al-free! (mut (.sizes w)))
+    (al-free! (mut (.boxes w)))
+    (al-free! (mut (.clips w)))
+    (al-free! (mut (.fields w)))
+    (al-free! (mut (.title w)))
+    (al-free! (mut (.watch-key w)))
+    (alloc/destroy [WidgetPane] a w)
+    (do)))

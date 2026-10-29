@@ -1,0 +1,344 @@
+(module jim.widgets-test)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.fs" :as fs)
+(import "coil.str" :use [str-eq sb-new sb-push-str! sb-str])
+(import "jim.widget-api" :as api)
+(import "jim.widgets" :as widgets)
+(import "coil.time" :as time)
+
+(extern usleep :cc c [u32] (-> i32))
+
+(defn find-id [(r (ptr widgets/Runtime)) (id (slice u8))] (-> i64)
+  (let [ui (field r ui)
+        (mut found) -1]
+    (for [i 0 (len (.nodes (.ui r)))]
+      (when (= (api/node-id ui (api/node ui i)) id) (set! found i)))
+    (load found)))
+
+(defn has-text? [(r (ptr widgets/Runtime)) (text (slice u8))] (-> bool)
+  (let [ui (field r ui)
+        (mut found) false]
+    (for [i 0 (len (.nodes (.ui r)))]
+      (let [n (api/node ui i)]
+        (when (and (= (.kind n) api/TEXT) (= (api/node-text ui n) text))
+          (set! found true))))
+    (load found)))
+
+(defn click! [(r (ptr widgets/Runtime)) (id (slice u8))] (-> void)
+  (assert (widgets/activate! r (find-id r id)))
+  (assert (widgets/render! r 400.0 300.0 0.0)))
+
+(deftest counter-widget-loads-and-handles-clicks
+         (let [r (widgets/create "counter" "." "")]
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "n = 0"))
+           (click! r "inc")
+           (click! r "inc")
+           (click! r "dec")
+           (assert (has-text? r "n = 1"))
+           (assert (has-text? r "click: dec"))
+           (click! r "dark")
+           (assert (has-text? r "toggle: dark"))
+           (widgets/free! r)))
+
+(defn probe-source [(label (slice u8)) (extra bool)] (-> (slice u8))
+  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+    (sb-push-str! (mut b)
+                  "(module widgets.probe)\n(import \"coil.primitive\" :as p)\n(import \"coil.alloc\" :as alloc)\n(import \"jim.widget-api\" :use *)\n")
+    (sb-push-str! (mut b)
+                  (if extra
+                      "(defstruct Probe [(n i64) (step i64)])\n"
+                      "(defstruct Probe [(n i64)])\n"))
+    (sb-push-str! (mut b)
+                  "(impl Widget Probe\n  (render [(self (ptr Probe)) (ui (ptr Ui))] (-> void)\n    (hstack! ui 4.0 0.0) (text! ui \"")
+    (sb-push-str! (mut b) label)
+    (sb-push-str! (mut b)
+                  " \" 12.0 0 false) (append-i64! ui (.n self)) (button! ui \"go\" \"go\") (end! ui))\n  (event [(self (ptr Probe)) (e (ptr Event))] (-> void)\n    (when (clicked? e \"go\") (set! (.n self) (+ (.n self) ")
+    (sb-push-str! (mut b) (if extra "(.step self)" "1"))
+    (sb-push-str! (mut b)
+                  ")) 0))\n  (save [(self (ptr Probe)) (s (ptr Snapshot))] (-> void)\n    (put-i64! s \"n\" (.n self))")
+    (sb-push-str! (mut b)
+                  (if extra " (put-i64! s \"step\" (.step self)))\n" ")\n"))
+    (sb-push-str! (mut b)
+                  "  (animating? [(self (ptr Probe))] (-> bool) false)\n  (destroy! [(self (ptr Probe))] (-> void) (alloc/destroy [Probe] (alloc/malloc-allocator) self) (do)))\n(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)\n  (set! out (alloc/box! (alloc/malloc-allocator) Probe (Probe :n (get-i64 saved \"n\" 0)")
+    (sb-push-str! (mut b) (if extra " :step (get-i64 saved \"step\" 10)" ""))
+    (sb-push-str! (mut b) "))))\n")
+    (sb-str b)))
+
+(defn write-probe! [(source (slice u8))] (-> void)
+  (assert (try (let [_
+                       (try-or! (fs/write-file (alloc/malloc-allocator)
+                                               "build/widget-tests/probe.coil"
+                                               source)
+                                false)]
+                 true))))
+
+(extern mkdir :cc c [(ptr i8) u16] (-> i32))
+
+(deftest reload-carries-state-and-rejects-broken-versions
+         (mkdir c"build" (p/cast u16 493))
+         (mkdir c"build/widget-tests" (p/cast u16 493))
+         (let [r (widgets/create-in "build/widget-tests" "probe" "." "")]
+           (write-probe! (probe-source "one" false))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (click! r "go")
+           (click! r "go")
+           (assert (has-text? r "one 2"))
+           ; A new field defaults; existing state carries over.
+           (write-probe! (probe-source "two" true))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "two 2"))
+           (click! r "go")
+           (assert (has-text? r "two 12"))
+           ; A type error keeps the running generation and explains why.
+           (write-probe! "(module widgets.probe)\n(defn boot [] (-> i64) \"not a number\")\n")
+           (widgets/reload! r)
+           (widgets/settle! r)
+           (assert (< (widgets/take-update! r) 0))
+           (assert (> (len (widgets/diagnostic r)) 0))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "two 12"))
+           ; Dropping the field again still boots from the saved state.
+           (write-probe! (probe-source "three" false))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "three 12"))
+           (widgets/free! r)))
+
+(deftest render-faults-are-reported-not-drawn
+         (let [(mut ui) (api/ui-new (alloc/malloc-allocator))]
+           (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+           (api/end! (mut ui))
+           (assert (= (.fault ui) api/FAULT-END-WITHOUT-CONTAINER))
+           (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+           (api/vstack! (mut ui) 0.0 0.0)
+           (api/button! (mut ui) "a" "a")
+           (api/append! (mut ui) "x")
+           (assert (= (.fault ui) api/FAULT-APPEND-WITHOUT-TEXT))
+           (api/ui-free! (mut ui))))
+
+(deftest render-faults-cover-orphans-and-styles
+         (let [(mut ui) (api/ui-new (alloc/malloc-allocator))]
+           (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+           (api/text! (mut ui) "loose" 12.0 0 false)
+           (assert (= (.fault ui) api/FAULT-CHILD-OF-LEAF))
+           (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+           (api/bg! (mut ui) 0x112233)
+           (assert (= (.fault ui) api/FAULT-STYLE-WITHOUT-ELEMENT))
+           (api/ui-free! (mut ui))))
+
+(deftest styles-apply-to-the-latest-element
+         (let [(mut ui) (api/ui-new (alloc/malloc-allocator))]
+           (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+           (api/vstack! (mut ui) 4.0 8.0)
+           (api/bg! (mut ui) 0x101010)
+           (api/button! (mut ui) "go" "Go")
+           (api/variant! (mut ui) api/PRIMARY)
+           (api/input! (mut ui) "q" "value" "hint")
+           (api/end! (mut ui))
+           (assert (= (.fault ui) 0))
+           (assert (= (.background (api/node (mut ui) 0)) 0x101010))
+           (assert (= (.variant (api/node (mut ui) 1)) api/PRIMARY))
+           (assert (= (api/node-placeholder (mut ui) (api/node (mut ui) 2))
+                      "hint"))
+           (assert (= (api/node-text (mut ui) (api/node (mut ui) 2)) "value"))
+           (api/ui-free! (mut ui))))
+
+(deftest snapshot-later-entries-win
+         (let [(mut s) (api/snapshot-new (alloc/malloc-allocator))]
+           (api/put-text! (mut s) "jim.dir" "saved")
+           (api/put-text! (mut s) "jim.dir" "current")
+           (api/put-i64! (mut s) "n" 7)
+           (assert (= (api/get-text (mut s) "jim.dir" "") "current"))
+           (assert (= (api/get-i64 (mut s) "n" 0) 7))
+           (assert (= (api/get-i64 (mut s) "missing" -3) -3))
+           (api/snapshot-free! (mut s))))
+
+(defn now-ms [] (-> i64)
+  (try (let [v (try-or! (time/monotonic-now-ms) 0)] v)))
+
+(deftest reload-returns-before-the-compile-finishes
+         (let [r (widgets/create "counter" "." "")
+               t0 (now-ms)]
+           (widgets/reload! r)
+           ; Starting a reload only queues it; the compile runs on the worker.
+           (assert (< (- (now-ms) t0) 20))
+           (assert (widgets/loading? r))
+           (assert (widgets/settle! r))
+           (assert (not (widgets/loading? r)))
+           (widgets/free! r)))
+
+(deftest state-survives-a-restart
+         (let [r (widgets/create "counter" "." "")]
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (click! r "inc")
+           (click! r "inc")
+           (click! r "inc")
+           (let [(mut saved) (api/snapshot-new (alloc/malloc-allocator))]
+             (assert (widgets/save-state! r (mut saved)))
+             (widgets/free! r)
+             ; A new runtime, as after relaunching Jim with the saved layout.
+             (let [again (widgets/create "counter" "." "")]
+               (widgets/restore-state! again (load saved))
+               (widgets/reload! again)
+               (assert (widgets/settle! again))
+               (assert (widgets/render! again 400.0 300.0 0.0))
+               (assert (has-text? again "n = 3"))
+               (widgets/free! again)))))
+
+(defn listener-source [] (-> (slice u8))
+  "(module widgets.listener)
+(import \"coil.alloc\" :as alloc)
+(import \"jim.widget-api\" :use *)
+(defstruct Listener [(heard (array u8 64)) (n i64)])
+(impl Widget Listener
+  (render [(self (ptr Listener)) (ui (ptr Ui))] (-> void)
+    (vstack! ui 0.0 0.0)
+    (watch! ui \"/tmp\")
+    (text! ui \"heard \" 12.0 0 false)
+    (append-i64! ui (.n self))
+    (end! ui))
+  (event [(self (ptr Listener)) (e (ptr Event))] (-> void)
+    (when (or (message? e \"ping\") (files-changed? e)) (set! (.n self) (+ (.n self) 1)) 0))
+  (save [(self (ptr Listener)) (s (ptr Snapshot))] (-> void) (do))
+  (animating? [(self (ptr Listener))] (-> bool) false)
+  (destroy! [(self (ptr Listener))] (-> void) (alloc/destroy [Listener] (alloc/malloc-allocator) self) (do)))
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (set! out (alloc/box! (alloc/malloc-allocator) Listener (Listener :heard (zeroed (array u8 64)) :n 0))))
+")
+
+(deftest messages-and-file-changes-reach-the-widget
+         (mkdir c"build" (p/cast u16 493))
+         (mkdir c"build/widget-tests" (p/cast u16 493))
+         (assert (try (let [_
+                              (try-or! (fs/write-file (alloc/malloc-allocator)
+                                                      "build/widget-tests/listener.coil"
+                                                      (listener-source))
+                                       false)]
+                        true)))
+         (let [r (widgets/create-in "build/widget-tests" "listener" "." "")]
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           ; The frame declared its watch.
+           (assert (= (len (.watches (.ui r))) 1))
+           (widgets/message! r "ping" "")
+           (widgets/message! r "other" "")
+           (widgets/files-changed! r "/tmp" "/tmp/x")
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "heard 2"))
+           (widgets/free! r)))
+
+(defn sleeper-source [(label (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+    (sb-push-str! (mut b)
+                  "(module widgets.sleeper)
+(import \"coil.primitive\" :as p)
+(import \"coil.alloc\" :as alloc)
+(import \"jim.widget-api\" :use *)
+(extern usleep :cc c [u32] (-> i32))
+(defstruct Nap [(ms i64)])
+(impl Task Nap (run [(self (ptr Nap))] (-> void) (usleep (p/cast u32 (* 1000 (.ms self)))) (do)))
+(defstruct Sleeper [(nap (ptr Nap)) (handle i64) (host (dyn Host))])
+(impl Widget Sleeper
+  (render [(self (ptr Sleeper)) (ui (ptr Ui))] (-> void) (vstack! ui 0.0 0.0) (text! ui \"")
+    (sb-push-str! (mut b) label)
+    (sb-push-str! (mut b)
+                  "\" 12.0 0 false) (end! ui))
+  (event [(self (ptr Sleeper)) (e (ptr Event))] (-> void) (do))
+  (save [(self (ptr Sleeper)) (s (ptr Snapshot))] (-> void) (do))
+  (animating? [(self (ptr Sleeper))] (-> bool) false)
+  (destroy! [(self (ptr Sleeper))] (-> void) (release-task (.host self) (.handle self)) (alloc/destroy [Sleeper] (alloc/malloc-allocator) self) (do)))
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        nap (alloc/box! a Nap (Nap :ms 300))
+        h (host saved)]
+    (set! out (alloc/box! a Sleeper (Sleeper :nap nap :handle (start-task h nap) :host h)))))
+")
+    (sb-str b)))
+
+(deftest retiring-waits-for-running-tasks
+         (mkdir c"build" (p/cast u16 493))
+         (mkdir c"build/widget-tests" (p/cast u16 493))
+         (let [r (widgets/create-in "build/widget-tests" "sleeper" "." "")]
+           (assert (try (let [_
+                                (try-or! (fs/write-file (alloc/malloc-allocator)
+                                                        "build/widget-tests/sleeper.coil"
+                                                        (sleeper-source "one"))
+                                         false)]
+                          true)))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (try (let [_
+                                (try-or! (fs/write-file (alloc/malloc-allocator)
+                                                        "build/widget-tests/sleeper.coil"
+                                                        (sleeper-source "two"))
+                                         false)]
+                          true)))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "two"))
+           ; Generation one's 300 ms task may still run, so it waits to retire.
+           (let [t0 (now-ms)]
+             (while (> (len (.retiring r)) 0)
+               (usleep (p/cast u32 2000))
+               (widgets/service-poll!))
+             (assert (< (- (now-ms) t0) 1000)))
+           (widgets/free! r)))
+
+(deftest reloads-finish-optimized-and-keep-state
+         (mkdir c"build" (p/cast u16 493))
+         (mkdir c"build/widget-tests" (p/cast u16 493))
+         (let [r (widgets/create-in "build/widget-tests" "probe" "." "")]
+           (write-probe! (probe-source "one" false))
+           (widgets/reload! r)
+           ; The quick native build goes live first; the optimized one follows.
+           (while (not (widgets/live? r))
+             (usleep (p/cast u32 2000))
+             (widgets/service-poll!))
+           (assert (not (widgets/optimized? r)))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (click! r "go")
+           (assert (widgets/settle! r))
+           (assert (widgets/optimized? r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "one 1"))
+           (click! r "go")
+           (write-probe! (probe-source "two" false))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/optimized? r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "two 2"))
+           (widgets/free! r)))
+
+(deftest a-save-during-the-optimized-compile-wins
+         (mkdir c"build" (p/cast u16 493))
+         (mkdir c"build/widget-tests" (p/cast u16 493))
+         (let [r (widgets/create-in "build/widget-tests" "probe" "." "")]
+           (write-probe! (probe-source "one" false))
+           (widgets/reload! r)
+           (while (not (widgets/live? r))
+             (usleep (p/cast u32 2000))
+             (widgets/service-poll!))
+           ; The optimized build of "one" is compiling; this save supersedes it.
+           (write-probe! (probe-source "two" false))
+           (widgets/reload! r)
+           (assert (widgets/settle! r))
+           (assert (widgets/optimized? r))
+           (assert (widgets/render! r 400.0 300.0 0.0))
+           (assert (has-text? r "two 0"))
+           (widgets/free! r)))

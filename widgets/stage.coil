@@ -1,0 +1,636 @@
+(module widgets.stage)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.proc" :as proc)
+(import "jim.widget-kit.json" :as json)
+(import "jim.widget-kit.diff" :as d)
+(import "jim.widget-kit.git-view" :as gv)
+(import "jim.widget-kit.live" :as live)
+
+;;; Interactive staging — `git add -p` as a pane, ported from Jim's stage.ft.
+;;;
+;;; Two structured diffs per file, index→worktree (unstaged) and HEAD→index
+;;; (staged), from `jimctl git diff --mode …`, shown as hunk stacks with
+;;; [Stage ↓] / [↑ Unstage] per hunk, whole-file buttons for what hunks cannot
+;;; express (untracked, renamed, binary), and a commit bar. Hunks are addressed
+;;; by header; jimctl recomputes the diff and answers "stale" when the file
+;;; changed underneath, and then we simply refresh.
+
+;;; One sidebar entry: a path with its unstaged and staged file indices (NONE
+;;; when that side has no changes).
+(defstruct Entry [(path-at i64) (path-len i64) (unstaged i64) (staged i64)])
+
+(defstruct Stage
+  [(unstaged d/Model)
+   (staged d/Model)
+   (unstaged-job proc/Job)
+   (staged-job proc/Job)
+   (write-job proc/Job)
+   (entries (ArrayList Entry))
+   (names (ArrayList u8))
+   (file i64)
+   (repo (ArrayList u8))
+   (status (ArrayList u8))
+   (message (ArrayList u8))
+   (outside live/Refresher)
+   (host (dyn Host))
+   ;; Both replies arrived and wait to be parsed.
+   (fetched bool)
+   (parse (ptr Parse))
+   (parse-handle i64)])
+
+;;; Decoding the two replies, building both models and highlighting them is the
+;;; slow part of a refresh, so it runs as a task off Jim's main thread.
+(defstruct Parse
+  [(unstaged-raw (ArrayList u8))
+   (staged-raw (ArrayList u8))
+   (unstaged d/Model)
+   (staged d/Model)
+   (unstaged-ok bool)
+   (staged-ok bool)
+   (error (ArrayList u8))])
+
+(impl Task Parse
+  (run [(self (ptr Parse))]
+       (-> void)
+       (set! (.unstaged-ok self)
+             (read-diff! (al-slice (.unstaged-raw self))
+                         (field self unstaged)
+                         (field self error)))
+       (set! (.staged-ok self)
+             (read-diff! (al-slice (.staged-raw self))
+                         (field self staged)
+                         (field self error)))
+       (do)))
+
+(defn parse-free! [(t (ptr Parse))] (-> void)
+  (al-free! (mut (.unstaged-raw t)))
+  (al-free! (mut (.staged-raw t)))
+  (d/free! (field t unstaged))
+  (d/free! (field t staged))
+  (al-free! (mut (.error t)))
+  (alloc/destroy [Parse] (alloc/malloc-allocator) t)
+  (do))
+
+(defn say! [(s (ptr Stage)) (message (slice u8))] (-> void)
+  (text/set-str! (field s status) message))
+
+(defn repo [(s (ptr Stage))] (-> (slice u8))
+  (al-slice (.repo s)))
+
+(defn refresh! [(s (ptr Stage))] (-> void)
+  (live/started! (field s outside))
+  (set! (.fetched s) true)
+  (when (not (proc/running? (field s unstaged-job)))
+    (proc/start! (field s unstaged-job)
+                 ["jimctl" "git" "diff" "--repo" (repo s) "--mode" "unstaged"]
+                 (repo s)
+                 0)
+    0)
+  (when (not (proc/running? (field s staged-job)))
+    (proc/start! (field s staged-job)
+                 ["jimctl" "git" "diff" "--repo" (repo s) "--mode" "staged"]
+                 (repo s)
+                 0)
+    0)
+  (say! s "loading…"))
+
+;;; jimctl's structured diff (files → hunks → lines) into model M, or the
+;;; reason it could not be read into ERROR. Pure, so it can run on a task.
+(defn read-diff! [(raw (slice u8))
+                  (m (ptr d/Model))
+                  (error (ptr (ArrayList u8)))] (-> bool)
+  (let [(mut r) (json/parse raw)
+        ok (json/ok? (mut r))]
+    (if (not ok)
+        (do (json/error-into! (mut r) error) 0)
+        (let [files
+                (json/get (mut r)
+                          (json/get (mut r) (json/root (mut r)) "diff")
+                          "files")
+              (mut path) (al-new [u8] (alloc/malloc-allocator))
+              (mut old) (al-new [u8] (alloc/malloc-allocator))
+              (mut change) (al-new [u8] (alloc/malloc-allocator))
+              (mut body) (al-new [u8] (alloc/malloc-allocator))]
+          (d/clear! m)
+          (for [k 0 (json/count (mut r) files)]
+            (let [f (json/nth (mut r) files k)
+                  hunks (json/get (mut r) f "hunks")]
+              (al-clear! (mut path))
+              (al-clear! (mut old))
+              (al-clear! (mut change))
+              (json/field-into! (mut r) f "path" (mut path) "")
+              (json/field-into! (mut r) f "old_path" (mut old) (al-slice path))
+              (json/field-into! (mut r) f "change" (mut change) "modified")
+              (d/begin-file! m
+                             (al-slice old)
+                             (al-slice path)
+                             (al-slice change)
+                             (json/field-bool (mut r) f "binary" false))
+              (for [h 0 (json/count (mut r) hunks)]
+                (let [hk (json/nth (mut r) hunks h)
+                      lines (json/get (mut r) hk "lines")]
+                  (al-clear! (mut body))
+                  (json/field-into! (mut r) hk "header" (mut body) "@@")
+                  (let [starts (d/hunk-starts (al-slice body))]
+                    (d/add-hunk! m (al-slice body) (.a starts) (.b starts)))
+                  (for [n 0 (json/count (mut r) lines)]
+                    (let [l (json/nth (mut r) lines n)
+                          (mut kind) (al-new [u8] (alloc/malloc-allocator))]
+                      (json/field-into! (mut r) l "kind" (mut kind) "context")
+                      (al-clear! (mut body))
+                      (json/field-into! (mut r) l "text" (mut body) "")
+                      (d/add-line! m
+                                   (cond (= (al-slice kind) "added") d/ADD
+                                         (= (al-slice kind) "removed") d/DEL
+                                         :else d/CONTEXT)
+                                   (json/field-i64 (mut r) l "old" 0)
+                                   (json/field-i64 (mut r) l "new" 0)
+                                   (al-slice body))
+                      (al-free! (mut kind))))))
+              (d/set-counts! m
+                             (json/field-i64 (mut r) f "added" 0)
+                             (json/field-i64 (mut r) f "removed" 0))))
+          (d/highlight-all! m)
+          (al-free! (mut path))
+          (al-free! (mut old))
+          (al-free! (mut change))
+          (al-free! (mut body))
+          0))
+    (json/free! (mut r))
+    ok))
+
+(defn entry-path [(s (ptr Stage)) (e (ptr Entry))] (-> (slice u8))
+  (subslice (al-slice (.names s)) (.path-at e) (+ (.path-at e) (.path-len e))))
+
+(defn find-entry [(s (ptr Stage)) (path (slice u8))] (-> i64)
+  (let [(mut found) NONE]
+    (for [i 0 (len (.entries s))]
+      (when (= (entry-path s (al-elem (field s entries) i)) path)
+        (set! found i)
+        0))
+    (load found)))
+
+;;; Merge both sides by path into sidebar entries.
+(defn rebuild! [(s (ptr Stage))] (-> void)
+  (al-clear! (mut (.entries s)))
+  (al-clear! (mut (.names s)))
+  (let [u (field s unstaged)
+        st (field s staged)]
+    (for [i 0 (d/file-count u)]
+      (let [path (d/path u (d/file u i))
+            at (len (.names s))]
+        (text/push-str! (field s names) path)
+        (push! (mut (.entries s))
+               (Entry
+                 :path-at at
+                 :path-len (len path)
+                 :unstaged i
+                 :staged NONE))))
+    (for [i 0 (d/file-count st)]
+      (let [path (d/path st (d/file st i))
+            existing (find-entry s path)]
+        (if (>= existing 0)
+            (do (set! (.staged (al-elem (field s entries) existing)) i) 0)
+            (let [at (len (.names s))]
+              (text/push-str! (field s names) path)
+              (push! (mut (.entries s))
+                     (Entry
+                       :path-at at
+                       :path-len (len path)
+                       :unstaged NONE
+                       :staged i))
+              0)))))
+  (when (>= (.file s) (len (.entries s))) (set! (.file s) 0) 0)
+  (do))
+
+(defn staged-count [(s (ptr Stage))] (-> i64)
+  (d/file-count (field s staged)))
+
+(defn parsing? [(s (ptr Stage))] (-> bool)
+  (!= (p/cast i64 (.parse s)) 0))
+
+(defn loading? [(s (ptr Stage))] (-> bool)
+  (or (proc/running? (field s unstaged-job))
+      (proc/running? (field s staged-job))
+      (parsing? s)))
+
+;;; Adopt a finished parse: swap in its models (keeping the old side when a
+;;; reply was unreadable) and rebuild the sidebar.
+(defn adopt-parse! [(s (ptr Stage))] (-> void)
+  (let [t (.parse s)]
+    (when (.unstaged-ok t)
+      (let [old (.unstaged s)]
+        (set! (.unstaged s) (.unstaged t))
+        (set! (.unstaged t) old))
+      0)
+    (when (.staged-ok t)
+      (let [old (.staged s)]
+        (set! (.staged s) (.staged t))
+        (set! (.staged t) old))
+      0)
+    (say! s (al-slice (.error t)))
+    (rebuild! s)
+    (release-task (.host s) (.parse-handle s))
+    (parse-free! t)
+    (set! (.parse s) (p/cast (ptr Parse) 0))
+    (do)))
+
+(defn start-parse! [(s (ptr Stage))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        t
+          (alloc/box! a
+                      Parse
+                      (Parse
+                        :unstaged-raw
+                          (text/owned (proc/output (field s unstaged-job)))
+                        :staged-raw
+                          (text/owned (proc/output (field s staged-job)))
+                        :unstaged (d/model-new)
+                        :staged (d/model-new)
+                        :unstaged-ok false
+                        :staged-ok false
+                        :error (al-new [u8] a)))]
+    (set! (.fetched s) false)
+    (set! (.parse s) t)
+    (set! (.parse-handle s) (start-task (.host s) t))
+    (do)))
+
+(defn poll-jobs! [(s (ptr Stage)) (e (ptr Event))] (-> void)
+  (let [u-running
+          (and (proc/running? (field s unstaged-job))
+               (not (proc/poll! (field s unstaged-job))))
+        s-running
+          (and (proc/running? (field s staged-job))
+               (not (proc/poll! (field s staged-job))))]
+    (when (and (parsing? s) (task-done? (.host s) (.parse-handle s)))
+      (adopt-parse! s)
+      0)
+    (when (and (.fetched s) (not u-running) (not s-running) (not (parsing? s)))
+      (start-parse! s)
+      0)
+    (when (and (proc/running? (field s write-job))
+               (proc/poll! (field s write-job)))
+      (let [j (field s write-job)]
+        (if (= (.tag j) 1)
+            ; `git commit` prints text, not JSON; its exit code says enough.
+            (if (= (.code j) 0)
+                (do (say! s "committed") (emit! e "git.changed" (repo s)))
+                (do
+                  (say! s "")
+                  (text/push-truncated! (field s status)
+                                        (text/trim (proc/output j))
+                                        200)))
+            (let [(mut r) (json/parse (proc/output j))]
+              (if (json/ok? (mut r))
+                  (do (say! s "") (emit! e "git.changed" (repo s)))
+                  (let [(mut e) (al-new [u8] (alloc/malloc-allocator))]
+                    (json/error-into! (mut r) (mut e))
+                    (if (= (al-slice e) "stale")
+                        (say! s "index changed under us — refreshed")
+                        (say! s (al-slice e)))
+                    (al-free! (mut e))
+                    (do)))
+              (json/free! (mut r)))))
+      (refresh! s)
+      0)
+    ; Changes made elsewhere (a terminal, another widget) refresh once idle.
+    (when (live/due? (field s outside) (loading? s)) (refresh! s) 0)
+    (do)))
+
+(defn entry [(s (ptr Stage))] (-> (ptr Entry))
+  (al-elem (field s entries) (.file s)))
+
+(defn mutate! [(s (ptr Stage)) (argv (slice (slice u8))) (message (slice u8))] (-> void)
+  (if (proc/running? (field s write-job))
+      (say! s "busy…")
+      (do (proc/start! (field s write-job) argv (repo s) 0) (say! s message))))
+
+(defn hunk-header [(m (ptr d/Model)) (f (ptr d/File)) (j i64)] (-> (slice u8))
+  (d/hunk-header m (d/hunk m (+ (.hunks-at f) j))))
+
+(defn act! [(s (ptr Stage)) (e (ptr Event))] (-> void)
+  (when (< (.file s) (len (.entries s)))
+    (let [en (entry s)
+          path (entry-path s en)]
+      (cond (clicked? e "stgf")
+              (mutate! s
+                       ["jimctl"
+                        "git"
+                        "stage-file"
+                        "--repo"
+                        (repo s)
+                        "--file"
+                        path]
+                       "staging file…")
+            (clicked? e "ustf")
+              (mutate! s
+                       ["jimctl"
+                        "git"
+                        "unstage-file"
+                        "--repo"
+                        (repo s)
+                        "--file"
+                        path]
+                       "unstaging file…")
+            (and (id-prefix? e "stg:") (!= (.unstaged en) NONE))
+              (let [m (field s unstaged)
+                    f (d/file m (.unstaged en))
+                    j (id-number e "stg:")]
+                (when (and (>= j 0) (< j (.hunks-len f)))
+                  (mutate! s
+                           ["jimctl"
+                            "git"
+                            "stage-hunk"
+                            "--repo"
+                            (repo s)
+                            "--file"
+                            path
+                            "--hunk-header"
+                            (hunk-header m f j)]
+                           "staging hunk…")
+                  0)
+                (do))
+            (and (id-prefix? e "ust:") (!= (.staged en) NONE))
+              (let [m (field s staged)
+                    f (d/file m (.staged en))
+                    j (id-number e "ust:")]
+                (when (and (>= j 0) (< j (.hunks-len f)))
+                  (mutate! s
+                           ["jimctl"
+                            "git"
+                            "unstage-hunk"
+                            "--repo"
+                            (repo s)
+                            "--file"
+                            path
+                            "--hunk-header"
+                            (hunk-header m f j)]
+                           "unstaging hunk…")
+                  0)
+                (do))
+            :else (do)))
+    0)
+  (do))
+
+(defn commit! [(s (ptr Stage))] (-> void)
+  (let [message (text/trim (al-slice (.message s)))]
+    (cond (= (len message) 0) (say! s "commit message is empty")
+          (= (staged-count s) 0) (say! s "nothing staged")
+          (proc/running? (field s write-job)) (say! s "busy…")
+          :else
+            (do
+              (proc/start! (field s write-job)
+                           ["git" "-C" (repo s) "commit" "-m" message]
+                           (repo s)
+                           1)
+              (al-clear! (mut (.message s)))
+              (say! s "committing…")))))
+
+;;; ---- rendering -------------------------------------------------------------
+(defn hunkable? [(m (ptr d/Model)) (f (ptr d/File))] (-> bool)
+  (let [change (d/change m f)]
+    (not (or (.binary f) (= change "untracked") (= change "renamed")))))
+
+(defn note [(m (ptr d/Model)) (f (ptr d/File))] (-> (slice u8))
+  (let [change (d/change m f)]
+    (cond (= change "untracked") "untracked file — stage adds the whole file"
+          (= change "renamed") "renamed — staged/unstaged as a whole file"
+          (.binary f) "binary file — no hunks"
+          :else "")))
+
+(defn section-head! [(ui (ptr Ui))
+                     (label (slice u8))
+                     (f (ptr d/File))
+                     (id (slice u8))
+                     (button (slice u8))] (-> void)
+  (hstack! ui 8.0 0.0)
+  (text! ui label 12.0 gv/INK true)
+  (text! ui "+" 11.0 gv/MUTED false)
+  (append-i64! ui (.adds f))
+  (append! ui " −")
+  (append-i64! ui (.dels f))
+  (grow! ui 1.0)
+  (button! ui id button)
+  (end! ui))
+
+(defn side! [(ui (ptr Ui))
+             (m (ptr d/Model))
+             (f (ptr d/File))
+             (prefix (slice u8))
+             (label (slice u8))] (-> void)
+  (let [(mut hunk) 0
+        (mut id) (al-new [u8] (alloc/malloc-allocator))]
+    ; Rows sit flush against each other, like the diff pane's.
+    (vstack! ui 0.0 0.0)
+    (for [i (.lines-at f) (+ (.lines-at f) (.lines-len f))]
+      (let [l (d/line m i)]
+        (if (= (.tag l) d/HUNK)
+            (do
+              (text/set-str! (mut id) prefix)
+              (text/push-i64! (mut id) (load hunk))
+              (hstack! ui 8.0 0.0)
+              (bg! ui gv/PANEL)
+              (radius! ui 4.0)
+              (pad! ui 2.0 6.0 2.0 6.0)
+              (margin! ui 6.0 0.0 0.0 0.0)
+              (gv/mono-text! ui (d/line-text m l) 11.0 gv/ACCENT)
+              (grow! ui 1.0)
+              (clip! ui)
+              (button! ui (al-slice id) label)
+              (end! ui)
+              (set! hunk (+ (load hunk) 1))
+              0)
+            (do (gv/line-row! ui m l "" false) 0))))
+    (end! ui)
+    (al-free! (mut id))
+    (do)))
+
+(defn file-body! [(s (ptr Stage)) (ui (ptr Ui))] (-> void)
+  (let [en (entry s)
+        u (field s unstaged)
+        st (field s staged)]
+    (vstack! ui 4.0 0.0)
+    (grow! ui 1.0)
+    (let [m (if (!= (.unstaged en) NONE) u st)
+          f (d/file m (if (!= (.unstaged en) NONE) (.unstaged en) (.staged en)))
+          n (note m f)]
+      (when (> (len n) 0) (text! ui n 11.0 gv/WARN false) 0)
+      (when (!= (.unstaged en) NONE)
+        (let [uf (d/file u (.unstaged en))]
+          (section-head! ui "Unstaged" uf "stgf" "Stage file")
+          (when (hunkable? u uf) (side! ui u uf "stg:" "Stage ↓") 0))
+        0)
+      (when (and (!= (.unstaged en) NONE) (!= (.staged en) NONE))
+        (divider! ui)
+        0)
+      (when (!= (.staged en) NONE)
+        (let [sf (d/file st (.staged en))]
+          (section-head! ui "Staged" sf "ustf" "Unstage file")
+          (when (hunkable? st sf) (side! ui st sf "ust:" "↑ Unstage") 0))
+        0))
+    (end! ui)))
+
+(defn file-row! [(s (ptr Stage)) (ui (ptr Ui)) (i i64)] (-> void)
+  (let [en (al-elem (field s entries) i)
+        selected (= i (.file s))
+        (mut id) (al-new [u8] (alloc/malloc-allocator))]
+    (text/push-str! (mut id) "file:")
+    (text/push-i64! (mut id) i)
+    (vstack! ui 1.0 0.0)
+    (pad! ui 5.0 8.0 5.0 8.0)
+    (radius! ui 6.0)
+    (clickable! ui (al-slice id) selected)
+    (text! ui (text/basename (entry-path s en)) 12.0 gv/INK selected)
+    (mono! ui)
+    (hstack! ui 6.0 0.0)
+    (when (!= (.staged en) NONE)
+      (gv/mono-text! ui "S:" 10.0 gv/ADDED)
+      (append-i64! ui (.hunks-len (d/file (field s staged) (.staged en))))
+      0)
+    (when (!= (.unstaged en) NONE)
+      (gv/mono-text! ui "U:" 10.0 gv/WARN)
+      (append-i64! ui (.hunks-len (d/file (field s unstaged) (.unstaged en))))
+      0)
+    (end! ui)
+    (end! ui)
+    (al-free! (mut id))
+    (do)))
+
+(defn commit-bar! [(s (ptr Stage)) (ui (ptr Ui))] (-> void)
+  (hstack! ui 8.0 0.0)
+  (textarea! ui
+             "msg"
+             (al-slice (.message s))
+             "Commit message… (⌘Return to commit staged)"
+             2)
+  (grow! ui 1.0)
+  (if (> (staged-count s) 0)
+      (let [(mut label) (al-new [u8] (alloc/malloc-allocator))]
+        (text/push-str! (mut label) "Commit staged (")
+        (text/push-i64! (mut label) (staged-count s))
+        (text/push-str! (mut label) ")")
+        (button! ui "commit" (al-slice label))
+        (variant! ui PRIMARY)
+        (al-free! (mut label))
+        (do))
+      (text! ui "nothing staged" 11.0 gv/MUTED false))
+  (end! ui))
+
+(impl Widget Stage
+  (render [(self (ptr Stage)) (ui (ptr Ui))]
+          (-> void)
+          (title! ui "Stage")
+          (watch! ui (repo self))
+          (vstack! ui 8.0 14.0)
+          (hstack! ui 8.0 0.0)
+          (text! ui "± stage" 13.0 gv/INK true)
+          (text! ui (text/basename (repo self)) 11.0 gv/MUTED false)
+          (button! ui "refresh" "↻")
+          (text! ui (al-slice (.status self)) 11.0 gv/WARN false)
+          (end! ui)
+          (divider! ui)
+          (if (= (len (.entries self)) 0)
+              (text! ui
+                     (if (loading? self)
+                         "Loading…"
+                         "Working tree clean — nothing to stage.")
+                     13.0
+                     gv/MUTED
+                     false)
+              (do
+                (hstack! ui 14.0 0.0)
+                (align! ui START)
+                (vstack! ui 3.0 0.0)
+                (width! ui 230.0)
+                (text! ui "Files (" 11.0 gv/MUTED true)
+                (append-i64! ui (len (.entries self)))
+                (append! ui ")")
+                (for [i 0 (len (.entries self))] (file-row! self ui i))
+                (end! ui)
+                (file-body! self ui)
+                (end! ui)))
+          (divider! ui)
+          (commit-bar! self ui)
+          (end! ui))
+  (event [(self (ptr Stage)) (e (ptr Event))]
+         (-> void)
+         (cond (tick? e) (poll-jobs! self e)
+               (or (files-changed? e) (message? e "git.changed"))
+                 (live/note! (field self outside))
+               (clicked? e "refresh") (refresh! self)
+               (or (clicked? e "commit") (submitted? e "msg")) (commit! self)
+               (changed? e "msg") (text/set-str! (field self message) (.text e))
+               (id-prefix? e "file:")
+                 (let [i (id-number e "file:")]
+                   (when (and (>= i 0) (< i (len (.entries self))))
+                     (set! (.file self) i)
+                     0)
+                   (do))
+               :else (act! self e)))
+  (save [(self (ptr Stage)) (s (ptr Snapshot))]
+        (-> void)
+        (put-i64! s "file" (.file self))
+        (put-text! s "message" (al-slice (.message self))))
+  (animating? [(self (ptr Stage))]
+              (-> bool)
+              (or (live/waiting? (field self outside))
+                  (.fetched self)
+                  (parsing? self)
+                  (proc/running? (field self unstaged-job))
+                  (proc/running? (field self staged-job))
+                  (proc/running? (field self write-job))))
+  (destroy! [(self (ptr Stage))]
+            (-> void)
+            (d/free! (field self unstaged))
+            (d/free! (field self staged))
+            (proc/free! (field self unstaged-job))
+            (proc/free! (field self staged-job))
+            (proc/free! (field self write-job))
+            ; Jim destroys a generation only after its tasks finished, so a parse
+            ; still here is done and can be freed.
+            (when (parsing? self)
+              (release-task (.host self) (.parse-handle self))
+              (parse-free! (.parse self))
+              0)
+            (al-free! (mut (.entries self)))
+            (al-free! (mut (.names self)))
+            (al-free! (mut (.repo self)))
+            (al-free! (mut (.status self)))
+            (al-free! (mut (.message self)))
+            (alloc/destroy [Stage] (alloc/malloc-allocator) self)
+            (do)))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        args (text/trim (get-text saved "jim.args" ""))
+        s
+          (alloc/box! a
+                      Stage
+                      (Stage
+                        :unstaged (d/model-new)
+                        :staged (d/model-new)
+                        :unstaged-job (proc/job-new (host saved))
+                        :staged-job (proc/job-new (host saved))
+                        :write-job (proc/job-new (host saved))
+                        :entries (al-new [Entry] a)
+                        :names (al-new [u8] a)
+                        :file (get-i64 saved "file" 0)
+                        :repo
+                          (text/owned (if (> (len args) 0)
+                                          args
+                                          (get-text saved "jim.dir" ".")))
+                        :status (al-new [u8] a)
+                        :message (text/owned (get-text saved "message" ""))
+                        :outside (live/refresher)
+                        :host (host saved)
+                        :fetched false
+                        :parse (p/cast (ptr Parse) 0)
+                        :parse-handle 0))]
+    (refresh! s)
+    (set! out s)))
