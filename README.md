@@ -22,6 +22,10 @@ the pin, patch, backend extension, or Zig version changes.
 service is the package's `session` executable artifact: a bare `coil build` or
 `coil run` also produces `build/jim-session`, linked against the Ghostty VT library.
 `GHOSTTY_SOURCE=/path/to/pinned/ghostty` can reuse an existing source checkout.
+Ghostty is built without its Sentry crash reporter, which would claim Jim's
+crashes as Ghostty's and, at this revision, races `ghostty_init`'s locale setup
+over the environment and crashed Jim at launch. Its version is given as the
+pinned revision; left alone, Ghostty's build reads this repository's git.
 The build checks its embedding header against the pinned header. The development
 app is `build/JimCoil.app`; it resolves this checkout's configuration and resources.
 The build uses the existing `TerminalBevy Local Signing` identity; set

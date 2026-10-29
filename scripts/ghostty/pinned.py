@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,6 +75,16 @@ def source():
     return LOCAL_SOURCE
 
 
+def version(src):
+    """Ghostty's own version, marked with the pinned revision. Without it
+    Ghostty's build asks git, which answers for this repository instead:
+    our branch and commit, and a release tag on our HEAD stops the build."""
+    match = re.search(r'\.version = "([^"]+)"', (src / 'build.zig.zon').read_text())
+    if not match:
+        raise SystemExit('No version in the pinned Ghostty build.zig.zon.')
+    return match.group(1) + '+' + REV[:7]
+
+
 def build():
     LOCAL_SOURCE.parent.mkdir(parents=True, exist_ok=True)
     src = source()
@@ -85,7 +96,12 @@ def build():
         raise SystemExit('This Ghostty revision requires Zig 0.16.0.')
     run(['xcrun', '-sdk', 'macosx', 'metal', '--version'])
     run(['python3', str(ROOT / 'scripts/ghostty/session-backend.py'), str(src)])
-    run(['zig', 'build', '-Dapp-runtime=none', '-Demit-xcframework=true',
+    # Without Sentry: Ghostty's crash reporter would install its handlers in
+    # Jim and file Jim's crashes as Ghostty's, and its start-up thread reads
+    # the environment while ghostty_init's ensureLocale is changing it
+    # (fixed upstream after this revision), which crashed Jim at launch.
+    run(['zig', 'build', '-Dversion-string=' + version(src), '-Dsentry=false',
+         '-Dapp-runtime=none', '-Demit-xcframework=true',
          '-Dxcframework-target=native', '-Doptimize=ReleaseFast', '-Demit-docs=false',
          '-Demit-webdata=false', '-Demit-macos-app=false', '--prefix', str(DEST)], cwd=src)
     artifacts = list((src / 'macos/GhosttyKit.xcframework').glob('macos-*/libghostty-internal.a'))
@@ -93,7 +109,8 @@ def build():
         raise SystemExit('Expected exactly one native GhosttyKit library.')
     (DEST / 'lib').mkdir(parents=True, exist_ok=True)
     shutil.copy2(artifacts[0], LIBRARIES['internal'])
-    run(['zig', 'build', '-Demit-lib-vt=true', '-Doptimize=ReleaseFast',
+    run(['zig', 'build', '-Dversion-string=' + version(src),
+         '-Demit-lib-vt=true', '-Doptimize=ReleaseFast',
          '-Demit-docs=false', '--prefix', str(DEST)], cwd=src)
     (DEST / 'revision').write_text(REV + '\n')
 
