@@ -321,6 +321,9 @@
          [i64]
          (if wide 2 1))
     (sky/show! (field s night) wide)
+    ; Fades over the sidebar run with the cube's transitions; once the stage
+    ; is beside it again, it is simply shown.
+    (when (not wide) (sidebar/fade! true 0.0))
     (do)))
 
 (defn pose! [(duration f64)] (-> void)
@@ -485,6 +488,7 @@
     ; Set first: pose! leaves the fade hidden while a transition runs.
     (set! (.settle-at s) (+ (animation/animation-now) ENTER-TIME))
     (pose! ENTER-TIME)
+    (sidebar/fade! false ENTER-TIME)
     (do)))
 
 ;;; Dive from the cube into project INDEX, turning the short way.
@@ -500,6 +504,7 @@
     (sky/fade! (field s night) false)
     (set! (.settle-at s) (+ (animation/animation-now) DIVE-TIME))
     (pose! DIVE-TIME)
+    (sidebar/fade! true DIVE-TIME)
     (do)))
 
 ;;; Finish a cube transition once its animation has run: a dive gives the
@@ -1220,9 +1225,16 @@
                       :else false))
             (and (.overview s) (= kind 11)) true
             ; The cube covers the whole window and takes every pointer
-            ; event while it is shown.
+            ; event while it is shown. A press in the title bar, above the
+            ; content, is the window's: its buttons and its drag.
             (and (.overview s)
-                 (or (= kind 1) (= kind 2) (= kind 6) (= kind 22)))
+                 (or (= kind 1) (= kind 2) (= kind 6) (= kind 22))
+                 (not (and (= kind 1)
+                           (>= (.y (msg Point
+                                        event
+                                        (sel c"locationInWindow")
+                                        []))
+                               (.h (msg Rect (.root s) (sel c"frame") []))))))
               (let [pt (msg Point event (sel c"locationInWindow") [])
                     now (animation/animation-now)]
                 (cond (= kind 1)
@@ -1418,6 +1430,15 @@
                             (rect 0.0 0.0 1096.0 860.0)
                             c"CATransformLayer"))
           (sky/add-fade! (field s night) root (.stage s))
+          ; The sidebar lies over the night and under the cube, so the
+          ; stage can widen over it while it fades.
+          (msg i64
+               root
+               (sel c"addSubview:positioned:relativeTo:")
+               [(ptr i8) i64 (ptr i8)]
+               (.view (sidebar/state))
+               -1
+               (.stage s))
           (msg i64
                (layer (.stage s))
                (sel c"setMasksToBounds:")

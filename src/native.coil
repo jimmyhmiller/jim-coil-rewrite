@@ -218,6 +218,60 @@
        (: 0.68 f32)
        (: 1.0 f32)))
 
+;;; Fade view V to OPACITY over DURATION, easing in and out from however
+;;; opaque it is shown now. The view's alpha holds the opacity it ends at.
+(defn fade-view! [(v (ptr i8)) (opacity f64) (duration f64)] (-> void)
+  (let [l (layer v)
+        shown (msg (ptr i8) l (sel c"presentationLayer") [])
+        from (msg f32 (if (= (p/cast i64 shown) 0) l shown) (sel c"opacity") [])]
+    (transaction! 0.0)
+    (msg i64
+         (class c"CATransaction")
+         (sel c"setDisableActions:")
+         [i8]
+         (: 1 i8))
+    (msg i64 v (sel c"setAlphaValue:") [f64] opacity)
+    (if (> duration 0.0)
+        (let [a
+                (msg (ptr i8)
+                     (class c"CABasicAnimation")
+                     (sel c"animationWithKeyPath:")
+                     [(ptr i8)]
+                     (ns c"opacity"))]
+          (msg i64
+               a
+               (sel c"setFromValue:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (class c"NSNumber")
+                    (sel c"numberWithFloat:")
+                    [f32]
+                    from))
+          (msg i64
+               a
+               (sel c"setToValue:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (class c"NSNumber")
+                    (sel c"numberWithFloat:")
+                    [f32]
+                    (p/cast f32 opacity)))
+          (msg i64 a (sel c"setDuration:") [f64] duration)
+          (msg i64
+               a
+               (sel c"setTimingFunction:")
+               [(ptr i8)]
+               (timing c"easeInEaseOut"))
+          (msg i64
+               l
+               (sel c"addAnimation:forKey:")
+               [(ptr i8) (ptr i8)]
+               a
+               (ns c"fade")))
+        (msg i64 l (sel c"removeAnimationForKey:") [(ptr i8)] (ns c"fade")))
+    (commit!)
+    (do)))
+
 (defn transform! [(l (ptr i8)) (t Transform) (duration f64)] (-> i64)
   (eased-transform! l t duration (timing c"easeInEaseOut") 0.0))
 

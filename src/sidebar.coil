@@ -23,6 +23,7 @@
    (swipe-time f64)
    (transition f64)
    (switched bool)
+   (faded bool)
    (model (ptr i8))
    (rows (ptr i8))
    (show-hidden bool)
@@ -46,6 +47,13 @@
 
 (defn transition! [(offset f64)] (-> void)
   (set! (.transition (state)) offset))
+
+;;; Fade the sidebar in (SHOWN) or out over DURATION, as the cube's stage
+;;; widens over it or gives the window back.
+(defn fade! [(shown bool) (duration f64)] (-> void)
+  (let [st (state)]
+    (set! (.faded st) (not shown))
+    (fade-view! (.view st) (if shown 1.0 0.0) duration)))
 
 (defn finish-rename! [] (-> void)
   (let [st (state)]
@@ -646,7 +654,10 @@
         new-top (+ (* (p/cast f64 (s/count (.rows st))) 28.0) 1.0)
         in-new-row
           (and in-band (>= from-top new-top) (< from-top (+ new-top 28.0)))]
-    (cond (and (= kind 22) (>= (.x pt) 0.0) (< (.x pt) (.width st)))
+    ; Faded under the cube, it starts nothing: a click or a scroll there is
+    ; the cube's. A press begun before the fade still ends here.
+    (cond (and (.faded st) (or (= kind 1) (= kind 22))) false
+          (and (= kind 22) (>= (.x pt) 0.0) (< (.x pt) (.width st)))
             (let [phase (msg u64 event (sel c"phase") [])
                   dx (msg f64 event (sel c"scrollingDeltaX") [])
                   dy (msg f64 event (sel c"scrollingDeltaY") [])
