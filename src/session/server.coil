@@ -71,6 +71,10 @@
 
 (const PROC-PIDVNODEPATHINFO 9)
 
+;;; GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES: how many lines of history a
+;;; session's terminal keeps.
+(const SCROLLBACK-MAX-LINES 28)
+
 (defstruct SockaddrUn [(length u8) (family u8) (path (array i8 104))])
 
 (defstruct PollFd [(fd i32) (events i16) (revents i16)])
@@ -94,8 +98,6 @@
    (expire i64)])
 
 (defstruct GhosttyColor [(r u8) (g u8) (b u8)])
-
-(defstruct GhosttyTerminalOptions [(cols u16) (rows u16) (max-scrollback u64)])
 
 (defstruct GhosttyPrimary
   [(conformance u16) (features (array u16 64)) (count u64)])
@@ -141,9 +143,6 @@
 (static-assert (= (sizeof Winsize) 8) "Darwin winsize ABI size")
 
 (static-assert (= (sizeof GhosttyColor) 3) "Ghostty RGB ABI size")
-
-(static-assert (= (sizeof GhosttyTerminalOptions) 16)
-               "Ghostty terminal options ABI size")
 
 (extern socket :cc (cc/C) [i32 i32 i32] (-> i32))
 
@@ -240,12 +239,12 @@
 (extern ghostty_terminal_new
         :cc
         (cc/C)
-        [(ptr i8) (ptr (ptr i8)) GhosttyTerminalOptions]
+        [(ptr i8) (ptr (ptr i8)) u16 u16]
         (-> i32))
 
 (extern ghostty_terminal_set :cc (cc/C) [(ptr i8) i32 (ptr i8)] (-> i32))
 
-(extern ghostty_terminal_resize :cc (cc/C) [(ptr i8) u16 u16 u16 u16] (-> i32))
+(extern ghostty_terminal_resize :cc (cc/C) [(ptr i8) u16 u16 u32 u32] (-> i32))
 
 (extern ghostty_terminal_vt_write :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> void))
 
@@ -423,8 +422,8 @@
                 (if (!= (ghostty_terminal_resize (.terminal s)
                                                  cols
                                                  rows
-                                                 (p/cast u16 (/ width cols))
-                                                 (p/cast u16 (/ height rows)))
+                                                 (p/cast u32 (/ width cols))
+                                                 (p/cast u32 (/ height rows)))
                         (: 0 i32))
                     (do (set! (.failed s) true) 0)
                     (let [(mut size)
@@ -896,26 +895,25 @@
                                                                       (fcntl (.journal s)
                                                                              F-SETFD
                                                                              FD-CLOEXEC)
-                                                                      (let [options
-                                                                              (GhosttyTerminalOptions
-                                                                                :cols
-                                                                                  (: 80
-                                                                                     u16)
-                                                                                :rows
-                                                                                  (: 24
-                                                                                     u16)
-                                                                                :max-scrollback
-                                                                                  (: 10000
-                                                                                     u64))]
+                                                                      (let [(mut scrollback)
+                                                                              (: 10000
+                                                                                 u64)]
                                                                         (if (!= (ghostty_terminal_new (p/cast (ptr i8)
                                                                                                               0)
                                                                                                       (field s
                                                                                                              terminal)
-                                                                                                      options)
+                                                                                                      (: 80
+                                                                                                         u16)
+                                                                                                      (: 24
+                                                                                                         u16))
                                                                                 (: 0
                                                                                    i32))
                                                                             1
                                                                             (do
+                                                                              (ghostty_terminal_set (.terminal s)
+                                                                                                    SCROLLBACK-MAX-LINES
+                                                                                                    (p/cast (ptr i8)
+                                                                                                            (mut scrollback)))
                                                                               (ghostty_terminal_set (.terminal s)
                                                                                                     0
                                                                                                     (p/cast (ptr i8)

@@ -41,11 +41,14 @@ and stable terminal UUIDs. Version 1 migration preserves the earlier rewrite's
 layouts. Invalid saved documents are rejected without overwriting them. Session
 connection failures retain recoverable panes rather than deleting saved metadata.
 
-The Ghostty dependency is pinned to `7aa9591746ffa4d2eee458960c76554352832595`.
-Its C header is retained under `vendor/`, and the used ABI subset has compile-time
-checks in Coil. The Objective-C messaging and animation modules come from the
-existing Coil GPU UI experiment and are maintained in `src/` as Jim modules;
-see [source origins](PROVENANCE.md).
+The Ghostty dependency is pinned to v1.4.0
+(`83fb95624b0439ee660c2679b43b38c8b63769cd`). Its C header is retained under
+`vendor/`, and the used ABI subset has compile-time checks in Coil. The session
+service declares the libghostty-vt functions it calls in `src/session/server.coil`;
+those are checked against `include/ghostty/vt` by hand when the pin moves. The
+Objective-C messaging and animation modules come from the existing Coil GPU UI
+experiment and are maintained in `src/` as Jim modules; see
+[source origins](PROVENANCE.md).
 
 ## Session ownership and transport
 

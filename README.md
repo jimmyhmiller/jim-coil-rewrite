@@ -5,10 +5,11 @@ project canvases, live Coil theme settings, and a composited workspace cube.
 
 ## Run
 
-Requires Coil, Zig 0.16.0 for pinned Ghostty, Xcode's Metal toolchain, and a
-local signing identity. Jim's session service and transport are Coil; Zig is
-used only to build the pinned Ghostty dependency and its project-local backend
-extension. On a fresh checkout:
+Requires Coil, Xcode's Metal toolchain, and a local signing identity. Jim's
+session service and transport are Coil; Zig is used only to build the pinned
+Ghostty dependency (v1.4.0) and its project-local backend extension. The build
+downloads the Zig that Ghostty needs (0.17.0, checked against its digest) into
+`build/deps`, so the Zig on PATH is left alone. On a fresh checkout:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
@@ -23,9 +24,8 @@ service is the package's `session` executable artifact: a bare `coil build` or
 `coil run` also produces `build/jim-session`, linked against the Ghostty VT library.
 `GHOSTTY_SOURCE=/path/to/pinned/ghostty` can reuse an existing source checkout.
 Ghostty is built without its Sentry crash reporter, which would claim Jim's
-crashes as Ghostty's and, at this revision, races `ghostty_init`'s locale setup
-over the environment and crashed Jim at launch. Its version is given as the
-pinned revision; left alone, Ghostty's build reads this repository's git.
+crashes as Ghostty's. Its version is given as the pinned revision; left alone,
+Ghostty's build reads this repository's git.
 The build checks its embedding header against the pinned header. The development
 app is `build/JimCoil.app`; it resolves this checkout's configuration and resources.
 The build uses the existing `TerminalBevy Local Signing` identity; set

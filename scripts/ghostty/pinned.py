@@ -17,9 +17,18 @@ import tarfile
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
-REV = '7aa9591746ffa4d2eee458960c76554352832595'
+# Ghostty v1.4.0.
+REV = '83fb95624b0439ee660c2679b43b38c8b63769cd'
 DEST = ROOT / 'build/ghostty'
 LOCAL_SOURCE = ROOT / 'build/deps' / ('ghostty-' + REV)
+# The Zig this Ghostty requires, kept beside it so the Zig on PATH, which
+# other projects use, can stay at its own version.
+ZIG_VERSION = '0.17.0'
+ZIG_NAME = 'zig-aarch64-macos-' + ZIG_VERSION
+ZIG_SHA256 = 'b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a'
+ZIG_MIRRORS = ['https://ziglang.freetls.fastly.net/',
+               'https://ziglang.org/download/' + ZIG_VERSION + '/']
+ZIG = ROOT / 'build/deps' / ZIG_NAME / 'zig'
 LIBRARIES = {
     'internal': DEST / 'lib/libghostty-internal.a',
     'vt': DEST / 'lib/libghostty-vt.a',
@@ -39,13 +48,35 @@ def run(args, **kwargs):
     subprocess.run(args, check=True, stdout=sys.stderr, **kwargs)
 
 
-def zig_version():
-    return subprocess.check_output(['zig', 'version'], text=True).strip()
+def zig():
+    """The pinned Zig, downloaded and checked against its digest on first use."""
+    if not ZIG.is_file():
+        ZIG.parent.parent.mkdir(parents=True, exist_ok=True)
+        archive = ZIG.parent.parent / (ZIG_NAME + '.tar.xz')
+        for mirror in ZIG_MIRRORS:
+            print('Downloading Zig', ZIG_VERSION, 'from', mirror, file=sys.stderr)
+            try:
+                urllib.request.urlretrieve(mirror + ZIG_NAME + '.tar.xz', archive)
+            except OSError as error:
+                print('  failed:', error, file=sys.stderr)
+                continue
+            if hashlib.sha256(archive.read_bytes()).hexdigest() == ZIG_SHA256:
+                break
+            print('  digest mismatch', file=sys.stderr)
+        else:
+            raise SystemExit('Could not download Zig ' + ZIG_VERSION + ' with the pinned digest.')
+        with tarfile.open(archive) as tar:
+            tar.extractall(ZIG.parent.parent, filter='data')
+        archive.unlink()
+    version = subprocess.check_output([str(ZIG), 'version'], text=True).strip()
+    if version != ZIG_VERSION:
+        raise SystemExit(str(ZIG) + ' is Zig ' + version + ', not ' + ZIG_VERSION + '.')
+    return str(ZIG)
 
 
 def fingerprint():
     digest = hashlib.sha256()
-    digest.update(REV.encode() + b'\0' + zig_version().encode() + b'\0')
+    digest.update(REV.encode() + b'\0' + ZIG_VERSION.encode() + b'\0')
     for path in INPUTS:
         digest.update(str(path.relative_to(ROOT)).encode() + b'\0')
         digest.update(path.read_bytes())
@@ -92,15 +123,11 @@ def build():
     actual = hashlib.sha256((src / 'include/ghostty.h').read_bytes()).digest()
     if actual != expected:
         raise SystemExit('Ghostty header differs from the pinned, ABI-tested header. Refusing to build.')
-    if zig_version() != '0.16.0':
-        raise SystemExit('This Ghostty revision requires Zig 0.16.0.')
     run(['xcrun', '-sdk', 'macosx', 'metal', '--version'])
     run(['python3', str(ROOT / 'scripts/ghostty/session-backend.py'), str(src)])
     # Without Sentry: Ghostty's crash reporter would install its handlers in
-    # Jim and file Jim's crashes as Ghostty's, and its start-up thread reads
-    # the environment while ghostty_init's ensureLocale is changing it
-    # (fixed upstream after this revision), which crashed Jim at launch.
-    run(['zig', 'build', '-Dversion-string=' + version(src), '-Dsentry=false',
+    # Jim and file Jim's crashes as Ghostty's.
+    run([zig(), 'build', '-Dversion-string=' + version(src), '-Dsentry=false',
          '-Dapp-runtime=none', '-Demit-xcframework=true',
          '-Dxcframework-target=native', '-Doptimize=ReleaseFast', '-Demit-docs=false',
          '-Demit-webdata=false', '-Demit-macos-app=false', '--prefix', str(DEST)], cwd=src)
@@ -109,7 +136,7 @@ def build():
         raise SystemExit('Expected exactly one native GhosttyKit library.')
     (DEST / 'lib').mkdir(parents=True, exist_ok=True)
     shutil.copy2(artifacts[0], LIBRARIES['internal'])
-    run(['zig', 'build', '-Dversion-string=' + version(src),
+    run([zig(), 'build', '-Dversion-string=' + version(src),
          '-Demit-lib-vt=true', '-Doptimize=ReleaseFast',
          '-Demit-docs=false', '--prefix', str(DEST)], cwd=src)
     (DEST / 'revision').write_text(REV + '\n')

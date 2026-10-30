@@ -5,6 +5,7 @@
 (import "jim.sessions" :as sessions)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
 
 (defstruct Terminal
   [(view (ptr i8))
@@ -474,7 +475,7 @@
       (release pool))))
 
 (defn action [(app (ptr i8)) (target g/Target) (value g/Action)] (-> bool)
-  (if (and (= (.tag target) (: 1 i32)) (= (.tag value) (: 35 i32)))
+  (if (and (= (.tag target) g/TARGET-SURFACE) (= (.tag value) g/ACTION-PWD))
       (let [t
               (p/cast (ptr Terminal)
                       (g/ghostty_surface_userdata (.surface target)))
@@ -487,62 +488,169 @@
             false))
       false))
 
-(defn read-clipboard [(userdata (ptr i8)) (kind i32) (request (ptr i8))]
-  (-> bool)
-  (let [t (p/cast (ptr Terminal) userdata)
-        pb (msg (ptr i8) (class c"NSPasteboard") (sel c"generalPasteboard") [])
-        s
-          (msg (ptr i8)
-               pb
-               (sel c"stringForType:")
-               [(ptr i8)]
-               (ns c"public.utf8-plain-text"))]
-    (do
-      (g/ghostty_surface_complete_clipboard_request (.surface t)
-                                                    (if (= (p/cast i64 s) 0)
-                                                        c""
-                                                        (utf8 s))
-                                                    request
-                                                    false)
-      true)))
+;;; The general pasteboard's type for MIME, or nil when macOS knows none.
+(defn pasteboard-type [(mime (ptr i8))] (-> (ptr i8))
+  (if (= (strcmp mime c"text/plain") (: 0 i32))
+      (ns c"public.utf8-plain-text")
+      (let [type
+              (msg (ptr i8)
+                   (class c"UTType")
+                   (sel c"typeWithMIMEType:")
+                   [(ptr i8)]
+                   (ns mime))]
+        (if (= (p/cast i64 type) 0)
+            (nil)
+            (msg (ptr i8) type (sel c"identifier") [])))))
 
+;;; The MIME type of pasteboard TYPE as a C string, or null when it has none.
+;;; Plain text in any encoding is text/plain, the name Ghostty asks for.
+(defn mime-of [(type (ptr i8))] (-> (ptr i8))
+  (let [ut
+          (msg (ptr i8)
+               (class c"UTType")
+               (sel c"typeWithIdentifier:")
+               [(ptr i8)]
+               type)
+        plain
+          (msg (ptr i8)
+               (class c"UTType")
+               (sel c"typeWithIdentifier:")
+               [(ptr i8)]
+               (ns c"public.plain-text"))]
+    (cond (= (p/cast i64 ut) 0) (p/cast (ptr i8) 0)
+          (!= (msg i8 ut (sel c"conformsToType:") [(ptr i8)] plain) (: 0 i8))
+            c"text/plain"
+          :else
+            (let [mime (msg (ptr i8) ut (sel c"preferredMIMEType") [])]
+              (if (= (p/cast i64 mime) 0) (p/cast (ptr i8) 0) (utf8 mime))))))
+
+;;; Whether NAMES, COUNT C strings, include NAME.
+(defn listed? [(names (ptr (ptr i8))) (count i64) (name (ptr i8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 count]
+      (when (= (strcmp (load (index names i)) name) (: 0 i32))
+        (set! found true)))
+    (load found)))
+
+;;; Serve a terminal's clipboard read from the general pasteboard: each MIME
+;;; type it asks for that the pasteboard holds, and, when it asks for the
+;;; list, every MIME type the pasteboard could serve. Jim has only the
+;;; standard clipboard.
+(defn read-clipboard [(userdata (ptr i8))
+                      (kind i32)
+                      (request (ptr i8))
+                      (mimes (ptr (ptr i8)))
+                      (count u64)
+                      (list bool)] (-> i32)
+  (if (!= kind g/CLIPBOARD-STANDARD)
+      g/CLIPBOARD-READ-UNSUPPORTED
+      (let [t (p/cast (ptr Terminal) userdata)
+            pb
+              (msg (ptr i8)
+                   (class c"NSPasteboard")
+                   (sel c"generalPasteboard")
+                   [])
+            (mut contents)
+              (al/ArrayList::new [g/ClipboardContent] (alloc/malloc-allocator))
+            (mut available)
+              (al/ArrayList::new [(ptr i8)] (alloc/malloc-allocator))]
+        (for [i 0 (p/cast i64 count)]
+          (let [mime (load (index mimes i))
+                type (pasteboard-type mime)]
+            (when (and (!= (p/cast i64 type) 0) (not (listed? mimes i mime)))
+              (let [data
+                      (msg (ptr i8)
+                           pb
+                           (sel c"dataForType:")
+                           [(ptr i8)]
+                           type)]
+                (when (!= (p/cast i64 data) 0)
+                  (push! (mut contents)
+                         (g/ClipboardContent
+                           :mime mime
+                           :data (msg (ptr i8) data (sel c"bytes") [])
+                           :len (msg u64 data (sel c"length") []))))))))
+        (when list
+          (let [types (msg (ptr i8) pb (sel c"types") [])]
+            (for [i 0 (p/cast i64 (msg u64 types (sel c"count") []))]
+              (let [mime
+                      (mime-of (msg (ptr i8)
+                                    types
+                                    (sel c"objectAtIndex:")
+                                    [u64]
+                                    (p/cast u64 i)))]
+                (when (and (!= (p/cast i64 mime) 0)
+                           (not (listed? (.data available) (len available) mime)))
+                  (push! (mut available) mime))))))
+        (let [result
+                (if (and (= (len contents) 0) (not list))
+                    g/CLIPBOARD-READ-UNAVAILABLE
+                    (let [(mut complete)
+                            (g/ClipboardComplete
+                              :contents (.data contents)
+                              :count (p/cast u64 (len contents))
+                              :available (.data available)
+                              :available-count (p/cast u64 (len available))
+                              :confirmed false
+                              :remember false)]
+                      (g/ghostty_surface_complete_clipboard_request (.surface t)
+                                                                    (mut complete)
+                                                                    request)
+                      g/CLIPBOARD-READ-STARTED))]
+          (al/ArrayList::free! (mut contents))
+          (al/ArrayList::free! (mut available))
+          result))))
+
+;;; Ghostty asks before a read or write its policy holds back. Jim has no
+;;; prompt: a paste the user asked for is confirmed as it stands, and anything
+;;; else is refused. config/ghostty denies terminal reads outright.
 (defn confirm-clipboard [(userdata (ptr i8))
-                         (text (ptr i8))
+                         (confirm (ptr g/ClipboardConfirm))
                          (request (ptr i8))
                          (kind i32)] (-> void)
-  ; Explicit paste is permitted. Unsolicited terminal reads are disabled by config.
-  (g/ghostty_surface_complete_clipboard_request (.surface (p/cast (ptr Terminal)
-                                                                  userdata))
-                                                (if (= kind (: 0 i32))
-                                                    text
-                                                    c"")
-                                                request
-                                                true))
+  (let [surface (.surface (p/cast (ptr Terminal) userdata))]
+    (if (= kind g/CLIPBOARD-REQUEST-PASTE)
+        (let [(mut complete)
+                (g/ClipboardComplete
+                  :contents (.contents confirm)
+                  :count (.count confirm)
+                  :available (.available confirm)
+                  :available-count (.available-count confirm)
+                  :confirmed true
+                  :remember false)]
+          (g/ghostty_surface_complete_clipboard_request surface
+                                                        (mut complete)
+                                                        request))
+        (g/ghostty_surface_deny_clipboard_request surface request))))
 
+;;; Put a terminal's clipboard write on the general pasteboard, each
+;;; representation under its pasteboard type. A write that needs confirmation
+;;; is dropped, since Jim has no prompt to ask with; config/ghostty allows
+;;; terminal writes, so none should need one.
 (defn write-clipboard [(userdata (ptr i8))
                        (kind i32)
                        (contents (ptr g/ClipboardContent))
                        (count u64)
                        (confirm bool)] (-> void)
-  (do
-    (for [i 0 (p/cast i64 count)]
-      (let [c (index contents i)]
-        (if (= (strcmp (.mime c) c"text/plain") (: 0 i32))
-            (let [pb
-                    (msg (ptr i8)
-                         (class c"NSPasteboard")
-                         (sel c"generalPasteboard")
-                         [])]
-              (do
-                (msg i64 pb (sel c"clearContents") [])
-                (msg i8
-                     pb
-                     (sel c"setString:forType:")
-                     [(ptr i8) (ptr i8)]
-                     (ns (.data c))
-                     (ns c"public.utf8-plain-text"))))
-            0)))
-    (do)))
+  (when (and (= kind g/CLIPBOARD-STANDARD) (not confirm) (> count (: 0 u64)))
+    (let [pb
+            (msg (ptr i8) (class c"NSPasteboard") (sel c"generalPasteboard") [])]
+      (msg i64 pb (sel c"clearContents") [])
+      (for [i 0 (p/cast i64 count)]
+        (let [c (index contents i)
+              type (pasteboard-type (.mime c))]
+          (when (!= (p/cast i64 type) 0)
+            (msg i8
+                 pb
+                 (sel c"setData:forType:")
+                 [(ptr i8) (ptr i8)]
+                 (msg (ptr i8)
+                      (class c"NSData")
+                      (sel c"dataWithBytes:length:")
+                      [(ptr i8) u64]
+                      (.data c)
+                      (.len c))
+                 type)))))))
 
 (defn close-surface [(userdata (ptr i8)) (alive bool)] (-> void)
   (set! (.closed (p/cast (ptr Terminal) userdata)) true))

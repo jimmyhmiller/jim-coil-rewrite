@@ -79,7 +79,53 @@
 
 (static-assert (= (p/alignof Action) 8) "Ghostty action ABI alignment")
 
-(defstruct ClipboardContent [(mime (ptr i8)) (data (ptr i8))])
+(defstruct ClipboardContent [(mime (ptr i8)) (data (ptr i8)) (len u64)])
+
+(defstruct ClipboardComplete
+  [(contents (ptr ClipboardContent))
+   (count u64)
+   (available (ptr (ptr i8)))
+   (available-count u64)
+   (confirmed bool)
+   (remember bool)])
+
+(defstruct ClipboardConfirm
+  [(contents (ptr ClipboardContent))
+   (count u64)
+   (available (ptr (ptr i8)))
+   (available-count u64)
+   (name (ptr i8))
+   (can-remember bool)])
+
+(static-assert (= (p/sizeof ClipboardContent) 24)
+               "Ghostty clipboard content ABI size")
+
+(static-assert (= (p/sizeof ClipboardComplete) 40)
+               "Ghostty clipboard completion ABI size")
+
+(static-assert (= (p/offsetof ClipboardComplete confirmed) 32)
+               "Ghostty clipboard completion confirmed offset")
+
+(static-assert (= (p/sizeof ClipboardConfirm) 48)
+               "Ghostty clipboard confirmation ABI size")
+
+;;; ghostty_target_tag_e, ghostty_action_tag_e
+(const TARGET-SURFACE (: 1 i32))
+
+(const ACTION-PWD (: 37 i32))
+
+;;; ghostty_clipboard_e
+(const CLIPBOARD-STANDARD (: 0 i32))
+
+;;; ghostty_clipboard_read_result_e
+(const CLIPBOARD-READ-STARTED (: 0 i32))
+
+(const CLIPBOARD-READ-UNAVAILABLE (: 1 i32))
+
+(const CLIPBOARD-READ-UNSUPPORTED (: 2 i32))
+
+;;; ghostty_clipboard_request_e
+(const CLIPBOARD-REQUEST-PASTE (: 0 i32))
 
 (extern ghostty_init :cc (cc/C) [u64 (ptr (ptr i8))] (-> i32))
 
@@ -156,7 +202,13 @@
 (extern ghostty_surface_complete_clipboard_request
         :cc
         (cc/C)
-        [(ptr i8) (ptr i8) (ptr i8) bool]
+        [(ptr i8) (ptr ClipboardComplete) (ptr i8)]
+        (-> void))
+
+(extern ghostty_surface_deny_clipboard_request
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr i8)]
         (-> void))
 
 (extern ghostty_surface_process_exited :cc (cc/C) [(ptr i8)] (-> bool))
