@@ -1,6 +1,8 @@
 (module jim.core-test)
 (import "jim.workspace" :as workspace)
-(import "jim.reload" :as reload)
+(import "jim.theme" :as theme)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "jim.ghostty" :as ghostty)
 (import "jim.native" :use *)
 (import "coil.math" :use [Float])
@@ -231,22 +233,83 @@
   (assert (= (sizeof ghostty/Target) 16))
   (assert (= (sizeof ghostty/Action) 32)))
 
-(deftest hot-load-copies-values-without-retaining-code
-  (let [(mut config) (reload/defaults)]
-    (assert (reload/load-config! c"build/shell-test.dylib" config))
-    (assert (near? (.duration config) 0.42))
-    (assert (near? (.sidebar config) 224.0))
-    (assert (not (reload/load-config! c"build/no-such-image.dylib"
-                                      config)))
-    (assert (near? (.sidebar config) 224.0))))
+(defn problem-of [(text (slice u8))] (-> (ArrayList u8))
+  (let [(mut t) (theme/defaults)
+        (mut problem) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (not (theme/parse! text (mut t) (mut problem))))
+    ; a refused theme leaves the last good one alone
+    (assert (= (load t) (theme/defaults)))
+    (load problem)))
 
-(deftest invalid-hot-load-values-are-rejected
-  (let [(mut config) (reload/defaults)]
-    (set! (.duration config) -1.0)
-    (assert (not (reload/valid? (load config))))
-    (set! config (reload/defaults))
-    (set! (.sidebar config) 10000.0)
-    (assert (not (reload/valid? (load config))))))
+(defn refused-with? [(text (slice u8)) (expected (slice u8))] (-> bool)
+  (let [(mut problem) (problem-of text)
+        same (= (slice problem) expected)]
+    (when (not same) (println "theme refused with: {s}" (slice problem)) 0)
+    (ArrayList::free! (mut problem))
+    same))
+
+(deftest the-shipped-theme-is-the-default
+  (let [(mut t) (theme/defaults)
+        (mut problem) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (set! (.duration t) 1.0)
+    (assert (theme/load! "config/theme" (mut t) (mut problem)))
+    (assert (= (load t) (theme/defaults)))
+    (ArrayList::free! (mut problem))))
+
+(defn theme-text [(duration (slice u8)) (extra (slice u8))] (-> (ArrayList u8))
+  (let [(mut text) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (theme/push-str! (mut text) "; a theme\n(Theme\n  duration ")
+    (theme/push-str! (mut text) duration)
+    (theme/push-str! (mut text)
+                     "\n  accent-r 0.4 accent-g 0.78 accent-b 0.96
+  canvas-r 0.055 canvas-g 0.07 canvas-b 0.095
+  rail-r 0.075 rail-g 0.09 rail-b 0.12
+  pane-r 0.105 pane-g 0.135 pane-b 0.18
+  ink-r 0.88 ink-g 0.91 ink-b 0.96
+  muted-r 0.51 muted-g 0.57 muted-b 0.65
+  shadow-r 0.005 shadow-g 0.009 shadow-b 0.018
+  edge-width 140 edge-distance 600 edge-strength 0.95")
+    (theme/push-str! (mut text) extra)
+    (theme/push-str! (mut text) ")\n")
+    (load text)))
+
+(deftest a-theme-reads-every-value
+  (let [(mut text) (theme-text "1.5" "")
+        (mut t) (theme/defaults)
+        (mut problem) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (theme/parse! (slice text) (mut t) (mut problem)))
+    (assert (near? (.duration t) 1.5))
+    (assert (near? (.edge-distance t) 600.0))
+    (assert (near? (.shadow-b t) 0.018))
+    (ArrayList::free! (mut problem))
+    (ArrayList::free! (mut text))))
+
+(deftest a-theme-out-of-range-is-refused-by-name
+  (let [(mut text) (theme-text "5" "")]
+    (assert (refused-with? (slice text)
+                           "duration is out of range"))
+    (ArrayList::free! (mut text))))
+
+(deftest a-misspelt-theme-value-is-refused-with-its-line
+  (let [(mut text) (theme-text "0.42" "\n  edge-strenght 0.5")]
+    (assert (refused-with? (slice text)
+                           "unknown field edge-strenght"))
+    (ArrayList::free! (mut text))))
+
+(deftest a-theme-missing-a-value-is-refused
+  (assert (refused-with? "(Theme duration 0.42)"
+                         "missing field Theme.accent-r")))
+
+(deftest a-theme-that-is-not-one-is-refused
+  (assert (refused-with? "(Thme duration 0.42"
+                         "line 1: malformed input invalid s-expression"))
+  (assert (refused-with? "; a theme\n(Theme\n  duration \"fast\")"
+                         "line 3: expected a number"))
+  (let [(mut t) (theme/defaults)
+        (mut problem) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (not (theme/load! "config/no-such-theme" (mut t) (mut problem))))
+    (assert (= (slice problem) "cannot read it"))
+    (ArrayList::free! (mut problem))))
 
 (deftest native-index-formatting-uses-the-real-integer
   (let [pool (new c"NSAutoreleasePool")]

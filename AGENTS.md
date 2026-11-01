@@ -13,7 +13,7 @@ Use modern Coil syntax in application code:
 - Treat vendored examples as implementation references, not the language style guide.
 
 Before completing Coil changes:
-1. Run `coil fmt --write src/*.coil tests/*.coil config/*.coil`.
+1. Run `coil fmt --write src/*.coil tests/*.coil`.
 2. Run `coil lint --fix`. Apply it to separately compiled entries as needed.
 3. Run format again after lint fixes, inspect the diff, and run the relevant checks,
    including `scripts/test.sh` for changes covered by the project suites.
@@ -35,5 +35,4 @@ while direct Coil calls retain Coil's internal struct-reference convention.
 
 Only patch the project-local pinned Ghostty dependency under build/deps; never
 modify original Jim's checkout or installed Ghostty. Reproduce patches through
-scripts/ghostty/session-backend.py. Compile config/ from its own package directory
-so hot configuration libraries cannot link a second copy of Ghostty into the app.
+scripts/ghostty/session-backend.py.

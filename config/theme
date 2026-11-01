@@ -1,0 +1,16 @@
+; Jim's theme. Save to apply it; a file that does not read as a theme, or a
+; value out of range, keeps the last good one, and Jim prints why.
+; Colours are red, green and blue from 0 to 1.
+(Theme
+  duration 0.42  ; seconds a transition takes, 0.05 to 2
+  accent-r 0.4  accent-g 0.78  accent-b 0.96
+  canvas-r 0.055  canvas-g 0.07  canvas-b 0.095
+  rail-r 0.075  rail-g 0.09  rail-b 0.12
+  pane-r 0.105  pane-g 0.135  pane-b 0.18
+  ink-r 0.88  ink-g 0.91  ink-b 0.96
+  muted-r 0.51  muted-g 0.57  muted-b 0.65
+  ; A shadow on each edge of a canvas shows how far its origin lies beyond it.
+  shadow-r 0.005  shadow-g 0.009  shadow-b 0.018
+  edge-width 140.0     ; the shadow's width in points, 20 to 240
+  edge-distance 600.0  ; how far beyond, in canvas points, makes it darkest, 50 to 4000
+  edge-strength 0.95)  ; its opacity when darkest, 0 to 1

@@ -1,0 +1,172 @@
+(module jim.theme)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "coil.serde.sexp" :as sexp)
+
+;;; Jim's theme: its colours as red, green and blue from 0 to 1, how long a
+;;; transition takes, and the shadows at a canvas's edges that show it goes on
+;;; past them. It is data: config/theme holds one as an s-expression, which Jim
+;;; reads again whenever it changes.
+(defstruct Theme
+  [(duration f64)
+   (accent-r f64)
+   (accent-g f64)
+   (accent-b f64)
+   (canvas-r f64)
+   (canvas-g f64)
+   (canvas-b f64)
+   (rail-r f64)
+   (rail-g f64)
+   (rail-b f64)
+   (pane-r f64)
+   (pane-g f64)
+   (pane-b f64)
+   (ink-r f64)
+   (ink-g f64)
+   (ink-b f64)
+   (muted-r f64)
+   (muted-g f64)
+   (muted-b f64)
+   (shadow-r f64)
+   (shadow-g f64)
+   (shadow-b f64)
+   (edge-width f64)
+   (edge-distance f64)
+   (edge-strength f64)])
+
+;;; A theme file names every value, and a name Theme does not have is refused,
+;;; so a misspelt one is reported instead of ignored.
+(derive (Deserialize (deny-unknown)) Theme)
+
+(derive Eq Theme)
+
+;;; The theme Jim starts with, until it has read config/theme.
+(defn defaults [] (-> Theme)
+  (Theme
+    :duration 0.42
+    :accent-r 0.4
+    :accent-g 0.78
+    :accent-b 0.96
+    :canvas-r 0.055
+    :canvas-g 0.07
+    :canvas-b 0.095
+    :rail-r 0.075
+    :rail-g 0.09
+    :rail-b 0.12
+    :pane-r 0.105
+    :pane-g 0.135
+    :pane-b 0.18
+    :ink-r 0.88
+    :ink-g 0.91
+    :ink-b 0.96
+    :muted-r 0.51
+    :muted-g 0.57
+    :muted-b 0.65
+    :shadow-r 0.005
+    :shadow-g 0.009
+    :shadow-b 0.018
+    :edge-width 140.0
+    :edge-distance 600.0
+    :edge-strength 0.95))
+
+(defn bounded? [(x f64) (low f64) (high f64)] (-> bool)
+  (and (>= x low) (<= x high)))
+
+(defn unit? [(x f64)] (-> bool)
+  (bounded? x 0.0 1.0))
+
+;;; The name of the first value of T outside its range, or "" when there is none.
+(defn out-of-range [(t Theme)] (-> (slice u8))
+  (cond (not (bounded? (.duration t) 0.05 2.0)) "duration"
+        (not (unit? (.accent-r t))) "accent-r"
+        (not (unit? (.accent-g t))) "accent-g"
+        (not (unit? (.accent-b t))) "accent-b"
+        (not (unit? (.canvas-r t))) "canvas-r"
+        (not (unit? (.canvas-g t))) "canvas-g"
+        (not (unit? (.canvas-b t))) "canvas-b"
+        (not (unit? (.rail-r t))) "rail-r"
+        (not (unit? (.rail-g t))) "rail-g"
+        (not (unit? (.rail-b t))) "rail-b"
+        (not (unit? (.pane-r t))) "pane-r"
+        (not (unit? (.pane-g t))) "pane-g"
+        (not (unit? (.pane-b t))) "pane-b"
+        (not (unit? (.ink-r t))) "ink-r"
+        (not (unit? (.ink-g t))) "ink-g"
+        (not (unit? (.ink-b t))) "ink-b"
+        (not (unit? (.muted-r t))) "muted-r"
+        (not (unit? (.muted-g t))) "muted-g"
+        (not (unit? (.muted-b t))) "muted-b"
+        (not (unit? (.shadow-r t))) "shadow-r"
+        (not (unit? (.shadow-g t))) "shadow-g"
+        (not (unit? (.shadow-b t))) "shadow-b"
+        (not (bounded? (.edge-width t) 20.0 240.0)) "edge-width"
+        (not (bounded? (.edge-distance t) 50.0 4000.0)) "edge-distance"
+        (not (unit? (.edge-strength t))) "edge-strength"
+        :else ""))
+
+(defn valid? [(t Theme)] (-> bool)
+  (= (len (out-of-range t)) 0))
+
+(defn push-str! [(l (ptr (ArrayList u8))) (s (slice u8))] (-> void)
+  (extend! (mut l) (data s) (len s))
+  (do))
+
+(defn push-int! [(l (ptr (ArrayList u8))) (n i64)] (-> void)
+  (when (>= n 10) (push-int! l (/ n 10)) 0)
+  (push! (mut l) (p/cast u8 (+ 48 (% n 10))))
+  (do))
+
+;;; The line of TEXT that byte OFFSET is on, counting from 1.
+(defn line-of [(text (slice u8)) (offset i64)] (-> i64)
+  (let [(mut line) 1]
+    (for [i 0 (if (< offset (len text)) offset (len text))]
+      (when (= (get text i) (: 10 u8)) (set! line (+ (load line) 1)) 0))
+    (load line)))
+
+;;; Read TEXT, a theme, into OUT. False, with why appended to PROBLEM, when it
+;;; is not one or a value is out of range; OUT is then unchanged.
+(defn parse! [(text (slice u8))
+              (out (ptr Theme))
+              (problem (ptr (ArrayList u8)))] (-> bool)
+  (match (sexp/from-sexp [Theme] (alloc/malloc-allocator) text)
+    (Err [e]
+         ; An unknown field's offset is where the theme starts, not where the
+         ; field is (coil-bugs: serde-unknown-field-offset-is-the-structs), so
+         ; only its name says where it is.
+         (when (and (>= (.offset e) 0)
+                    (match (.kind e) (UnknownField [] false) (_ true)))
+           (push-str! problem "line ")
+           (push-int! problem (line-of text (.offset e)))
+           (push-str! problem ": ")
+           0)
+         (push-str! problem (de-error-message (.kind e)))
+         ; the context often restates the kind; say it once
+         (when (and (> (len (.ctx e)) 0)
+                    (!= (.ctx e) (de-error-message (.kind e))))
+           (push-str! problem " ")
+           (push-str! problem (.ctx e))
+           0)
+         false)
+    (Ok [t]
+        (let [bad (out-of-range t)]
+          (if (= (len bad) 0)
+              (do (set! out t) true)
+              (do
+                (push-str! problem bad)
+                (push-str! problem " is out of range")
+                false))))))
+
+;;; Read the theme file at PATH into OUT, as parse! does.
+(defn load! [(path (slice u8))
+             (out (ptr Theme))
+             (problem (ptr (ArrayList u8)))] (-> bool)
+  (match (fs/read-file (alloc/malloc-allocator) path)
+    (Err [_] (push-str! problem "cannot read it") false)
+    (Ok [text]
+        (let [ok (parse! text out problem)]
+          (alloc/free [u8] (alloc/malloc-allocator) text)
+          ok))))

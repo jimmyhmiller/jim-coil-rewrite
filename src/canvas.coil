@@ -4,7 +4,7 @@
 (import "jim.widget-view" :as widget-view)
 (import "jim.widget-api" :as api)
 (import "jim.ghostty" :as g)
-(import "jim.reload" :as theme)
+(import "jim.theme" :as theme)
 (import "jim.storage" :as storage)
 (import "jim.sessions" :as sessions)
 (import "jim.animation" :as animation)
@@ -55,7 +55,7 @@
    (hovered (ptr Pane))
    (exposed-at f64)
    (returning-at f64)
-   (theme theme/Config)
+   (theme theme/Theme)
    (zoom-enabled bool)
    (space-held bool)
    (last-click f64)
@@ -306,7 +306,7 @@
       (commit!)
       (do))))
 
-(defn apply-theme! [(c (ptr Canvas)) (cfg theme/Config)] (-> void)
+(defn apply-theme! [(c (ptr Canvas)) (cfg theme/Theme)] (-> void)
   (do
     (set! (.theme c) cfg)
     (for [i 0 (count c)]
@@ -326,7 +326,7 @@
                (color (.muted-r cfg) (.muted-g cfg) (.muted-b cfg) 1.0)))))
     (project! c)))
 
-(defn create! [(parent (ptr i8)) (width f64) (height f64) (cfg theme/Config)]
+(defn create! [(parent (ptr i8)) (width f64) (height f64) (cfg theme/Theme)]
   (-> (ptr Canvas))
   (let [c (alloc/box! (alloc/malloc-allocator) Canvas (zeroed Canvas))]
     (do

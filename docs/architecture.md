@@ -23,16 +23,14 @@ Nested canvases and the rest of Jim's pane kinds remain migration work.
 The origin indicators match `jim-app/src/canvas.rs`: screen-space edge gradients
 are behind panes, and their strength measures how far the origin lies beyond that
 viewport edge in world units. Width, saturation distance, strength, and shadow
-color are live Coil theme values. Main surfaces and pane chrome also have explicit
+color are live theme values. Main surfaces and pane chrome also have explicit
 tokens. Ghostty's own palette/configuration lives in `config/ghostty`.
 
-The live configuration boundary is versioned: a separately compiled Coil dylib
-exports a version and indexed numeric values. Compilation runs in an NSTask; a
-failed compile, unsupported ABI, or invalid value preserves the last good config.
-The host copies validated values and unloads the image. No pointer into the dylib
-is retained. This is trusted native code; execution budgets and metaprogram-based
-isolation have not been implemented. The boundary should grow into versioned pane
-providers without moving terminal ownership into reloadable code.
+The theme is data, not code: `config/theme` is an s-expression that `jim.theme`
+decodes into its `Theme` with coil.serde, refusing unknown and missing values,
+and validates field by field. Jim reads it on the main thread when it changes
+or on ⌘R; a file that does not decode, or a value out of range, preserves the
+last good theme.
 
 Layout persistence stores project cameras, pane rectangles, z-order, and focus in
 `~/Library/Application Support/JimCoil/layout.json`, using an atomic replacement.

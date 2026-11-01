@@ -1,4 +1,0 @@
-[package]
-name = "jim-shell-config"
-entry = "shell.coil"
-source-roots = ["."]

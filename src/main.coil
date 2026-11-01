@@ -16,7 +16,7 @@
 (import "jim.palette" :as palette)
 (import "jim.timings" :as timings)
 (import "jim.animation" :as animation)
-(import "jim.reload" :as reload)
+(import "jim.theme" :as theme)
 (import "coil.primitive" :as p)
 (import "coil.args" :as args)
 (import "coil.math" :use [Float])
@@ -44,7 +44,7 @@
    (projects (al/ArrayList ProjectView))
    (model (ptr i8))
    (notes (ptr i8))
-   (config reload/Config)
+   (theme theme/Theme)
    (width f64)
    (height f64)
    (selected i64)
@@ -78,9 +78,7 @@
    (settle-at f64)
    ;; Whether every project's panes must be posed again (after a layout).
    (refit bool)
-   (task (ptr i8))
-   (generation i64)
-   (output (ptr i8))
+   ;; When config/theme was last changed, as of its last read.
    (stamp f64)
    (maintenance-at f64)
    (running bool)])
@@ -600,7 +598,7 @@
         fw (face-width width)
         fh height
         scale (msg f64 (.window s) (sel c"backingScaleFactor") [])
-        cfg (.config s)]
+        cfg (.theme s)]
     (do
       (transaction! 0.0)
       (msg i64
@@ -638,81 +636,21 @@
       (commit!)
       (do))))
 
-(defn reload-start! [] (-> void)
-  (let [s (shell)]
-    (if (= (p/cast i64 (.task s)) 0)
-        (let [task (new c"NSTask")
-              output
-                (indexed-string c"../build/config-"
-                                (+ (.generation s) 1)
-                                c".dylib")
-              argv (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
-              error (p/alloc-stack (ptr i8))
-              bundled (runtime/toolchain)]
-          (do
-            (set! error (nil))
-            (set! (.generation s) (+ (.generation s) 1))
-            (msg i64
-                 task
-                 (sel c"setExecutableURL:")
-                 [(ptr i8)]
-                 (msg (ptr i8)
-                      (class c"NSURL")
-                      (sel c"fileURLWithPath:")
-                      [(ptr i8)]
-                      (ns (if (= (p/cast i64 bundled) 0)
-                              c"/usr/bin/env"
-                              bundled))))
-            ; A release builds with its own toolchain; a development build with
-            ; the one on PATH.
-            (if (= (p/cast i64 bundled) 0)
-                (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"coil"))
-                ; The release's compiler links LLVM where Homebrew keeps it;
-                ; dyld falls back to the bundle's copy where that is missing.
-                (let [env
-                        (msg (ptr i8)
-                             (msg (ptr i8)
-                                  (msg (ptr i8)
-                                       (class c"NSProcessInfo")
-                                       (sel c"processInfo")
-                                       [])
-                                  (sel c"environment")
-                                  [])
-                             (sel c"mutableCopy")
-                             [])]
-                  (msg i64
-                       env
-                       (sel c"setObject:forKey:")
-                       [(ptr i8) (ptr i8)]
-                       (runtime/frameworks)
-                       (ns c"DYLD_FALLBACK_LIBRARY_PATH"))
-                  (msg i64 task (sel c"setEnvironment:") [(ptr i8)] env)
-                  (release env)))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"build"))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"shell.coil"))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"--shared"))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] (ns c"-o"))
-            (msg i64 argv (sel c"addObject:") [(ptr i8)] output)
-            (msg i64 task (sel c"setArguments:") [(ptr i8)] argv)
-            (msg i64
-                 task
-                 (sel c"setCurrentDirectoryPath:")
-                 [(ptr i8)]
-                 (ns c"config"))
-            (if (!= (msg i8
-                         task
-                         (sel c"launchAndReturnError:")
-                         [(ptr (ptr i8))]
-                         error)
-                    (: 0 i8))
-                (do
-                  (set! (.task s) task)
-                  (set! (.output s) (msg (ptr i8) output (sel c"retain") []))
-                  (status! c"Compiling Coil configuration…"))
-                (do
-                  (release task)
-                  (status! c"Could not launch Coil compiler; see launch environment.")))))
-        (do))))
+;;; Read config/theme again and apply it. A file that is not a theme keeps the
+;;; last good one, and Jim says why.
+(defn theme-load! [] (-> void)
+  (let [s (shell)
+        (mut problem) (al/ArrayList::new [u8] (alloc/malloc-allocator))]
+    (if (theme/load! "config/theme" (field s theme) (mut problem))
+        (do (layout!) (status! c"Theme applied"))
+        (do
+          (theme/push-str! (mut problem) "; keeping the last good theme")
+          (push! [u8] (mut problem) (: 0 u8))
+          (printf c"Jim: config/theme: %s\n"
+                  (p/cast (ptr i8) (data (slice problem))))
+          0))
+    (al/ArrayList::free! (mut problem))
+    (do)))
 
 (defn background-maintenance! [] (-> void)
   (let [s (shell)
@@ -724,26 +662,6 @@
               (> (.height s) (.h bounds)))
           (layout!)
           (do))
-      (if (and (!= (p/cast i64 (.task s)) 0)
-               (= (msg i8 (.task s) (sel c"isRunning") []) (: 0 i8)))
-          (do
-            (if (and (= (msg i32 (.task s) (sel c"terminationStatus") [])
-                        (: 0 i32))
-                     (reload/load-config! (utf8 (msg (ptr i8)
-                                                     (ns c"config")
-                                                     (sel c"stringByAppendingPathComponent:")
-                                                     [(ptr i8)]
-                                                     (.output s)))
-                                          (field s config)))
-                (do
-                  (layout!)
-                  (status! c"Coil configuration reloaded · terminals preserved"))
-                (status! c"Reload failed · keeping last good configuration · see compiler output"))
-            (release (.task s))
-            (release (.output s))
-            (set! (.task s) (nil))
-            (set! (.output s) (nil)))
-          0)
       (let [manager
               (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
             attrs
@@ -751,7 +669,7 @@
                    manager
                    (sel c"attributesOfItemAtPath:error:")
                    [(ptr i8) (ptr i8)]
-                   (ns c"config/shell.coil")
+                   (ns c"config/theme")
                    (nil))
             date
               (msg (ptr i8)
@@ -760,8 +678,8 @@
                    [(ptr i8)]
                    (ns c"NSFileModificationDate"))
             stamp (msg f64 date (sel c"timeIntervalSince1970") [])]
-        (if (and (> stamp (.stamp s)) (= (p/cast i64 (.task s)) 0))
-            (do (set! (.stamp s) stamp) (reload-start!))
+        (if (> stamp (.stamp s))
+            (do (set! (.stamp s) stamp) (theme-load!))
             (do))))))
 
 (defn save-layout! [] (-> bool)
@@ -833,7 +751,7 @@
                       c"CATransformLayer")
         ; Before the canvas, so it lies behind the panes.
         plate (view f (rect 0.0 0.0 1032.0 736.0))
-        c (canvas/create! f 1032.0 736.0 (.config s))
+        c (canvas/create! f 1032.0 736.0 (.theme s))
         saved (storage/get record c"layout")]
     (do
       ; Behind the canvas's edge shadows (-1) in the face's 3D space.
@@ -976,7 +894,7 @@
                   (canvas/project! (project i))))
               (do)))
         (= id 8) (if (>= (.selected (shell)) 0) (toggle!) (do))
-        (= id 9) (reload-start!)
+        (= id 9) (theme-load!)
         (= id 10) (timings/toggle!)
         (= id 29)
           (when (and (>= (.selected (shell)) 0) (not (.overview (shell))))
@@ -1219,7 +1137,7 @@
                                     (set! (.angle s)
                                           (nearest-angle (.selected s)))
                                     (set! (.spin s) 0.0)
-                                    (pose! (.duration (.config s))))
+                                    (pose! (.duration (.theme s))))
                                 :else (do))
                           true)
                       :else false))
@@ -1379,7 +1297,7 @@
           (set! (.app s) app)
           (set! (.window s) window)
           (set! (.root s) root)
-          (set! (.config s) (reload/defaults))
+          (set! (.theme s) (theme/defaults))
           (set! (.running s) true)
           (msg i8 app (sel c"setActivationPolicy:") [i64] 0)
           (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns c"Jim · Coil"))
@@ -1592,13 +1510,6 @@
                                                (* 1000.0
                                                   (- (timings/now) start)))))
                           (release frame-pool)))))
-                  (if (!= (p/cast i64 (.task s)) 0)
-                      (do
-                        (msg i64 (.task s) (sel c"terminate") [])
-                        (msg i64 (.task s) (sel c"waitUntilExit") [])
-                        (release (.task s))
-                        (release (.output s)))
-                      0)
                   (save-layout!)
                   (palette/free!)
                   (timings/free!)

@@ -24,7 +24,7 @@
         (= id 6) c"Canvas: Zoom out"
         (= id 7) c"Canvas: Toggle zoom"
         (= id 8) c"Workspace: Show or hide cube"
-        (= id 9) c"Theme: Reload Coil configuration"
+        (= id 9) c"Theme: Reload config/theme"
         (= id 10) c"Developer: Toggle frame timings"
         (= id 11) c"Project: First visible project"
         (= id 12) c"Project: Second visible project"

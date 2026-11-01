@@ -6,14 +6,14 @@
 ;;; Where Jim runs from. A development build runs in this checkout: the bundle
 ;;; is build/JimCoil.app, and Jim works two levels above it. A release bundle
 ;;; (scripts/release.py) carries the files Jim reads at run time in
-;;; Contents/Resources/root, and its own Coil toolchain in
-;;; Contents/Resources/coil, so it runs on a Mac without the checkout, Coil or
-;;; Homebrew's LLVM.
+;;; Contents/Resources/root, and the Coil standard library widgets compile
+;;; against in Contents/Resources/coil, so it runs on a Mac without the checkout
+;;; or Coil.
 ;;;
 ;;; A release never writes into its bundle. It works in a copy of the root under
 ;;; Application Support, refreshed whenever the release changes. The widgets and
-;;; the shell configuration in that copy are the user's to edit, so a newer
-;;; release adds the files they lack and leaves the others alone.
+;;; the configuration in that copy are the user's to edit, so a newer release
+;;; adds the files they lack and leaves the others alone.
 (extern strdup :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (defn files [] (-> (ptr i8))
@@ -39,26 +39,20 @@
                 name)]
     (if (exists? path) path (nil))))
 
-;;; The bundle's Frameworks, where a release keeps the libraries its toolchain
-;;; links.
-(defn frameworks [] (-> (ptr i8))
-  (msg (ptr i8)
-       (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
-       (sel c"privateFrameworksPath")
-       []))
-
-;;; The release's own `coil`, as a C string that lives as long as Jim, or null
-;;; in a development build.
+;;; The toolchain a release's widget sessions name, as a C string that lives as
+;;; long as Jim, or null in a development build. coil.jit finds the standard
+;;; library from a compiler's path, <prefix>/bin/coil beside <prefix>/lib/coil. A
+;;; tpde session only reads that library and never runs the compiler, so the
+;;; release ships the library alone (scripts/release.py).
 (defn toolchain [] (-> (ptr i8))
   (let [cell (p/alloc-static (ptr i8))
         known (p/alloc-static bool)]
     (when (not (load known))
-      (let [path (resource c"coil/bin/coil")]
-        (set! cell
-              (if (= (p/cast i64 path) 0)
-                  (p/cast (ptr i8) 0)
-                  (strdup (utf8 path))))
-        (set! known true)))
+      (set! cell
+            (if (= (p/cast i64 (resource c"coil/lib/coil/stdlib")) 0)
+                (p/cast (ptr i8) 0)
+                (strdup (utf8 (join (resource c"coil") c"bin/coil")))))
+      (set! known true))
     (load cell)))
 
 (defn copy! [(from (ptr i8)) (to (ptr i8))] (-> bool)

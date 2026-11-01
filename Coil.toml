@@ -4,6 +4,11 @@ entry = "src/main.coil"
 source-roots = ["src", "tests"]
 exclude = ["src/session/server.coil"]
 
+# Widgets compile through tpde alone, so Jim links no LLVM. Jim itself is still
+# compiled with LLVM.
+[build]
+jit = "tpde"
+
 [link]
 frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers", "CoreServices"]
 libs = ["objc", "c++"]

@@ -424,46 +424,16 @@
       (assert (< (- (now-ms) t0) 1000)))
     (widgets/free! r)))
 
-(deftest reloads-finish-optimized-and-keep-state
+(deftest a-save-during-a-compile-is-compiled-after-it
   (mkdir c"build" (: 493 u16))
   (mkdir c"build/widget-tests" (: 493 u16))
   (let [r (widgets/create-in "build/widget-tests" "probe" "." "")]
     (write-probe! (probe-source "one" false))
     (widgets/reload! r)
-    ; The quick native build goes live first; the optimized one follows.
-    (while (not (widgets/live? r))
-      (usleep (: 2000 u32))
-      (widgets/service-poll!))
-    (assert (not (widgets/optimized? r)))
-    (assert (widgets/render! r 400.0 300.0 0.0))
-    (click! r "go")
-    (assert (widgets/settle! r))
-    (assert (widgets/optimized? r))
-    (assert (widgets/render! r 400.0 300.0 0.0))
-    (assert (has-text? r "one 1"))
-    (click! r "go")
+    ; "one" is compiling; this save supersedes it.
     (write-probe! (probe-source "two" false))
     (widgets/reload! r)
     (assert (widgets/settle! r))
-    (assert (widgets/optimized? r))
-    (assert (widgets/render! r 400.0 300.0 0.0))
-    (assert (has-text? r "two 2"))
-    (widgets/free! r)))
-
-(deftest a-save-during-the-optimized-compile-wins
-  (mkdir c"build" (: 493 u16))
-  (mkdir c"build/widget-tests" (: 493 u16))
-  (let [r (widgets/create-in "build/widget-tests" "probe" "." "")]
-    (write-probe! (probe-source "one" false))
-    (widgets/reload! r)
-    (while (not (widgets/live? r))
-      (usleep (: 2000 u32))
-      (widgets/service-poll!))
-    ; The optimized build of "one" is compiling; this save supersedes it.
-    (write-probe! (probe-source "two" false))
-    (widgets/reload! r)
-    (assert (widgets/settle! r))
-    (assert (widgets/optimized? r))
     (assert (widgets/render! r 400.0 300.0 0.0))
     (assert (has-text? r "two 0"))
     (widgets/free! r)))

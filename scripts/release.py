@@ -5,21 +5,16 @@ A development build runs inside this checkout and uses the `coil` on PATH. The
 release carries everything Jim reads at run time instead, so it runs on a Mac
 with neither (see src/runtime.coil):
 
-  Contents/MacOS/jim-coil      the app
-  Contents/Frameworks/         libLLVM and the libraries it needs, which the app
-                               (for its widget JIT) and the toolchain link
+  Contents/MacOS/jim-coil      the app; built with `jit = "tpde"`, so its widget
+                               JIT links no LLVM
+  Contents/Frameworks/         any libraries the app links that macOS lacks
+                               (none today, so it is left out)
   Contents/Resources/root/     Coil.toml, src/, widgets/, config/, build/jim-session
                                and Ghostty's resources: copied to Application
                                Support on first launch, where Jim works
-  Contents/Resources/coil/     the Coil toolchain that built Jim: bin/coil and
-                               lib/coil, where widget sessions find the standard
-                               library and theme reloads find the compiler
-
-The toolchain is copied byte for byte. Coil keys its compile-time units to the
-exact compiler binary, so rewriting the compiler's library paths or signing it
-again would leave it unable to load them. It links LLVM at Homebrew's path
-instead, and Jim runs it with DYLD_FALLBACK_LIBRARY_PATH set to the bundle's
-Frameworks, which dyld searches only when that path is missing.
+  Contents/Resources/coil/     lib/coil, the standard library of the toolchain
+                               that built Jim, which widget sessions compile
+                               against
 
 usage: scripts/release.py [--version VERSION] [--dirty]
 
@@ -46,9 +41,15 @@ source-roots = ["src"]
 exclude = ["src/session/server.coil"]
 '''
 
-# The parts of an installed toolchain a running Jim uses. lint-profile is
-# only for `coil lint`.
-TOOLCHAIN_LIB = ['prelude.coil', 'stdlib', 'compiler', 'sealed', 'units', 'ct-units']
+# The parts of an installed toolchain a running Jim uses. Widgets import only
+# the standard library, and their sessions publish through tpde, which reads it
+# and never runs a compiler, so bin/ is left out with the rest:
+#   compiler/       the compiler's sources, read only by programs that import
+#                   coil.jit, which no widget does
+#   units/          the install's cache of coil.jit prebuilt for such programs
+#   library-state/  the library already checked, which only `coil` reads
+#   lint-profile/   `coil lint`'s checkers prebuilt
+TOOLCHAIN_LIB = ['prelude.coil', 'stdlib']
 
 
 def run(*cmd, **kw):
@@ -86,9 +87,10 @@ def add_rpath(path, rpath):
 def bundle_libraries(binaries, frameworks):
     """Copy every non-system library BINARIES need into FRAMEWORKS, and point
     every reference at @rpath."""
-    frameworks.mkdir(parents=True, exist_ok=True)
     pending = [d for b in binaries for d in dependencies(b)]
     copied = {}
+    if pending:
+        frameworks.mkdir(parents=True, exist_ok=True)
     while pending:
         dep = pending.pop()
         if dep in copied:
@@ -136,7 +138,7 @@ def main():
 
     coil = Path(os.path.realpath(shutil.which('coil') or ''))
     if not coil.is_file():
-        raise SystemExit('coil must be on PATH: the release carries the toolchain that built Jim.')
+        raise SystemExit('coil must be on PATH: the release carries the standard library of the coil that built Jim.')
     toolchain_lib = coil.parent.parent / 'lib/coil'
     if not toolchain_lib.is_dir():
         raise SystemExit('No standard library beside ' + str(coil) + ' at ' + str(toolchain_lib))
@@ -159,11 +161,6 @@ def main():
     shutil.copytree(ROOT / 'build/ghostty/share', root / 'build/ghostty/share', symlinks=True)
 
     bundled = contents / 'Resources/coil'
-    (bundled / 'bin').mkdir(parents=True)
-    bundled_coil = bundled / 'bin/coil'
-    shutil.copy2(coil, bundled_coil)
-    if Path(str(coil) + '.toolchain').is_file():
-        shutil.copy2(str(coil) + '.toolchain', str(bundled_coil) + '.toolchain')
     for name in TOOLCHAIN_LIB:
         source = toolchain_lib / name
         if source.is_dir():
@@ -175,7 +172,8 @@ def main():
             raise SystemExit('The toolchain has no ' + str(source))
 
     libraries = bundle_libraries([app_binary], contents / 'Frameworks')
-    add_rpath(app_binary, '@executable_path/../Frameworks')
+    if libraries:
+        add_rpath(app_binary, '@executable_path/../Frameworks')
 
     with (contents / 'Info.plist').open('wb') as f:
         # Its own identifier: macOS keys privacy permissions to the identifier
@@ -187,21 +185,20 @@ def main():
             'LSMinimumSystemVersion': minimum_macos(app_binary),
             'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication'}, f)
 
-    # The app and its libraries may reach only into the bundle and macOS; what
-    # the toolchain links must be in Frameworks for dyld's fallback to find.
+    # The app, its libraries and the code in Resources (jim-session) may reach
+    # only into the bundle and macOS.
     for path in [app_binary] + libraries:
         stray = dependencies(path)
         if stray:
             raise SystemExit(str(path) + ' still links ' + ', '.join(stray))
-    bundled_names = {p.name for p in libraries}
     for path in (contents / 'Resources').rglob('*'):
         if path.is_file() and not path.is_symlink() and code(path):
-            missing = [d for d in dependencies(path) if Path(d).name not in bundled_names]
-            if missing:
-                raise SystemExit(str(path) + ' links ' + ', '.join(missing) + ', not in Frameworks')
+            stray = dependencies(path)
+            if stray:
+                raise SystemExit(str(path) + ' links ' + ', '.join(stray))
 
-    # Only what this script changed is signed again; the toolchain and
-    # jim-session keep the signatures they were built with.
+    # Only what this script changed is signed again; jim-session keeps the
+    # signature it was built with.
     identity = os.environ.get('JIM_RELEASE_SIGN_IDENTITY', '-')
     for path in libraries:
         run('codesign', '--force', '--sign', identity, '--timestamp=none', str(path))

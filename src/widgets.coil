@@ -125,8 +125,6 @@
    ;; of live code fails instead of unmapping it. Written by the worker.
    (leases (array i64 2))
    (leased (array bool 2))
-   ;; Whether each slot's session publishes through LLVM.
-   (optimizing-slots (array bool 2))
    ;; Owned by the main thread.
    (live i64)
    (widget (dyn api/Widget))
@@ -144,14 +142,6 @@
    (released bool)
    (compiling bool)
    (again bool)
-   ;; Main thread: the source of the live native generation, waiting to be
-   ;; compiled again with the optimizer once the other slot is free.
-   (unoptimized (ArrayList u8))
-   (optimize-wanted bool)
-   ;; The compile in flight is the optimized one, and the live generation
-   ;; came from one.
-   (optimizing bool)
-   (optimized bool)
    (closing bool)
    (update i64)
    (generation i64)
@@ -196,7 +186,6 @@
   [(kind i64)
    (runtime (ptr Runtime))
    (slot i64)
-   (optimize bool)
    (source (ArrayList u8))
    (module (ArrayList u8))])
 
@@ -290,27 +279,15 @@
       0)
     (p/make-dyn alloc/Allocator z)))
 
-;;; A new session. Every save compiles twice: first with the native backend,
-;;; which is quick (a save shows in about half a second), then, off to the side,
-;;; with LLVM at level 2, whose code runs 10-50x faster (as fast as an AOT -O2
-;;; build) but takes two to three times as long to compile. A host without LLVM
-;;; gets the native backend for both and says so.
+;;; A new session, publishing through the native backend (tpde): Jim is built
+;;; with `jit = "tpde"`, so its JIT links no LLVM. A save shows in about half a
+;;; second.
 ;;; A new session reads Jim's Coil.toml (from the working directory, the project
 ;;; root) so widget imports such as jim.widget-api resolve from its source roots.
-(defn acquire [(optimize bool)] (-> jit/JitSession)
-  (let [options
-          (jit/JitOptions
-            :toolchain (session-toolchain)
-            :backend (if optimize (jit/Llvm) (jit/Native))
-            :opt-level (if optimize 2 0))
-        (mut session)
-          (match (jit/jit-session-new-with-options (compiler-allocator) options)
-            (Ok [session] session)
-            (Err [problem]
-                 (println "widgets: optimized JIT unavailable ({s}); using the default backend"
-                          (jit/jit-options-error-message problem))
-                 (jit/jit-session-new-with-toolchain (compiler-allocator)
-                                                     (session-toolchain))))
+(defn acquire [] (-> jit/JitSession)
+  (let [(mut session)
+          (jit/jit-session-new-with-toolchain (compiler-allocator)
+                                              (session-toolchain))
         loaded (jit/jit-session-load-project! (mut session))]
     (when (!= loaded 0)
       (println "widgets: the JIT session could not load Coil.toml ({}); project imports will not resolve"
@@ -318,19 +295,10 @@
       0)
     (load session)))
 
-;;; Slot I's session, publishing through LLVM when OPTIMIZE. A session keeps its
-;;; backend for life, so switching frees it (the slot is empty by then: it was
-;;; reset when its last generation retired) and starts another.
-(defn session [(r (ptr Runtime)) (i i64) (optimize bool)]
-  (-> (ptr jit/JitSession))
-  (when (and (load (index (field r started) i))
-             (!= (load (index (field r optimizing-slots) i)) optimize))
-    (jit/jit-session-free! (index (field r sessions) i))
-    (set! (index (field r started) i) false)
-    0)
+;;; Slot I's session, started on first use.
+(defn session [(r (ptr Runtime)) (i i64)] (-> (ptr jit/JitSession))
   (when (not (load (index (field r started) i)))
-    (set! (index (field r sessions) i) (acquire optimize))
-    (set! (index (field r optimizing-slots) i) optimize)
+    (set! (index (field r sessions) i) (acquire))
     (set! (index (field r started) i) true)
     0)
   (index (field r sessions) i))
@@ -375,7 +343,7 @@
 ;;; Worker: compile JOB's source and shim, and find the shim.
 (defn run-compile [(job (ptr Job))] (-> Done)
   (let [r (.runtime job)
-        s (session r (.slot job) (.optimize job))
+        s (session r (.slot job))
         (mut message) (ArrayList::new [u8] (alloc/malloc-allocator))
         (mut shim-name) (ArrayList::new [u8] (alloc/malloc-allocator))
         compiled
@@ -507,7 +475,6 @@
 (defn submit! [(kind i64)
                (r (ptr Runtime))
                (slot i64)
-               (optimize bool)
                (source (slice u8))] (-> void)
   (let [s (service)
         a (alloc/malloc-allocator)
@@ -522,7 +489,6 @@
              :kind kind
              :runtime r
              :slot slot
-             :optimize optimize
              :source (load src)
              :module (load module)))
     (set! (.outstanding s) (+ (.outstanding s) 1))
@@ -558,7 +524,6 @@
     (push-str! (field r args) args)
     (set! (.restored r) (p/cast (ptr api/Snapshot) 0))
     (set! (.retiring r) (ArrayList::new [Retiree] a))
-    (set! (.unoptimized r) (ArrayList::new [u8] a))
     (set! (.live r) -1)
     r))
 
@@ -577,10 +542,6 @@
 
 (defn live? [(r (ptr Runtime))] (-> bool)
   (>= (.live r) 0))
-
-;;; True when the live generation came from the optimizing compile.
-(defn optimized? [(r (ptr Runtime))] (-> bool)
-  (and (live? r) (.optimized r)))
 
 ;;; True while the first generation is still compiling.
 (defn loading? [(r (ptr Runtime))] (-> bool)
@@ -627,13 +588,13 @@
               (when (.present e) (api/destroy! (.widget e)) 0)
               (services/free! (.services e))
               (when (not (.closing r))
-                (submit! JOB-RESET r (.slot e) false "")
+                (submit! JOB-RESET r (.slot e) "")
                 0)
               0))))
     (set! (.len (field r retiring)) (load k)))
   (when (and (.closing r) (= (len (.retiring r)) 0) (not (.released r)))
     (set! (.released r) true)
-    (submit! JOB-RELEASE r 0 false "")
+    (submit! JOB-RELEASE r 0 "")
     0)
   (when (and (.again r)
              (not (.closing r))
@@ -642,7 +603,7 @@
     (set! (.again r) false)
     (reload! r)
     0)
-  (optimize-if-ready! r))
+  (do))
 
 (defn retire! [(r (ptr Runtime))
                (widget (dyn api/Widget))
@@ -663,27 +624,6 @@
         0))
     (when (not (load listed)) (push! (mut all) r) 0))
   (drain-retiring! r))
-
-;;; Once the native generation is live and the other slot is free, compile the
-;;; same source again with the optimizer; it replaces the native generation like
-;;; any reload. A save meanwhile takes precedence (see finish!).
-(defn optimize-if-ready! [(r (ptr Runtime))] (-> void)
-  (when (and (.optimize-wanted r)
-             (live? r)
-             (not (.closing r))
-             (not (.compiling r))
-             (not (.again r))
-             (= (len (.retiring r)) 0))
-    (set! (.optimize-wanted r) false)
-    (set! (.compiling r) true)
-    (set! (.optimizing r) true)
-    (submit! JOB-COMPILE
-             r
-             (if (= (.live r) 0) 1 0)
-             true
-             (slice (.unoptimized r)))
-    0)
-  (do))
 
 ;;; Start compiling the current source; returns at once. A save arriving while a
 ;;; compile runs is compiled after it, once. The result arrives through
@@ -708,10 +648,7 @@
                                   (do)))]
                  (do
                    (set! (.compiling r) true)
-                   (set! (.optimizing r) false)
-                   (set! (.optimize-wanted r) false)
-                   (set-str! (field r unoptimized) source)
-                   (submit! JOB-COMPILE r (if (= (.live r) 0) 1 0) false source)
+                   (submit! JOB-COMPILE r (if (= (.live r) 0) 1 0) source)
                    (alloc/free [u8] (alloc/malloc-allocator) source)
                    (do))))))
 
@@ -800,7 +737,6 @@
     (ArrayList::free! (mut (.name r)))
     (ArrayList::free! (mut (.path r)))
     (ArrayList::free! (mut (.retiring r)))
-    (ArrayList::free! (mut (.unoptimized r)))
     (alloc/destroy [Runtime] a r)
     (do)))
 
@@ -810,40 +746,14 @@
           (= (.kind d) JOB-RESET) (do)
           (.closing r) (do (set! (.compiling r) false) (do))
           :else
-            (let [optimized (.optimizing r)]
+            (do
               (set! (.compiling r) false)
-              (set! (.optimizing r) false)
-              (cond ; A save arrived during the optimized compile, so its result is
-                    ; an older version: drop it (a failed compile reset itself).
-                    (and optimized (.again r))
-                      (do
-                        (when (.ok d)
-                          (submit! JOB-RESET r (.slot d) false "")
-                          0)
-                        0)
-                    (and (.ok d) (boot! r (.slot d) (.shim d)))
-                      (do
-                        (set! (.update r) 1)
-                        (set! (.optimized r) optimized)
-                        (set! (.optimize-wanted r) (not optimized))
-                        0)
-                    :else
-                      (do
-                        (when (not (.ok d))
-                          (if optimized
-                              (do
-                                ; The native build of this source is live; the
-                                ; optimizer should accept whatever it accepted.
-                                (say! r "The optimized build failed: ")
-                                (push-str! (field r diagnostic)
-                                           (slice (.message d)))
-                                0)
-                              (do (say! r (slice (.message d))) 0))
-                          0)
-                        (set! (.update r) -1)
-                        0))
+              (if (and (.ok d) (boot! r (.slot d) (.shim d)))
+                  (set! (.update r) 1)
+                  (do
+                    (when (not (.ok d)) (say! r (slice (.message d))) 0)
+                    (set! (.update r) -1)))
               (when (.again r) (set! (.again r) false) (reload! r) 0)
-              (optimize-if-ready! r)
               (do)))
     (ArrayList::free! (mut (.message d)))
     (do)))

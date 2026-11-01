@@ -1,7 +1,7 @@
 # Jim in Coil
 
 A native macOS shell for the Jim rewrite: Ghostty terminal panes on independent
-project canvases, live Coil theme settings, and a composited workspace cube.
+project canvases, a live theme, and a composited workspace cube.
 
 ## Run
 
@@ -36,12 +36,13 @@ app identity across rebuilds. macOS may ask for Documents-folder access at first
 
 `python3 scripts/release.py` builds a self-contained `build/dist/JimCoil.app`
 and `build/dist/JimCoil-<commit>-macos-arm64.zip` from a clean tree. It runs
-on an Apple silicon Mac without this checkout, Coil, or Homebrew's LLVM:
+on an Apple silicon Mac without this checkout, Coil, or LLVM: Jim is built with
+`jit = "tpde"` (`Coil.toml`), so its widget JIT links no LLVM, and nothing it
+does at run time needs a compiler.
 
-- `Contents/Frameworks` holds libLLVM and the libraries it needs.
-- `Contents/Resources/coil` holds the Coil toolchain that built Jim, copied
-  byte for byte. Widgets compile with it, and theme reloads build with it, which
-  needs Xcode's command line tools.
+- `Contents/Resources/coil` holds the standard library of the `coil` that built
+  Jim, which widgets compile against. The rest of the installed toolchain is
+  left out; `scripts/release.py` says why.
 - `Contents/Resources/root` holds what Jim reads at run time: a manifest for
   widget imports, `src/`, `widgets/`, `config/`, `jim-session`, and Ghostty's
   resources.
@@ -120,9 +121,11 @@ does at some point after launch. So the cube never moves an anchor: the stage's
 perspective, the reflection, the cube and its faces carry their centers in
 their transforms.
 
-Edit and save `config/shell.coil` to hot-load theme/configuration values. ⌘R forces
-a reload. Invalid builds preserve the last good configuration and live terminals.
-Terminal configuration is in `config/ghostty` and is read at application startup.
+The theme is data: `config/theme`, an s-expression read into `jim.theme`'s
+`Theme` with Coil's serde. Edit and save it to apply it; ⌘R reads it again. A
+file that does not read as a theme, or a value out of range, keeps the last good
+theme, and Jim prints why. Terminal configuration is in `config/ghostty` and is
+read at application startup.
 
 ## Actions and diagnostics
 
@@ -185,10 +188,9 @@ Widgets never block Jim's main thread for long work:
   only thread that touches the JIT, with its own malloc zone) while the current
   version keeps running and responding. When it is ready, the main thread saves
   the running widget's state, boots the new version from it and switches over;
-  that swap costs one render. Each save compiles twice: first with Coil's native
-  JIT backend, live in 0.15–0.3 s; then with its LLVM backend at `-O2`, about
-  1 s later, whose code runs 10–50× faster and replaces the native version the
-  same way. A save made during the optimized compile supersedes it. The old generation retires once any background
+  that swap costs one render. Each save compiles once, with Coil's native JIT
+  backend (tpde), live in 0.15–0.3 s. A save made during a compile is compiled
+  after it. The old generation retires once any background
   tasks it started have finished, then its session is reset, which unmaps its
   code. A compile error or API misuse leaves the previous version running and
   shows the error in the pane.
