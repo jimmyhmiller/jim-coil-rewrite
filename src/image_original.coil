@@ -1,0 +1,272 @@
+(module jim.image-original)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "jim.native" :use *)
+
+;;; Programs often show a terminal a thumbnail and print where the full image is. This
+;;; finds that file from the text around the thumbnail. A path alone proves nothing, so
+;;; a file counts only if, scaled down to the thumbnail's size, it looks like the
+;;; thumbnail. No match means no original, and the thumbnail is all there is to show.
+
+;;; Mean difference per colour channel, out of 255, that still counts as the same
+;;; picture. Measured on Codex: its thumbnail differs from its original by 3.9, and from
+;;; the closest other image, an earlier version of the same page at the same size, by 20.5.
+(const SAME-PICTURE-DIFFERENCE 10.0)
+
+;;; How far a thumbnail's size may be from the original's shape, in thumbnail pixels.
+(const SHAPE-TOLERANCE 1.5)
+
+(const MAX-CANDIDATES 32)
+
+;;; How many line ends one path may run across: a program can wrap it as it prints it.
+(const MAX-WRAPS 3)
+
+(const UTF8-ENCODING (: 4 u64))
+
+(const READ-MAPPED-IF-SAFE (: 1 u64))
+
+(const PREMULTIPLIED-LAST (: 1 u32))
+
+(const INTERPOLATION-HIGH (: 3 i32))
+
+(extern strncasecmp :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> i32))
+
+(extern strncmp :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> i32))
+
+(extern CGColorSpaceCreateDeviceRGB :cc (cc/C) [] (-> (ptr i8)))
+
+(extern CGColorSpaceRelease :cc (cc/C) [(ptr i8)] (-> void))
+
+(extern CGBitmapContextCreate
+        :cc
+        (cc/C)
+        [(ptr i8) u64 u64 u64 u64 (ptr i8) u32]
+        (-> (ptr i8)))
+
+(extern CGBitmapContextGetData :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern CGContextSetInterpolationQuality :cc (cc/C) [(ptr i8) i32] (-> void))
+
+(extern CGContextDrawImage :cc (cc/C) [(ptr i8) Rect (ptr i8)] (-> void))
+
+(extern CGContextRelease :cc (cc/C) [(ptr i8)] (-> void))
+
+(defn nil? [(object (ptr i8))] (-> bool)
+  (= (p/cast i64 object) 0))
+
+(defn byte-at [(text (ptr i8)) (i i64)] (-> i64)
+  (p/cast i64 (load (index text i))))
+
+(defn line-end? [(c i64)] (-> bool)
+  (or (= c 10) (= c 13)))
+
+(defn blank? [(c i64)] (-> bool)
+  (or (= c 32) (= c 9)))
+
+;;; What ends a path, or comes before one: `"see (/a/b.png)"`, `path=/a/b.png`.
+(defn path-edge? [(c i64)] (-> bool)
+  (or (blank? c)
+      (line-end? c)
+      (= c 34)
+      (= c 39)
+      (= c 96)
+      (= c 40)
+      (= c 41)
+      (= c 91)
+      (= c 93)
+      (= c 60)
+      (= c 62)))
+
+(defn path-start? [(text (ptr i8)) (i i64)] (-> bool)
+  (and (or (= i 0)
+           (path-edge? (byte-at text (- i 1)))
+           (= (byte-at text (- i 1)) 58)
+           (= (byte-at text (- i 1)) 61))
+       (or (and (= (byte-at text i) 47) (!= (byte-at text (+ i 1)) 47))
+           (= (strncmp (index text i) c"~/" 2) (: 0 i32))
+           (= (strncmp (index text i) c"file:///" 8) (: 0 i32)))))
+
+(defn ends-with? [(bytes (ptr i8)) (n i64) (suffix (ptr i8))] (-> bool)
+  (let [length (p/cast i64 (strlen suffix))]
+    (and (>= n length)
+         (= (strncasecmp (index bytes (- n length))
+                         suffix
+                         (p/cast u64 length))
+            (: 0 i32)))))
+
+(defn image-name? [(bytes (ptr i8)) (n i64)] (-> bool)
+  (or (ends-with? bytes n c".png")
+      (ends-with? bytes n c".jpg")
+      (ends-with? bytes n c".jpeg")
+      (ends-with? bytes n c".gif")
+      (ends-with? bytes n c".webp")
+      (ends-with? bytes n c".heic")
+      (ends-with? bytes n c".tif")
+      (ends-with? bytes n c".tiff")
+      (ends-with? bytes n c".bmp")))
+
+;;; The file a path or file URL as printed means, or nil.
+(defn file-path [(bytes (ptr i8)) (n i64)] (-> (ptr i8))
+  (let [printed
+          (msg (ptr i8)
+               (msg (ptr i8)
+                    (msg (ptr i8) (class c"NSString") (sel c"alloc") [])
+                    (sel c"initWithBytes:length:encoding:")
+                    [(ptr i8) u64 u64]
+                    bytes
+                    (p/cast u64 n)
+                    UTF8-ENCODING)
+               (sel c"autorelease")
+               [])]
+    (cond (nil? printed) (nil)
+          (= (strncmp bytes c"file:///" 8) (: 0 i32))
+            (msg (ptr i8)
+                 (msg (ptr i8)
+                      (class c"NSURL")
+                      (sel c"URLWithString:")
+                      [(ptr i8)]
+                      printed)
+                 (sel c"path")
+                 [])
+          :else (msg (ptr i8) printed (sel c"stringByExpandingTildeInPath") []))))
+
+;;; Every image file path TEXT might name from I on, up to where a path has to stop,
+;;; added to OUT. A path that reaches a line end may go on at the next line's first
+;;; word, so each place it could end with an image's name is a candidate.
+(defn collect-from! [(text (ptr i8)) (i i64) (scratch (ptr i8)) (out (ptr i8))]
+  (-> void)
+  (let [(mut at) i
+        (mut n) (: 0 i64)
+        (mut wraps) (: 0 i64)
+        (mut going) true]
+    (while (load going)
+      (let [c (byte-at text (load at))]
+        (cond (line-end? c)
+                (if (>= (load wraps) MAX-WRAPS)
+                    (set! going false)
+                    (do
+                      (set! wraps (+ (load wraps) 1))
+                      (while (or (line-end? (byte-at text (load at)))
+                                 (blank? (byte-at text (load at))))
+                        (set! at (+ (load at) 1)))
+                      (when (= (byte-at text (load at)) 0)
+                        (set! going false))))
+              (or (= c 0) (path-edge? c)) (set! going false)
+              :else
+                (do
+                  (set! (index scratch (load n)) (p/cast i8 c))
+                  (set! n (+ (load n) 1))
+                  (set! at (+ (load at) 1))
+                  (when (image-name? scratch (load n))
+                    (let [path (file-path scratch (load n))]
+                      (when (not (nil? path))
+                        (msg i64 out (sel c"addObject:") [(ptr i8)] path))))))))
+    (do)))
+
+;;; The image files TEXT might name, in the order it names them, as an array of strings.
+(defn candidates [(text (ptr i8))] (-> (ptr i8))
+  (let [out (msg (ptr i8) (class c"NSMutableArray") (sel c"array") [])
+        length (p/cast i64 (strlen text))
+        buffer
+          (msg (ptr i8)
+               (class c"NSMutableData")
+               (sel c"dataWithLength:")
+               [u64]
+               (p/cast u64 (+ length 1)))
+        scratch (msg (ptr i8) buffer (sel c"mutableBytes") [])]
+    (for [i 0 length]
+      (when (and (< (msg i64 out (sel c"count") []) MAX-CANDIDATES)
+                 (path-start? text i))
+        (collect-from! text i scratch out)))
+    out))
+
+;;; Mean difference per colour channel between thumbnail RGBA, straight alpha, and the
+;;; same pixels premultiplied, as Core Graphics draws them.
+(defn difference [(thumbnail (ptr i8)) (drawn (ptr i8)) (pixels i64)] (-> f64)
+  (let [(mut total) (: 0 i64)]
+    (for [i 0 pixels]
+      (let [alpha (& (byte-at thumbnail (+ (* i 4) 3)) 255)]
+        (for [channel 0 3]
+          (let [at (+ (* i 4) channel)
+                plain (& (byte-at thumbnail at) 255)
+                expected (/ (* plain alpha) 255)
+                actual (& (byte-at drawn at) 255)
+                gap (- expected actual)]
+            (set! total (+ (load total) (if (< gap 0) (- 0 gap) gap)))))))
+    (/ (p/cast f64 (load total)) (p/cast f64 (* pixels 3)))))
+
+(defn same-shape? [(w i64) (h i64) (thumbnail-w i64) (thumbnail-h i64)]
+  (-> bool)
+  (let [scaled-w (/ (* (p/cast f64 w) (p/cast f64 thumbnail-h)) (p/cast f64 h))
+        gap (- scaled-w (p/cast f64 thumbnail-w))]
+    (and (<= gap SHAPE-TOLERANCE) (>= gap (- 0.0 SHAPE-TOLERANCE)))))
+
+;;; Whether IMAGE, a CGImage, looks like W by H pixels of thumbnail RGBA once scaled down.
+(defn looks-like? [(image (ptr i8)) (w i64) (h i64) (thumbnail (ptr i8))]
+  (-> bool)
+  (let [space (CGColorSpaceCreateDeviceRGB)
+        context
+          (CGBitmapContextCreate (nil)
+                                 (p/cast u64 w)
+                                 (p/cast u64 h)
+                                 8
+                                 (p/cast u64 (* w 4))
+                                 space
+                                 PREMULTIPLIED-LAST)
+        same
+          (if (nil? context)
+              false
+              (do
+                (CGContextSetInterpolationQuality context INTERPOLATION-HIGH)
+                (CGContextDrawImage context
+                                    (rect 0.0
+                                          0.0
+                                          (p/cast f64 w)
+                                          (p/cast f64 h))
+                                    image)
+                (<= (difference thumbnail
+                                (CGBitmapContextGetData context)
+                                (* w h))
+                    SAME-PICTURE-DIFFERENCE)))]
+    (when (not (nil? context))
+      (CGContextRelease context))
+    (CGColorSpaceRelease space)
+    same))
+
+;;; Whether the file at PATH is the original of W by H pixels of thumbnail RGBA.
+(defn original? [(path (ptr i8)) (w i64) (h i64) (thumbnail (ptr i8))] (-> bool)
+  (let [data
+          (msg (ptr i8)
+               (class c"NSData")
+               (sel c"dataWithContentsOfFile:options:error:")
+               [(ptr i8) u64 (ptr i8)]
+               path
+               READ-MAPPED-IF-SAFE
+               (nil))
+        rep
+          (if (nil? data)
+              (nil)
+              (msg (ptr i8)
+                   (class c"NSBitmapImageRep")
+                   (sel c"imageRepWithData:")
+                   [(ptr i8)]
+                   data))]
+    (and (not (nil? rep))
+         (>= (msg i64 rep (sel c"pixelsHigh") []) h)
+         (same-shape? (msg i64 rep (sel c"pixelsWide") [])
+                      (msg i64 rep (sel c"pixelsHigh") [])
+                      w
+                      h)
+         (looks-like? (msg (ptr i8) rep (sel c"CGImage") []) w h thumbnail))))
+
+;;; The path of the file TEXT names that W by H pixels of thumbnail RGBA were made from,
+;;; or nil if it names none.
+(defn find [(text (ptr i8)) (w i64) (h i64) (thumbnail (ptr i8))] (-> (ptr i8))
+  (let [paths (candidates text)
+        (mut found) (nil)]
+    (for [i 0 (msg i64 paths (sel c"count") [])]
+      (when (nil? (load found))
+        (let [path (msg (ptr i8) paths (sel c"objectAtIndex:") [i64] i)]
+          (when (original? path w h thumbnail)
+            (set! found path)))))
+    (load found)))

@@ -1,0 +1,168 @@
+(module jim.image-preview-test)
+(import "jim.terminal" :as terminal)
+(import "jim.image-original" :as original)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+(defn alpha-at [(rep (ptr i8)) (x i64)] (-> f64)
+  (msg f64
+       (msg (ptr i8) rep (sel c"colorAtX:y:") [i64 i64] x 0)
+       (sel c"alphaComponent")
+       []))
+
+(defn green-at [(rep (ptr i8)) (x i64)] (-> f64)
+  (msg f64
+       (msg (ptr i8) rep (sel c"colorAtX:y:") [i64 i64] x 0)
+       (sel c"greenComponent")
+       []))
+
+;;; One opaque red pixel, then one half-transparent green one. Straight alpha means
+;;; the green stays full however transparent the pixel is.
+(deftest png-keeps-size-and-straight-alpha
+  (let [(mut pixels) (zeroed (array u8 8))
+        bytes (p/cast (ptr u8) (mut pixels))]
+    (set! (index bytes 0) (: 255 u8))
+    (set! (index bytes 3) (: 255 u8))
+    (set! (index bytes 5) (: 255 u8))
+    (set! (index bytes 7) (: 128 u8))
+    (let [png (terminal/png-of 2 1 (p/cast (ptr i8) bytes))
+          rep
+            (msg (ptr i8)
+                 (class c"NSBitmapImageRep")
+                 (sel c"imageRepWithData:")
+                 [(ptr i8)]
+                 png)]
+      (assert (= (msg i64 rep (sel c"pixelsWide") []) 2))
+      (assert (= (msg i64 rep (sel c"pixelsHigh") []) 1))
+      (assert (= (alpha-at rep 0) 1.0))
+      (assert (< (green-at rep 0) 0.01))
+      (assert (> (alpha-at rep 1) 0.49))
+      (assert (< (alpha-at rep 1) 0.51))
+      (assert (> (green-at rep 1) 0.99)))))
+
+(defn found-at [(text (ptr i8)) (i i64)] (-> (ptr i8))
+  (msg (ptr i8) (original/candidates text) (sel c"objectAtIndex:") [i64] i))
+
+(defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (!= (msg i8 a (sel c"isEqualToString:") [(ptr i8)] (ns b)) (: 0 i8)))
+
+(defn count-of [(text (ptr i8))] (-> i64)
+  (msg i64 (original/candidates text) (sel c"count") []))
+
+(deftest paths-are-found-however-they-are-printed
+  (assert (same? (found-at c"Saved to: /tmp/a/b.png" 0) c"/tmp/a/b.png"))
+  (assert (same? (found-at c"see (/tmp/b.JPG), ok" 0) c"/tmp/b.JPG"))
+  (assert (same? (found-at c"path=/tmp/c.webp" 0) c"/tmp/c.webp"))
+  (assert (= (count-of c"no images /tmp/a.txt or http://x/y.png") 0)))
+
+;;; As Codex prints it: a file URL its own line wrapping splits after a slash.
+(deftest a-wrapped-file-url-is-rejoined
+  (assert (same? (found-at c"  Saved to: file:///tmp/my%20dir/\nexec-1.png\n\nWorked"
+                           0)
+                 c"/tmp/my dir/exec-1.png")))
+
+(deftest a-path-on-the-next-line-is-still-its-own-path
+  (let [text c"/tmp/one.png\n/tmp/two.png"]
+    (assert (same? (found-at text 0) c"/tmp/one.png"))
+    (assert (!= (msg i8
+                     (original/candidates text)
+                     (sel c"containsObject:")
+                     [(ptr i8)]
+                     (ns c"/tmp/two.png"))
+                (: 0 i8)))))
+
+(deftest a-home-path-is-expanded
+  (assert (msg i8
+               (found-at c"~/shots/a.png" 0)
+               (sel c"hasPrefix:")
+               [(ptr i8)]
+               (ns c"/"))))
+
+;;; W by H pixels of a horizontal gradient, or its mirror image.
+(defn gradient! [(data (ptr u8)) (w i64) (h i64) (mirrored bool)] (-> void)
+  (for [y 0 h]
+    (for [x 0 w]
+      (let [at (* 4 (+ x (* y w)))
+            across (if mirrored (- (- w 1) x) x)
+            value (p/cast u8 (/ (* across 255) (- w 1)))]
+        (set! (index data at) value)
+        (set! (index data (+ at 1)) value)
+        (set! (index data (+ at 2)) value)
+        (set! (index data (+ at 3)) (: 255 u8))))))
+
+(defn written-png [(w i64) (h i64) (data (ptr u8))] (-> (ptr i8))
+  (let [path
+          (msg (ptr i8)
+               (msg (ptr i8)
+                    (class c"NSString")
+                    (sel c"stringWithUTF8String:")
+                    [(ptr i8)]
+                    c"/tmp")
+               (sel c"stringByAppendingPathComponent:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (msg (ptr i8)
+                         (msg (ptr i8) (class c"NSUUID") (sel c"UUID") [])
+                         (sel c"UUIDString")
+                         [])
+                    (sel c"stringByAppendingString:")
+                    [(ptr i8)]
+                    (ns c"-jim-image-original-test.png")))]
+    (msg i8
+         (terminal/png-of w h (p/cast (ptr i8) data))
+         (sel c"writeToFile:atomically:")
+         [(ptr i8) i8]
+         path
+         (: 1 i8))
+    path))
+
+(defn remove-file! [(path (ptr i8))] (-> void)
+  (do
+    (msg i8
+         (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+         (sel c"removeItemAtPath:error:")
+         [(ptr i8) (ptr i8)]
+         path
+         (nil))
+    (do)))
+
+(deftest only-the-file-that-looks-like-the-thumbnail-counts
+  (let [(mut big) (zeroed (array u8 12800))
+        (mut other) (zeroed (array u8 12800))
+        (mut wrong-shape) (zeroed (array u8 12800))
+        (mut small) (zeroed (array u8 800))
+        big-bytes (p/cast (ptr u8) (mut big))
+        other-bytes (p/cast (ptr u8) (mut other))
+        shape-bytes (p/cast (ptr u8) (mut wrong-shape))
+        small-bytes (p/cast (ptr u8) (mut small))]
+    (gradient! big-bytes 80 40 false)
+    (gradient! other-bytes 80 40 true)
+    (gradient! shape-bytes 40 80 false)
+    (gradient! small-bytes 20 10 false)
+    (let [original (written-png 80 40 big-bytes)
+          mirrored (written-png 80 40 other-bytes)
+          tall (written-png 40 80 shape-bytes)
+          thumbnail (p/cast (ptr i8) small-bytes)]
+      (assert (original/original? original 20 10 thumbnail))
+      (assert (not (original/original? mirrored 20 10 thumbnail)))
+      (assert (not (original/original? tall 20 10 thumbnail)))
+      (assert (not (original/original? (ns c"/tmp/jim-no-such-file.png")
+                                       20
+                                       10
+                                       thumbnail)))
+      (let [listing
+              (msg (ptr i8)
+                   (msg (ptr i8)
+                        mirrored
+                        (sel c"stringByAppendingString:")
+                        [(ptr i8)]
+                        (ns c" "))
+                   (sel c"stringByAppendingString:")
+                   [(ptr i8)]
+                   original)
+            found (original/find (utf8 listing) 20 10 thumbnail)]
+        (assert (!= (msg i8 found (sel c"isEqualToString:") [(ptr i8)] original)
+                    (: 0 i8))))
+      (remove-file! original)
+      (remove-file! mirrored)
+      (remove-file! tall))))

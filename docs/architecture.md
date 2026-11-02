@@ -90,6 +90,25 @@ once replay ends, so a running TUI is not resized unless the size really changed
 Replay is exact for the retained stream, not a model snapshot. Reboot recovery and
 graphics referencing vanished files require further work.
 
+## Previewing terminal images
+
+Clicking an image a program drew in a terminal picks it, with an outline, as selecting
+a file does in Finder. Space then opens Quick Look, and Space or Escape closes it. Any
+other key drops the pick and goes to the terminal, as does the image leaving the screen,
+so Space means preview only straight after a click and typing is never eaten.
+
+Programs often send only a thumbnail and print where the full image is. Codex sends
+52x96 of a 921x1708 file. `image_original.coil` reads the text around the image for
+image paths and file URLs, rejoining ones the program wrapped, and accepts a file only
+if it has the thumbnail's shape and, scaled down to it, differs by at most 10 of 255 per
+channel. Codex's original measured 3.9 and the closest other image, an earlier version of
+the same page, 20.5. With no match Quick Look shows the terminal's own pixels, from a
+temporary copy deleted on close. Relative paths and paths with bare spaces are not found.
+
+The lookups are additions to the Ghostty patch. Placements come from the renderer's own
+list under its draw mutex, so a hit is exactly what was drawn. A private `RenderState`
+would consume the terminal's dirty flags from under the renderer.
+
 ## Adopting original Jim's daemons
 
 `jim-session --adopt UPSTREAM SOCKET CWD RESOURCES` serves the JIM1 protocol as usual,

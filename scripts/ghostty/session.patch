@@ -232,7 +232,7 @@
      export fn ghostty_surface_free(ptr: *Surface) void {
          ptr.app.closeSurface(ptr);
      }
-@@ -2140,6 +2160,18 @@
+@@ -2140,6 +2160,225 @@
  
      /// Returns true if the surface currently has mouse capturing
      /// enabled.
@@ -246,6 +246,213 @@
 +        return t.modes.get(.bracketed_paste) and
 +            t.screens.active_key == .primary and
 +            t.flags.mouse_event == .none;
++    }
++
++    /// An image on the surface, in the view's points from its top left.
++    const ImageBox = extern struct {
++        id: u32 = 0,
++        transmission: u64 = 0,
++        x: f64 = 0,
++        y: f64 = 0,
++        width: f64 = 0,
++        height: f64 = 0,
++    };
++
++    /// An image's displayed pixels as straight RGBA. The caller frees them
++    /// with ghostty_surface_image_pixels_free.
++    const ImagePixels = extern struct {
++        width: u32 = 0,
++        height: u32 = 0,
++        data: ?[*]u8 = null,
++        len: usize = 0,
++    };
++
++    const ImageRect = struct {
++        left: f64,
++        top: f64,
++        right: f64,
++        bottom: f64,
++
++        fn of(core: *const CoreSurface, p: @import("../renderer/image.zig").Placement) ImageRect {
++            const left = @as(f64, @floatFromInt(p.x)) * @as(f64, @floatFromInt(core.size.cell.width)) +
++                @as(f64, @floatFromInt(core.size.padding.left + p.cell_offset_x));
++            const top = @as(f64, @floatFromInt(p.y)) * @as(f64, @floatFromInt(core.size.cell.height)) +
++                @as(f64, @floatFromInt(core.size.padding.top + p.cell_offset_y));
++            return .{
++                .left = left,
++                .top = top,
++                .right = left + @as(f64, @floatFromInt(p.width)),
++                .bottom = top + @as(f64, @floatFromInt(p.height)),
++            };
++        }
++
++        fn contains(self: ImageRect, x: f64, y: f64) bool {
++            return x >= self.left and x < self.right and y >= self.top and y < self.bottom;
++        }
++
++        fn containsRect(self: ImageRect, other: ImageRect) bool {
++            return other.left >= self.left and other.right <= self.right and
++                other.top >= self.top and other.bottom <= self.bottom;
++        }
++
++        /// Whether OTHER is the next piece of the same image: placeholders
++        /// place an image one row at a time, each row its own placement.
++        fn adjoins(self: ImageRect, other: ImageRect, cell_height: f64) bool {
++            return other.left < self.right and self.left < other.right and
++                other.top <= self.bottom + cell_height and self.top <= other.bottom + cell_height;
++        }
++
++        fn merged(self: ImageRect, other: ImageRect) ImageRect {
++            return .{
++                .left = @min(self.left, other.left),
++                .top = @min(self.top, other.top),
++                .right = @max(self.right, other.right),
++                .bottom = @max(self.bottom, other.bottom),
++            };
++        }
++    };
++
++    /// The placement to box: the topmost one under the mouse, or, given an
++    /// image ID, the first of that image. Whatever joins it makes the box.
++    fn findImageBox(surface: *Surface, wanted: ?u32) ?ImageBox {
++        const core = &surface.core_surface;
++        var id: u32 = undefined;
++        var rect: ImageRect = undefined;
++        {
++            core.renderer.draw_mutex.lockUncancelable(global.io());
++            defer core.renderer.draw_mutex.unlock(global.io());
++            const placements = core.renderer.images.kitty_placements.items;
++            var found = false;
++            var i = placements.len;
++            while (i > 0 and !found) {
++                i -= 1;
++                const p = placements[if (wanted == null) i else placements.len - 1 - i];
++                const image_id = switch (p.image_id) {
++                    .kitty => |v| v,
++                    .overlay => continue,
++                };
++                const r = ImageRect.of(core, p);
++                if (if (wanted) |w| w == image_id else r.contains(surface.cursor_pos.x, surface.cursor_pos.y)) {
++                    id = image_id;
++                    rect = r;
++                    found = true;
++                }
++            }
++            if (!found) return null;
++
++            const cell_height: f64 = @floatFromInt(core.size.cell.height);
++            var grew = true;
++            while (grew) {
++                grew = false;
++                for (placements) |p| {
++                    switch (p.image_id) {
++                        .kitty => |v| if (v != id) continue,
++                        .overlay => continue,
++                    }
++                    const r = ImageRect.of(core, p);
++                    if (!rect.containsRect(r) and rect.adjoins(r, cell_height)) {
++                        rect = rect.merged(r);
++                        grew = true;
++                    }
++                }
++            }
++        }
++
++        // Taken after the draw mutex: rendering takes this one first.
++        core.renderer_state.mutex.lockUncancelable(global.io());
++        defer core.renderer_state.mutex.unlock(global.io());
++        const image = core.io.terminal.screens.active.kitty_images.imageById(id) orelse return null;
++        const scale_x: f64 = @floatCast(surface.content_scale.x);
++        const scale_y: f64 = @floatCast(surface.content_scale.y);
++        return .{
++            .id = id,
++            .transmission = image.transmission,
++            .x = rect.left / scale_x,
++            .y = rect.top / scale_y,
++            .width = (rect.right - rect.left) / scale_x,
++            .height = (rect.bottom - rect.top) / scale_y,
++        };
++    }
++
++    /// The image under the mouse, if any.
++    export fn ghostty_surface_image_at_mouse(surface: *Surface, out: *ImageBox) bool {
++        out.* = findImageBox(surface, null) orelse return false;
++        return true;
++    }
++
++    /// Where image ID is on the surface now, if it is showing.
++    export fn ghostty_surface_image_box(surface: *Surface, id: u32, out: *ImageBox) bool {
++        out.* = findImageBox(surface, id) orelse return false;
++        return true;
++    }
++
++    /// A copy of what the image shows, if TRANSMISSION is still that image.
++    export fn ghostty_surface_image_pixels(surface: *Surface, id: u32, transmission: u64, out: *ImagePixels) bool {
++        const core = &surface.core_surface;
++        core.renderer_state.mutex.lockUncancelable(global.io());
++        defer core.renderer_state.mutex.unlock(global.io());
++        const image = core.io.terminal.screens.active.kitty_images.imageById(id) orelse return false;
++        if (image.transmission != transmission) return false;
++        const data = image.renderData().bytes() orelse return false;
++        const channels: usize = switch (image.format) {
++            .gray => 1,
++            .gray_alpha => 2,
++            .rgb => 3,
++            .rgba => 4,
++            .png => return false,
++        };
++        const pixels = @as(usize, image.width) * @as(usize, image.height);
++        if (pixels == 0 or data.len != pixels * channels) return false;
++        const rgba = surface.app.core_app.alloc.alloc(u8, pixels * 4) catch return false;
++        for (0..pixels) |i| {
++            const from = data[i * channels..][0..channels];
++            const to = rgba[i * 4..][0..4];
++            switch (image.format) {
++                .gray => to.* = .{ from[0], from[0], from[0], 255 },
++                .gray_alpha => to.* = .{ from[0], from[0], from[0], from[1] },
++                .rgb => to.* = .{ from[0], from[1], from[2], 255 },
++                .rgba => to.* = .{ from[0], from[1], from[2], from[3] },
++                .png => unreachable,
++            }
++        }
++        out.* = .{ .width = image.width, .height = image.height, .data = rgba.ptr, .len = rgba.len };
++        return true;
++    }
++
++    export fn ghostty_surface_image_pixels_free(surface: *Surface, pixels: *ImagePixels) void {
++        if (pixels.data) |data| surface.app.core_app.alloc.free(data[0..pixels.len]);
++        pixels.* = .{};
++    }
++
++    /// The text from ROWS_BEFORE rows above an image to ROWS_AFTER below it,
++    /// reaching into scrollback. Free it with ghostty_surface_free_text.
++    export fn ghostty_surface_text_around_image(surface: *Surface, box: *const ImageBox, rows_before: u32, rows_after: u32, result: *Text) bool {
++        const core = &surface.core_surface;
++        core.renderer_state.mutex.lockUncancelable(global.io());
++        defer core.renderer_state.mutex.unlock(global.io());
++        const t = &core.io.terminal;
++        const row = struct {
++            fn of(points: f64, c: *const CoreSurface, scale: f64, rows: u32) u32 {
++                const pixels = points * scale - @as(f64, @floatFromInt(c.size.padding.top));
++                const at = @floor(pixels / @as(f64, @floatFromInt(c.size.cell.height)));
++                return @intFromFloat(std.math.clamp(at, 0, @as(f64, @floatFromInt(rows - 1))));
++            }
++        }.of;
++        const scale: f64 = @floatCast(surface.content_scale.y);
++        const top = row(box.y, core, scale, t.rows);
++        const bottom = row(box.y + box.height, core, scale, t.rows);
++        const pages = &t.screens.active.pages;
++        const start = pages.pin(.{ .viewport = .{ .x = 0, .y = top } }) orelse return false;
++        const end = pages.pin(.{ .viewport = .{ .x = t.cols - 1, .y = bottom } }) orelse return false;
++        const first = switch (start.upOverflow(rows_before)) {
++            .offset => |p| p,
++            .overflow => |o| o.end,
++        };
++        const last = switch (end.downOverflow(rows_after)) {
++            .offset => |p| p,
++            .overflow => |o| o.end,
++        };
++        return readTextLocked(surface, terminal.Selection.init(first, last, false), result);
 +    }
 +
      export fn ghostty_surface_mouse_captured(surface: *Surface) bool {

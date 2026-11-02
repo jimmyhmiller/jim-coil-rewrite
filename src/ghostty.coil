@@ -223,6 +223,50 @@
         [(ptr i8) (ptr SurfaceConfig) i32 u32 u32]
         (-> (ptr i8)))
 
+;;; An image on a surface, in the view's points from its top left. The transmission
+;;; tells this image from a later one sent under the same ID.
+(defstruct ImageBox
+  [(id u32)
+   (transmission u64)
+   (x f64)
+   (y f64)
+   (w f64)
+   (h f64)])
+
+;;; An image's displayed pixels as straight RGBA.
+(defstruct ImagePixels [(w u32) (h u32) (data (ptr i8)) (len u64)])
+
+(static-assert (= (p/sizeof ImageBox) 48) "Ghostty image box ABI size")
+
+(static-assert (= (p/offsetof ImageBox transmission) 8)
+               "Ghostty image box transmission offset")
+
+(static-assert (= (p/sizeof ImagePixels) 24) "Ghostty image pixels ABI size")
+
+(extern ghostty_surface_image_at_mouse
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr ImageBox)]
+        (-> bool))
+
+(extern ghostty_surface_image_box
+        :cc
+        (cc/C)
+        [(ptr i8) u32 (ptr ImageBox)]
+        (-> bool))
+
+(extern ghostty_surface_image_pixels
+        :cc
+        (cc/C)
+        [(ptr i8) u32 u64 (ptr ImagePixels)]
+        (-> bool))
+
+(extern ghostty_surface_image_pixels_free
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr ImagePixels)]
+        (-> void))
+
 (defstruct TextPoint [(tag i32) (coord i32) (x u32) (y u32)])
 
 (defstruct TextSelection [(top TextPoint) (bottom TextPoint) (rectangle bool)])
@@ -237,3 +281,9 @@
         (-> bool))
 
 (extern ghostty_surface_free_text :cc (cc/C) [(ptr i8) (ptr Text)] (-> void))
+
+(extern ghostty_surface_text_around_image
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr ImageBox) u32 u32 (ptr Text)]
+        (-> bool))

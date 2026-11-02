@@ -4,6 +4,7 @@
 (import "jim.native" :use *)
 (import "jim.ghostty" :as g)
 (import "jim.sessions" :as sessions)
+(import "jim.image-original" :as original)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
@@ -18,7 +19,13 @@
    (accum (ptr i8))
    (selection Range)
    (in-key bool)
-   (closed bool)])
+   (closed bool)
+   (picked g/ImageBox)
+   (outline (ptr i8))
+   (pick-timer (ptr i8))
+   (preview-directory (ptr i8))
+   (preview-url (ptr i8))
+   (space-taken bool)])
 
 (defn association-key [] (-> (ptr i8))
   (p/alloc-static i8))
@@ -198,13 +205,343 @@
           0)
       (g/ghostty_surface_key (.surface t) (load key)))))
 
+;;; ---- image preview --------------------------------------------------------------
+;;; As in Finder: click an image to pick it, then Space shows it in Quick Look. Space
+;;; alone cannot mean preview, or hovering over an image would eat what is being typed.
+
+(const SPACE-KEYCODE (: 49 u16))
+
+(const KEY-DOWN-EVENT (: 10 u64))
+
+(const PNG-FILE-TYPE (: 4 u64))
+
+(const ALPHA-NONPREMULTIPLIED (: 2 u64))
+
+(const PICK-CHECK-SECONDS 0.1)
+
+(defn nil? [(object (ptr i8))] (-> bool)
+  (= (p/cast i64 object) 0))
+
+(defn picked? [(t (ptr Terminal))] (-> bool)
+  (not (nil? (.outline t))))
+
+(defn plain-space? [(event (ptr i8))] (-> bool)
+  (and (= (msg u16 event (sel c"keyCode") []) SPACE-KEYCODE)
+       (= (& (mods event) (: 15 i32)) (: 0 i32))))
+
+(defn repeat? [(event (ptr i8))] (-> bool)
+  (!= (msg i8 event (sel c"isARepeat") []) (: 0 i8)))
+
+;;; PNG bytes of W by H pixels of straight RGBA.
+(defn png-of [(w i64) (h i64) (data (ptr i8))] (-> (ptr i8))
+  (let [(mut planes) data
+        rep
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSBitmapImageRep") (sel c"alloc") [])
+               (sel c"initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bitmapFormat:bytesPerRow:bitsPerPixel:")
+               [(ptr (ptr i8)) i64 i64 i64 i64 i8 i8 (ptr i8) u64 i64 i64]
+               (mut planes)
+               w
+               h
+               8
+               4
+               (: 1 i8)
+               (: 0 i8)
+               (ns c"NSDeviceRGBColorSpace")
+               ALPHA-NONPREMULTIPLIED
+               (* w 4)
+               32)]
+    (if (nil? rep)
+        (nil)
+        (let [png
+                (msg (ptr i8)
+                     rep
+                     (sel c"representationUsingType:properties:")
+                     [u64 (ptr i8)]
+                     PNG-FILE-TYPE
+                     (msg (ptr i8)
+                          (class c"NSDictionary")
+                          (sel c"dictionary")
+                          []))]
+          (release rep)
+          png))))
+
+(defn place-outline! [(t (ptr Terminal))] (-> void)
+  (let [box (.picked t)
+        bounds (msg Rect (.view t) (sel c"bounds") [])]
+    (msg i64 (class c"CATransaction") (sel c"begin") [])
+    (msg i64 (class c"CATransaction") (sel c"setDisableActions:") [i8] (: 1 i8))
+    (msg i64
+         (.outline t)
+         (sel c"setFrame:")
+         [Rect]
+         (rect (.x box)
+               (- (.h bounds) (+ (.y box) (.h box)))
+               (.w box)
+               (.h box)))
+    (msg i64 (class c"CATransaction") (sel c"commit") [])
+    (do)))
+
+(defn unpick! [(t (ptr Terminal))] (-> void)
+  (when (picked? t)
+    (msg i64 (.pick-timer t) (sel c"invalidate") [])
+    (set! (.pick-timer t) (nil))
+    (msg i64 (.outline t) (sel c"removeFromSuperlayer") [])
+    (release (.outline t))
+    (set! (.outline t) (nil))
+    (do)))
+
+(defn pick! [(t (ptr Terminal)) (box g/ImageBox)] (-> void)
+  (do
+    (set! (.picked t) box)
+    (when (not (picked? t))
+      (let [outline (new c"CALayer")]
+        (msg i64 outline (sel c"setBorderWidth:") [f64] 2.0)
+        (msg i64 outline (sel c"setCornerRadius:") [f64] 2.0)
+        (msg i64
+             outline
+             (sel c"setBorderColor:")
+             [(ptr i8)]
+             (msg (ptr i8) (color 0.447 0.78 0.925 1.0) (sel c"CGColor") []))
+        (msg i64 (layer (.view t)) (sel c"addSublayer:") [(ptr i8)] outline)
+        (set! (.outline t) outline)
+        (set! (.pick-timer t)
+              (msg (ptr i8)
+                   (class c"NSTimer")
+                   (sel c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:")
+                   [f64 (ptr i8) (ptr i8) (ptr i8) i8]
+                   PICK-CHECK-SECONDS
+                   (.view t)
+                   (sel c"checkPick:")
+                   (nil)
+                   (: 1 i8)))))
+    (place-outline! t)))
+
+;;; Output and scrolling move what is on screen. The outline follows the image, and a
+;;; picked image no longer showing is no longer picked, so Space types again.
+(defn check-pick [(self (ptr i8)) (cmd (ptr i8)) (timer (ptr i8))] (-> void)
+  (let [t (terminal self)
+        (mut box) (zeroed g/ImageBox)]
+    (cond (not (nil? (.preview-url t))) (do)
+          (and (g/ghostty_surface_image_box (.surface t)
+                                            (.id (.picked t))
+                                            (mut box))
+               (= (.transmission (load box)) (.transmission (.picked t))))
+            (do (set! (.picked t) (load box)) (place-outline! t))
+          :else (unpick! t))))
+
+(defn pick-under-mouse! [(t (ptr Terminal))] (-> void)
+  (let [(mut box) (zeroed g/ImageBox)]
+    (if (g/ghostty_surface_image_at_mouse (.surface t) (mut box))
+        (pick! t (load box))
+        (unpick! t))))
+
+(defn preview-panel [] (-> (ptr i8))
+  (msg (ptr i8) (class c"QLPreviewPanel") (sel c"sharedPreviewPanel") []))
+
+;;; How far from a picked image to look for where its full-size file was printed.
+(const ROWS-BEFORE-IMAGE (: 60 u32))
+
+(const ROWS-AFTER-IMAGE (: 10 u32))
+
+(defn set-preview-file! [(t (ptr Terminal)) (path (ptr i8))] (-> void)
+  (set! (.preview-url t)
+        (msg (ptr i8)
+             (msg (ptr i8)
+                  (class c"NSURL")
+                  (sel c"fileURLWithPath:")
+                  [(ptr i8)]
+                  path)
+             (sel c"retain")
+             [])))
+
+;;; The full-size file of the thumbnail in PIXELS, from the text around it, or nil.
+(defn picked-original [(t (ptr Terminal)) (pixels g/ImagePixels)] (-> (ptr i8))
+  (let [(mut box) (.picked t)
+        (mut around) (zeroed g/Text)]
+    (if (g/ghostty_surface_text_around_image (.surface t)
+                                             (mut box)
+                                             ROWS-BEFORE-IMAGE
+                                             ROWS-AFTER-IMAGE
+                                             (mut around))
+        (let [found
+                (original/find (.text around)
+                               (p/cast i64 (.w pixels))
+                               (p/cast i64 (.h pixels))
+                               (.data pixels))]
+          (g/ghostty_surface_free_text (.surface t) (mut around))
+          found)
+        (nil))))
+
+;;; Save PIXELS where Quick Look can read them. False if they could not be.
+(defn write-preview-copy! [(t (ptr Terminal)) (pixels g/ImagePixels)] (-> bool)
+  (let [files (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+        directory
+          (append (NSTemporaryDirectory)
+                  (append (ns c"jim-preview-") (sessions/identifier)))
+        path (append directory (ns c"/image.png"))
+        png
+          (png-of (p/cast i64 (.w pixels))
+                  (p/cast i64 (.h pixels))
+                  (.data pixels))
+        written
+          (and (not (nil? png))
+               (!= (msg i8
+                        files
+                        (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+                        [(ptr i8) i8 (ptr i8) (ptr i8)]
+                        directory
+                        (: 1 i8)
+                        (nil)
+                        (nil))
+                   (: 0 i8))
+               (!= (msg i8
+                        png
+                        (sel c"writeToFile:atomically:")
+                        [(ptr i8) i8]
+                        path
+                        (: 1 i8))
+                   (: 0 i8)))]
+    (when written
+      (set! (.preview-directory t) (msg (ptr i8) directory (sel c"retain") []))
+      (set-preview-file! t path))
+    written))
+
+;;; Choose what Quick Look shows: the picked image's full-size file if the text around
+;;; it names one, else a copy of what the terminal has. False if neither can be shown.
+(defn prepare-preview! [(t (ptr Terminal))] (-> bool)
+  (let [(mut pixels) (zeroed g/ImagePixels)
+        box (.picked t)]
+    (if (g/ghostty_surface_image_pixels (.surface t)
+                                        (.id box)
+                                        (.transmission box)
+                                        (mut pixels))
+        (let [held (load pixels)
+              original (picked-original t held)
+              ready
+                (if (nil? original)
+                    (write-preview-copy! t held)
+                    (do (set-preview-file! t original) true))]
+          (g/ghostty_surface_image_pixels_free (.surface t) (mut pixels))
+          ready)
+        false)))
+
+;;; Stop previewing, deleting the copy if it was one. An original stays where it is.
+(defn remove-preview! [(t (ptr Terminal))] (-> void)
+  (when (not (nil? (.preview-url t)))
+    (when (not (nil? (.preview-directory t)))
+      (msg i8
+           (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+           (sel c"removeItemAtPath:error:")
+           [(ptr i8) (ptr i8)]
+           (.preview-directory t)
+           (nil))
+      (release (.preview-directory t))
+      (set! (.preview-directory t) (nil)))
+    (release (.preview-url t))
+    (set! (.preview-url t) (nil))
+    (do)))
+
+;;; Quick Look finds who controls its panel by walking the responder chain of the key
+;;; window, so the panel asks the terminal view showing the preview.
+(defn accepts-preview [(self (ptr i8)) (cmd (ptr i8)) (panel (ptr i8))] (-> i8)
+  (let [t (terminal self)]
+    (p/cast i8
+            (if (and (!= (p/cast i64 t) 0) (not (nil? (.preview-url t)))) 1 0))))
+
+(defn begin-preview [(self (ptr i8)) (cmd (ptr i8)) (panel (ptr i8))] (-> void)
+  (do
+    (msg i64 panel (sel c"setDataSource:") [(ptr i8)] self)
+    (msg i64 panel (sel c"setDelegate:") [(ptr i8)] self)
+    (do)))
+
+(defn end-preview [(self (ptr i8)) (cmd (ptr i8)) (panel (ptr i8))] (-> void)
+  (do
+    (msg i64 panel (sel c"setDataSource:") [(ptr i8)] (nil))
+    (msg i64 panel (sel c"setDelegate:") [(ptr i8)] (nil))
+    (remove-preview! (terminal self))))
+
+(defn preview-count [(self (ptr i8)) (cmd (ptr i8)) (panel (ptr i8))] (-> i64)
+  1)
+
+(defn preview-item [(self (ptr i8))
+                    (cmd (ptr i8))
+                    (panel (ptr i8))
+                    (index i64)] (-> (ptr i8))
+  (.preview-url (terminal self)))
+
+;;; Space closes the preview it opened. Its key-up and any repeats land back here.
+(defn preview-event [(self (ptr i8))
+                     (cmd (ptr i8))
+                     (panel (ptr i8))
+                     (event (ptr i8))] (-> i8)
+  (if (and (= (msg u64 event (sel c"type") []) KEY-DOWN-EVENT)
+           (plain-space? event))
+      (do
+        (set! (.space-taken (terminal self)) true)
+        (msg i64 panel (sel c"orderOut:") [(ptr i8)] (nil))
+        (: 1 i8))
+      (: 0 i8)))
+
+;;; Where the preview zooms from and back to: the image in the terminal.
+(defn preview-source [(self (ptr i8))
+                      (cmd (ptr i8))
+                      (panel (ptr i8))
+                      (item (ptr i8))] (-> Rect)
+  (let [t (terminal self)
+        box (.picked t)
+        bounds (msg Rect self (sel c"bounds") [])]
+    (msg Rect
+         (msg (ptr i8) self (sel c"window") [])
+         (sel c"convertRectToScreen:")
+         [Rect]
+         (msg Rect
+              self
+              (sel c"convertRect:toView:")
+              [Rect (ptr i8)]
+              (rect (.x box)
+                    (- (.h bounds) (+ (.y box) (.h box)))
+                    (.w box)
+                    (.h box))
+              (nil)))))
+
+;;; Show the picked image. False if it is gone, so the key should type as usual.
+(defn show-preview! [(t (ptr Terminal))] (-> bool)
+  (if (prepare-preview! t)
+      (let [panel (preview-panel)]
+        (msg i64 panel (sel c"makeKeyAndOrderFront:") [(ptr i8)] (nil))
+        (msg i64 panel (sel c"reloadData") [])
+        true)
+      false))
+
+(defn close-preview! [(t (ptr Terminal))] (-> void)
+  (when (not (nil? (.preview-url t)))
+    (msg i64 (preview-panel) (sel c"orderOut:") [(ptr i8)] (nil))
+    (remove-preview! t)))
+
+;;; Whether this key is Space opening the preview of a picked image. Any other key
+;;; means typing has resumed, so it drops the pick and goes to the terminal.
+(defn key-opens-preview? [(t (ptr Terminal)) (event (ptr i8))] (-> bool)
+  (cond (not (picked? t)) false
+        (and (plain-space? event) (show-preview! t)) true
+        :else (do (unpick! t) false)))
+
 (defn key-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
-  (key-event self
-             event
-             (if (!= (msg i8 event (sel c"isARepeat") []) (: 0 i8)) 2 1)))
+  (let [t (terminal self)]
+    (if (and (.space-taken t) (repeat? event) (plain-space? event))
+        (do)
+        (do
+          (set! (.space-taken t) false)
+          (if (key-opens-preview? t event)
+              (set! (.space-taken t) true)
+              (key-event self event (if (repeat? event) 2 1)))))))
 
 (defn key-up [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
-  (key-event self event 0))
+  (let [t (terminal self)]
+    (if (and (.space-taken t)
+             (= (msg u16 event (sel c"keyCode") []) SPACE-KEYCODE))
+        (set! (.space-taken t) false)
+        (key-event self event 0))))
 
 (defn mouse-position! [(self (ptr i8)) (event (ptr i8))] (-> void)
   (let [pt
@@ -228,6 +565,8 @@
          [(ptr i8)]
          self)
     (mouse-position! self event)
+    (when (= (msg i64 event (sel c"buttonNumber") []) 0)
+      (pick-under-mouse! (terminal self)))
     (g/ghostty_surface_mouse_button (.surface (terminal self))
                                     1
                                     (p/cast i32
@@ -275,6 +614,7 @@
 
 (defn focus-out [(self (ptr i8)) (cmd (ptr i8))] (-> i8)
   (do
+    (unpick! (terminal self))
     (g/ghostty_surface_set_focus (.surface (terminal self)) false)
     (: 1 i8)))
 
@@ -648,6 +988,38 @@
                      c"performDragOperation:"
                      (p/cast (ptr i8) (fnptr-of perform-drag))
                      c"c@:@")
+            (method! cls
+                     c"checkPick:"
+                     (p/cast (ptr i8) (fnptr-of check-pick))
+                     c"v@:@")
+            (method! cls
+                     c"acceptsPreviewPanelControl:"
+                     (p/cast (ptr i8) (fnptr-of accepts-preview))
+                     c"c@:@")
+            (method! cls
+                     c"beginPreviewPanelControl:"
+                     (p/cast (ptr i8) (fnptr-of begin-preview))
+                     c"v@:@")
+            (method! cls
+                     c"endPreviewPanelControl:"
+                     (p/cast (ptr i8) (fnptr-of end-preview))
+                     c"v@:@")
+            (method! cls
+                     c"numberOfPreviewItemsInPreviewPanel:"
+                     (p/cast (ptr i8) (fnptr-of preview-count))
+                     c"q@:@")
+            (method! cls
+                     c"previewPanel:previewItemAtIndex:"
+                     (p/cast (ptr i8) (fnptr-of preview-item))
+                     c"@@:@q")
+            (method! cls
+                     c"previewPanel:handleEvent:"
+                     (p/cast (ptr i8) (fnptr-of preview-event))
+                     c"c@:@@")
+            (method! cls
+                     c"previewPanel:sourceFrameOnScreenForPreviewItem:"
+                     (p/cast (ptr i8) (fnptr-of preview-source))
+                     c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@@")
             (method! cls c"copy:" (p/cast (ptr i8) (fnptr-of copy)) c"v@:@")
             (method! cls c"paste:" (p/cast (ptr i8) (fnptr-of paste)) c"v@:@")
             (method! cls
@@ -950,6 +1322,8 @@
 
 (defn free! [(t (ptr Terminal))] (-> void)
   (do
+    (unpick! t)
+    (close-preview! t)
     (if (!= (p/cast i64 (.surface t)) 0)
         (g/ghostty_surface_free (.surface t))
         (do))
@@ -975,4 +1349,5 @@
           [character-index :as "jim_terminal_character_index"]
           [first-rect :as "jim_terminal_first_rect"]
           [marked-range :as "jim_terminal_marked_range"]
-          [selected-range :as "jim_terminal_selected_range"])
+          [selected-range :as "jim_terminal_selected_range"]
+          [preview-source :as "jim_terminal_preview_source"])
