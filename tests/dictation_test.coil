@@ -13,6 +13,18 @@
 
 (extern memcpy :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
 
+(extern mkdtemp :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
+
+(extern close :cc (cc/C) [i32] (-> i32))
+
+(extern flock :cc (cc/C) [i32 i32] (-> i32))
+
+(extern system :cc (cc/C) [(ptr i8)] (-> i32))
+
 (defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
   (= (strcmp a b) (: 0 i32)))
 
@@ -263,3 +275,94 @@
           (assert (!= (p/cast i64 (strcasestr text c"terminal")) 0)))
         (core/session-free! state)
         (do))))
+
+(deftest the-level-reads-as-original-jims-meter-does
+  (let [(mut samples) (zeroed (array f32 4))
+        data (p/cast (ptr f32) (mut samples))]
+    (assert (= (core/level-of data 0) (: 0.0 f32)))
+    ; Silence is the bottom of the scale, and full scale the top.
+    (assert (= (core/level-of data 4) (: 0.0 f32)))
+    (for [i 0 4] (set! (index data i) (: 1.0 f32)))
+    (assert (> (core/level-of data 4) (: 0.999 f32)))
+    ; -30 dB is halfway.
+    (for [i 0 4] (set! (index data i) (: 0.0316228 f32)))
+    (let [level (core/level-of data 4)]
+      (assert (and (> level (: 0.49 f32)) (< level (: 0.51 f32)))))))
+
+(deftest the-last-line-of-a-log-is-what-failed
+  (let [(mut text) (zeroed (array i8 64))
+        bytes (p/cast (ptr i8) (mut text))]
+    (let [n (snprintf bytes (: 64 u64) c"one\ntwo failed\n\n  \n")]
+      (assert (same? (core/last-line bytes (p/cast i64 n)) c"two failed")))
+    (assert (same? (core/last-line bytes 0) c""))))
+
+;;; A new, empty directory for a pretend install.
+(defn temporary-home [(out (ptr i8))] (-> (ptr i8))
+  (snprintf out (: 200 u64) c"/tmp/jim-phonon-test-XXXXXX")
+  (mkdtemp out))
+
+(defn remove-home! [(home (ptr i8))] (-> i64)
+  (let [(mut command) (zeroed (array i8 300))]
+    (snprintf (p/cast (ptr i8) (mut command)) (: 300 u64) c"rm -rf '%s'" home)
+    (system (p/cast (ptr i8) (mut command)))
+    0))
+
+;;; Lays out what a finished install leaves, and proves it was given PHONON_HOME.
+(const FAKE-INSTALL
+       c"set -e
+mkdir -p \"$PHONON_HOME/venv/bin\"
+touch \"$PHONON_HOME/venv/bin/phonon\"
+chmod +x \"$PHONON_HOME/venv/bin/phonon\"
+echo pin > \"$PHONON_HOME/installed\"
+")
+
+(deftest an-install-counts-once-its-marker-and-program-are-there
+  (let [(mut buffer) (zeroed (array i8 200))
+        home (temporary-home (p/cast (ptr i8) (mut buffer)))]
+    (assert (not (core/installed-at? home)))
+    (assert (core/run-installer FAKE-INSTALL home))
+    (assert (core/installed-at? home))
+    ; A second run finds it done, and doesn't run a script that would fail.
+    (assert (core/run-installer c"exit 7" home))
+    (remove-home! home)
+    (do)))
+
+(deftest a-failed-install-says-why-and-does-not-count
+  (let [(mut buffer) (zeroed (array i8 200))
+        home (temporary-home (p/cast (ptr i8) (mut buffer)))]
+    (assert (not (core/run-installer c"echo working
+echo 'pip exploded' >&2
+exit 3"
+                                     home)))
+    (assert (not (core/installed-at? home)))
+    (assert (!= (p/cast i64 (strstr (core/last-error) c"pip exploded")) 0))
+    (remove-home! home)
+    (do)))
+
+(deftest an-interrupted-install-does-not-count
+  (let [(mut buffer) (zeroed (array i8 200))
+        home (temporary-home (p/cast (ptr i8) (mut buffer)))]
+    ; The program is there, but the script never got as far as its last step.
+    (assert (not (core/run-installer c"mkdir -p \"$PHONON_HOME/venv/bin\"
+touch \"$PHONON_HOME/venv/bin/phonon\"
+chmod +x \"$PHONON_HOME/venv/bin/phonon\""
+                                     home)))
+    (assert (not (core/installed-at? home)))
+    (remove-home! home)
+    (do)))
+
+(deftest the-lock-outlives-this-process-while-the-installer-runs
+  (let [(mut buffer) (zeroed (array i8 200))
+        (mut path) (zeroed (array i8 300))
+        home (temporary-home (p/cast (ptr i8) (mut buffer)))]
+    ; What the script leaves running holds the lock, as it would if the app quit now.
+    (assert (not (core/run-installer c"sleep 2 &
+exit 1" home)))
+    (snprintf (p/cast (ptr i8) (mut path)) (: 300 u64) c"%s/install.lock" home)
+    (let [lock (open (p/cast (ptr i8) (mut path)) (: 2 i32))]
+      (assert (>= lock (: 0 i32)))
+      ; LOCK_EX | LOCK_NB
+      (assert (!= (flock lock (: 6 i32)) (: 0 i32)))
+      (close lock)
+      (remove-home! home)
+      (do))))

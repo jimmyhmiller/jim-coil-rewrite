@@ -668,7 +668,10 @@
       (nil)))
 
 (defn dictation-toggle! [] (-> void)
-  (dictation/toggle! (.root (shell)) (focused-session) (timings/now))
+  (dictation/toggle! (.root (shell))
+                     (focused-session)
+                     (palette/open?)
+                     (timings/now))
   (do))
 
 ;;; The surface of the session being dictated into, wherever it is now.
@@ -1224,7 +1227,21 @@
           (for [i 0 (count)]
             (set! (.space-held (project i)) (= kind 10)))
           0)
-      (cond (and (= kind 10)
+      (cond (and (= kind 10) (= (actions/key-action key flags) 31))
+              ; Ahead of the palette, which otherwise swallows it, since dictation can
+              ; write there. Holding the keys down must not start and stop it repeatedly.
+              (do
+                (when (= (msg i8 event (sel c"isARepeat") []) (: 0 i8))
+                  (invoke! 31))
+                true)
+            ; Escape ends dictation and nothing else, whatever has the keyboard.
+            (and (= kind 10) (dictation/listening?) (= key (: 53 u16)))
+              (do (dictation/stop!) true)
+            (and (= kind 10)
+                 (or (= key (: 36 u16)) (= key (: 76 u16)))
+                 (dictation/holds-return? (.window s)))
+              (do (dictation/return!) true)
+            (and (= kind 10)
                  (and command
                       (and (!= (& flags 131072) (: 0 u64))
                            (= key (: 35 u16)))))
@@ -1242,11 +1259,7 @@
               (do (canvas/clear-resize-cursor!) (palette/handle! event))
             (sidebar/handle! event) (do (canvas/clear-resize-cursor!) true)
             (timings/owns-event? event) false
-            (and (= kind 10) (dictation/listening?) (= key (: 53 u16)))
-              (do (dictation/stop!) true)
-            (and (= kind 10)
-                 (dictation/listening?)
-                 (!= (actions/key-action key flags) 31))
+            (and (= kind 10) (dictation/typing-ends-it? (.window s)))
               (do (dictation/detach!) false)
             (and (= kind 5) (or (< (.selected s) 0) (.overview s)))
               (do (canvas/clear-resize-cursor!) false)

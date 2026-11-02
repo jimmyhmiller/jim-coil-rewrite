@@ -140,9 +140,25 @@ A service writes it from the binary it started with, so a running one logs nothi
 
 ## Dictation
 
-⌘⇧T starts hands-free dictation into the focused terminal, and Escape or ⌘⇧T stops it.
-AudioQueue delivers 16 kHz floats to a worker thread (`src/dictation.coil`), which cuts
-them into phrases and decodes them on the Phonon server shared with original Jim
-(`src/dictation_core.coil`). A revision is DEL × n then a paste of what changed, sent only
-while `ghostty_surface_revisable` says the child is a line editor. Otherwise the transcript
-stays on the pill and lands as one paste at the end. Typing during dictation ends it.
+⌘⇧T starts hands-free dictation into whatever has the keyboard, and Escape or ⌘⇧T stops
+it. Return also stops it, and reaches the target once the last words have landed, except
+in the palette, where it would run whichever action they left selected. AudioQueue delivers
+16 kHz floats to a worker thread (`src/dictation.coil`), which cuts them into phrases and
+decodes them on the Phonon server shared with original Jim (`src/dictation_core.coil`).
+Each buffer also sets the pill's level meter.
+
+A terminal gets a revision as DEL × n then a paste of what changed, sent only while
+`ghostty_surface_revisable` says the child is a line editor. Otherwise the transcript stays
+on the pill and lands as one paste at the end. Typing during dictation ends it.
+
+Everything else that takes text is AppKit's: the palette, a project being renamed, a
+widget's input or text area. All go through the window's first responder, an `NSTextView`,
+which for a field is the one field editor they share. A write replaces the text it last
+wrote, through `insertText:replacementRange:` so listeners hear it. It stops writing if that
+text has changed, so an edit is never overwritten, or if the target has lost the keyboard.
+
+If Phonon isn't installed, the first ⌘⇧T runs original Jim's installer, compiled in, on a
+background thread and doesn't open the microphone. The pill says when it's ready. It uses
+original Jim's files and lock in `~/.jim/phonon`, and the lock is inherited by the script,
+so an app that quits mid-install leaves it running and the next one waits for it. Any
+finished install counts, whichever pin, so the two apps can't reinstall over each other.

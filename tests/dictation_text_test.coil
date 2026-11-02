@@ -1,0 +1,222 @@
+(module jim.dictation-text-test)
+(import "coil.cc")
+(import "jim.dictation" :as dictation)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+(extern strcmp :cc (coil.cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (= (strcmp (utf8 a) b) (: 0 i32)))
+
+(defn change-count [] (-> (ptr i64))
+  (p/alloc-static i64))
+
+(defn newline-count [] (-> (ptr i64))
+  (p/alloc-static i64))
+
+(defn counted-change [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (set! (change-count) (+ (load (change-count)) 1))
+  (do))
+
+(export-c [counted-change :as "jim_test_counted_change"])
+
+(defn counted-command [(self (ptr i8))
+                       (cmd (ptr i8))
+                       (control (ptr i8))
+                       (view (ptr i8))
+                       (command (ptr i8))] (-> i8)
+  (if (= (p/cast i64 command) (p/cast i64 (sel c"insertNewline:")))
+      (do (set! (newline-count) (+ (load (newline-count)) 1)) (: 1 i8))
+      (: 0 i8)))
+
+(export-c [counted-command :as "jim_test_counted_command"])
+
+;;; Hears what a field or a text view hears, as the palette and widgets do.
+(defn listener [] (-> (ptr i8))
+  (let [cell (p/alloc-static (ptr i8))]
+    (when (= (p/cast i64 (load cell)) 0)
+      (let [cls
+              (objc_allocateClassPair (class c"NSObject")
+                                      c"JimDictationTestListener"
+                                      0)]
+        (method! cls
+                 c"controlTextDidChange:"
+                 (p/cast (ptr i8) (fnptr-of counted-change))
+                 c"v@:@")
+        (method! cls
+                 c"textDidChange:"
+                 (p/cast (ptr i8) (fnptr-of counted-change))
+                 c"v@:@")
+        (method! cls
+                 c"control:textView:doCommandBySelector:"
+                 (p/cast (ptr i8) (fnptr-of counted-command))
+                 c"c@:@@:")
+        (objc_registerClassPair cls)
+        (set! cell
+              (msg (ptr i8)
+                   (msg (ptr i8) cls (sel c"alloc") [])
+                   (sel c"init")
+                   []))
+        0))
+    (load cell)))
+
+(defn test-window [] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") [])
+  (let [window
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSWindow") (sel c"alloc") [])
+               (sel c"initWithContentRect:styleMask:backing:defer:")
+               [Rect u64 u64 i8]
+               (rect 0.0 0.0 400.0 300.0)
+               (: 0 u64)
+               (: 2 u64)
+               (: 1 i8))]
+    (msg i64 window (sel c"setReleasedWhenClosed:") [i8] (: 0 i8))
+    window))
+
+(defn add-field! [(window (ptr i8)) (value (ptr i8)) (y f64)] (-> (ptr i8))
+  (let [field
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSTextField") (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               (rect 0.0 y 200.0 24.0))]
+    (msg i64 field (sel c"setStringValue:") [(ptr i8)] (ns value))
+    (msg i64 field (sel c"setDelegate:") [(ptr i8)] (listener))
+    (msg i64
+         (msg (ptr i8) window (sel c"contentView") [])
+         (sel c"addSubview:")
+         [(ptr i8)]
+         field)
+    field))
+
+(defn focus! [(window (ptr i8)) (view (ptr i8))] (-> i64)
+  (msg i8 window (sel c"makeFirstResponder:") [(ptr i8)] view)
+  0)
+
+(defn editor-text [(editor (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) editor (sel c"string") []))
+
+(deftest a-field-gets-the-words-and-hears-about-them
+  (let [window (test-window)
+        field (add-field! window c"old name" 0.0)]
+    (focus! window field)
+    (let [editor (dictation/focused-text window)]
+      (assert (!= (p/cast i64 editor) 0))
+      ; Focusing a field selects it, so the first words replace it, as typing would.
+      (dictation/target-text! editor true)
+      (set! (change-count) 0)
+      (dictation/write-editor! c"hello")
+      (assert (same? (editor-text editor) c"hello"))
+      (assert (> (load (change-count)) 0))
+      (dictation/write-editor! c"hello world")
+      (assert (same? (editor-text editor) c"hello world"))
+      (assert (not (.detached (dictation/state))))
+      ; Commits as the field would on Return.
+      (set! (.submit (dictation/state)) true)
+      (set! (newline-count) 0)
+      (dictation/replay-return! (nil))
+      (assert (= (load (newline-count)) 1))
+      (dictation/end-session!)
+      (do))))
+
+(deftest an-edit-under-the-words-is-never-overwritten
+  (let [window (test-window)
+        field (add-field! window c"" 0.0)]
+    (focus! window field)
+    (let [editor (dictation/focused-text window)]
+      (dictation/target-text! editor true)
+      (set! (.detached (dictation/state)) false)
+      (dictation/write-editor! c"one two")
+      (msg i64
+           editor
+           (sel c"insertText:replacementRange:")
+           [(ptr i8) Range]
+           (ns c"X")
+           (Range :location (: 3 u64) :length (: 0 u64)))
+      (dictation/write-editor! c"one two three")
+      (assert (.detached (dictation/state)))
+      (assert (same? (editor-text editor) c"oneX two"))
+      (dictation/end-session!)
+      (do))))
+
+(deftest moving-to-another-field-stops-the-writing
+  (let [window (test-window)
+        first-field (add-field! window c"" 0.0)
+        second-field (add-field! window c"keep me" 40.0)]
+    (focus! window first-field)
+    (let [editor (dictation/focused-text window)]
+      (dictation/target-text! editor true)
+      (set! (.detached (dictation/state)) false)
+      (dictation/write-editor! c"words")
+      ; The same field editor now edits the other field, so a write would look fine.
+      (focus! window second-field)
+      (assert (= (p/cast i64 (dictation/focused-text window))
+                 (p/cast i64 editor)))
+      (assert (not (dictation/editing-target?)))
+      (dictation/write-editor! c"more words")
+      (assert (.detached (dictation/state)))
+      (assert (same? (msg (ptr i8) second-field (sel c"stringValue") [])
+                     c"keep me"))
+      (dictation/end-session!)
+      (do))))
+
+(deftest a-text-view-keeps-what-is-around-the-caret
+  (let [window (test-window)
+        view
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSTextView") (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               (rect 0.0 0.0 300.0 200.0))]
+    (msg i64
+         (msg (ptr i8) window (sel c"contentView") [])
+         (sel c"addSubview:")
+         [(ptr i8)]
+         view)
+    (msg i64 view (sel c"setDelegate:") [(ptr i8)] (listener))
+    ; An emoji is two characters to AppKit, and the caret must count them as it does.
+    (msg i64
+         view
+         (sel c"setString:")
+         [(ptr i8)]
+         (ns c"\xf0;\x9f;\x98;\x80; before  after"))
+    (msg i64
+         view
+         (sel c"setSelectedRange:")
+         [Range]
+         (Range :location (: 10 u64) :length (: 0 u64)))
+    (focus! window view)
+    (assert (= (p/cast i64 (dictation/focused-text window)) (p/cast i64 view)))
+    (assert (= (p/cast i64 (dictation/client-of view)) (p/cast i64 view)))
+    (dictation/target-text! view true)
+    (set! (.detached (dictation/state)) false)
+    (set! (change-count) 0)
+    (dictation/write-editor! c"caf\xc3;\xa9;")
+    (dictation/write-editor! c"caf\xc3;\xa9; au lait")
+    (assert (not (.detached (dictation/state))))
+    (assert (same? (editor-text view)
+                   c"\xf0;\x9f;\x98;\x80; before caf\xc3;\xa9; au lait after"))
+    (assert (> (load (change-count)) 0))
+    (dictation/end-session!)
+    (do)))
+
+(deftest nothing-that-cannot-be-typed-in-is-a-target
+  (let [window (test-window)
+        view
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSTextView") (sel c"alloc") [])
+               (sel c"initWithFrame:")
+               [Rect]
+               (rect 0.0 0.0 300.0 200.0))]
+    (msg i64
+         (msg (ptr i8) window (sel c"contentView") [])
+         (sel c"addSubview:")
+         [(ptr i8)]
+         view)
+    (msg i64 view (sel c"setEditable:") [i8] (: 0 i8))
+    (focus! window view)
+    (assert (= (p/cast i64 (dictation/focused-text window)) 0))
+    (assert (= (p/cast i64 (dictation/focused-text (nil))) 0))
+    (do)))

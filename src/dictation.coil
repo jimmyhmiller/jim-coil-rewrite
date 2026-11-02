@@ -7,8 +7,14 @@
 (import "jim.session.transport" :as transport)
 
 ;;; Hands-free dictation, as in original Jim. ⌘⇧T starts it and Escape or ⌘⇧T stops it.
-;;; Words appear in the focused terminal while you speak and settle as the engine gets
-;;; more context. The target is chosen when dictation starts, and focus can move on.
+;;; Words appear in what has the keyboard while you speak, and settle as the engine gets
+;;; more context. Return ends it, and is passed on once the last words have landed. The
+;;; target is chosen when dictation starts.
+;;;
+;;; Anything else that takes text here is AppKit's: the palette, a project being renamed,
+;;; a widget's input or text area. Each write checks the text it is replacing is still
+;;; what it wrote, and stops writing if it isn't, so an edit is never overwritten. It also
+;;; stops if the target loses the keyboard, as there's a shared field editor to mistake.
 ;;;
 ;;; A terminal is a byte stream and a paste can't be unsent, so a revision is DEL × n
 ;;; then the new text, which only means "delete what we wrote" to a line editor. It is
@@ -35,6 +41,8 @@
 (extern free :cc (cc/C) [(ptr i8)] (-> void))
 
 (extern strlen :cc (cc/C) [(ptr i8)] (-> u64))
+
+(extern strdup :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (extern malloc :cc (cc/C) [u64] (-> (ptr i8)))
 
@@ -91,8 +99,8 @@
 ;;; kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
 (const FLOAT-PACKED 9)
 
-;;; 100 ms of 32-bit samples.
-(const BUFFER-BYTES 6400)
+;;; 50 ms of 32-bit samples, which is also how often the meter moves.
+(const BUFFER-BYTES 3200)
 
 ;;; AudioQueueBuffer: mAudioData at 8, mAudioDataByteSize at 16.
 (const BUFFER-DATA-OFFSET 8)
@@ -101,9 +109,22 @@
 
 (const ERROR-SECONDS 5.0)
 
+;;; Which way a long line on the pill loses its overflow. A transcript's end is the part
+;;; to see, and a message's start.
+(const CUT-HEAD 3)
+
+(const CUT-TAIL 4)
+
 (const PILL-WIDTH 420.0)
 
 (const PILL-HEIGHT 30.0)
+
+;;; The pill while it has a meter under its text.
+(const PILL-METER-HEIGHT 42.0)
+
+(const METER-WIDTH 392.0)
+
+(const METER-HEIGHT 4.0)
 
 (const PILL-TOP 64.0)
 
@@ -123,7 +144,10 @@
    (failed bool)
    (text (ptr i8))
    (fresh bool)
-   (capturing bool)])
+   (capturing bool)
+   (level f32)
+   (install-done bool)
+   (install-ok bool)])
 
 (defn shared [] (-> (ptr Shared))
   (p/alloc-static Shared))
@@ -150,6 +174,7 @@
     (core/samples-push! (field s pending)
                         data
                         (/ (p/cast i64 bytes) 4))
+    (set! (.level s) (core/level-of data (/ (p/cast i64 bytes) 4)))
     (let [capturing (.capturing s)]
       (unlock!)
       (when capturing
@@ -215,11 +240,29 @@
 
 (export-c [worker-main :as "jim_dictation_worker"])
 
+;;; The install's own thread. It reports on the pill when it's done.
+(defn installer-main [(argument (ptr i8))] (-> (ptr i8))
+  (let [ok (core/install-phonon!)
+        s (shared)]
+    (lock!)
+    (set! (.install-ok s) ok)
+    (set! (.install-done s) true)
+    (unlock!)
+    (p/cast (ptr i8) 0)))
+
+(export-c [installer-main :as "jim_dictation_installer"])
+
 ;;; ---- the main thread -----------------------------------------------------------------
 
 (defstruct State
   [(phase i64)
    (target (ptr i8))
+   (editor (ptr i8))
+   (client (ptr i8))
+   (at u64)
+   (replay-return bool)
+   (submit bool)
+   (installing bool)
    (detached bool)
    (inserted (ptr i8))
    (preview (ptr i8))
@@ -227,6 +270,8 @@
    (queue (ptr i8))
    (pill (ptr i8))
    (label (ptr i8))
+   (meter (ptr i8))
+   (fill (ptr i8))
    (message-until f64)
    (mutex-ready bool)])
 
@@ -274,27 +319,47 @@
                      (rect 14.0 6.0 (- PILL-WIDTH 28.0) 18.0)
                      12.0
                      false))
-        (msg i64
-             (.label s)
-             (sel c"setLineBreakMode:")
-             [u64]
-             (: 3 u64))
+        (set! (.meter s)
+              (view pill (rect 14.0 8.0 METER-WIDTH METER-HEIGHT)))
+        (msg i64 (layer (.meter s)) (sel c"setCornerRadius:") [f64] 2.0)
+        (background! (.meter s) 0.17 0.21 0.27)
+        (set! (.fill s) (view (.meter s) (rect 0.0 0.0 2.0 METER-HEIGHT)))
+        (msg i64 (layer (.fill s)) (sel c"setCornerRadius:") [f64] 2.0)
+        (background! (.fill s) 0.45 0.72 1.0)
         (msg i64 pill (sel c"setHidden:") [i8] (: 1 i8))
         0))
     0))
 
-(defn pill-text! [(root (ptr i8)) (text (ptr i8))] (-> i64)
+;;; Show LEVEL, from 0 to 1, on the meter.
+(defn meter! [(level f32)] (-> i64)
+  (let [s (state)
+        width (* (p/cast f64 level) METER-WIDTH)]
+    (when (!= (p/cast i64 (.fill s)) 0)
+      (frame! (.fill s)
+              (rect 0.0 0.0 (if (< width 2.0) 2.0 width) METER-HEIGHT))
+      0)
+    0))
+
+(defn pill-text! [(root (ptr i8)) (text (ptr i8)) (cut i64) (metered bool)]
+  (-> i64)
   (let [s (state)
         bounds (msg Rect root (sel c"bounds") [])
-        flipped (!= (msg i8 root (sel c"isFlipped") []) (: 0 i8))]
+        flipped (!= (msg i8 root (sel c"isFlipped") []) (: 0 i8))
+        height (if metered PILL-METER-HEIGHT PILL-HEIGHT)]
     (ensure-pill! root)
     (frame! (.pill s)
             (rect (/ (- (.w bounds) PILL-WIDTH) 2.0)
-                  (if flipped
-                      PILL-TOP
-                      (- (.h bounds) (+ PILL-TOP PILL-HEIGHT)))
+                  (if flipped PILL-TOP (- (.h bounds) (+ PILL-TOP height)))
                   PILL-WIDTH
-                  PILL-HEIGHT))
+                  height))
+    (frame! (.label s)
+            (rect 14.0 (- height 24.0) (- PILL-WIDTH 28.0) 18.0))
+    (msg i64
+         (.meter s)
+         (sel c"setHidden:")
+         [i8]
+         (if metered (: 0 i8) (: 1 i8)))
+    (msg i64 (.label s) (sel c"setLineBreakMode:") [u64] (p/cast u64 cut))
     (msg i64 (.label s) (sel c"setStringValue:") [(ptr i8)] (ns text))
     (msg i64
          root
@@ -326,7 +391,93 @@
               (if (= (p/cast i64 preview) 0)
                   c""
                   (index preview (core/tail-start preview 56))))
-    (pill-text! root out)
+    (pill-text! root out CUT-HEAD (= (.phase s) LISTENING))
+    0))
+
+;;; ---- writing to AppKit's text ----------------------------------------------------------
+
+;;; What in WINDOW has the keyboard and takes text, or nil. A text field's is the shared
+;;; field editor, as AppKit edits every field through one.
+(defn focused-text [(window (ptr i8))] (-> (ptr i8))
+  (let [responder
+          (if (= (p/cast i64 window) 0)
+              (nil)
+              (msg (ptr i8) window (sel c"firstResponder") []))]
+    (if (and (!= (p/cast i64 responder) 0)
+             (!= (msg i8
+                      responder
+                      (sel c"isKindOfClass:")
+                      [(ptr i8)]
+                      (class c"NSTextView"))
+                 (: 0 i8))
+             (!= (msg i8 responder (sel c"isEditable") []) (: 0 i8)))
+        responder
+        (nil))))
+
+;;; What EDITOR is editing: the field, for a field editor, otherwise itself.
+(defn client-of [(editor (ptr i8))] (-> (ptr i8))
+  (if (!= (msg i8 editor (sel c"isFieldEditor") []) (: 0 i8))
+      (msg (ptr i8) editor (sel c"delegate") [])
+      editor))
+
+;;; Whether the target still has the keyboard. The field editor moving on to another
+;;; field looks like nothing happened, unless what it's editing is checked too.
+(defn editing-target? [] (-> bool)
+  (let [s (state)
+        editor (.editor s)
+        window (msg (ptr i8) editor (sel c"window") [])]
+    (and (= (p/cast i64 (focused-text window)) (p/cast i64 editor))
+         (= (p/cast i64 (client-of editor)) (p/cast i64 (.client s))))))
+
+;;; Replace the characters at AT in EDITOR, if they are still PREVIOUS, with TEXT. True
+;;; if they were. Going through the text input system tells whoever is listening, so the
+;;; palette filters and a widget hears the change, and leaves the caret after the text.
+(defn revise-text! [(editor (ptr i8))
+                    (at u64)
+                    (previous (ptr i8))
+                    (text (ptr i8))] (-> bool)
+  (let [before (ns previous)
+        length (msg u64 before (sel c"length") [])
+        whole (msg (ptr i8) editor (sel c"string") [])
+        span (Range :location at :length length)]
+    (if (or (> (+ at length) (msg u64 whole (sel c"length") []))
+            (= (msg i8
+                    (msg (ptr i8)
+                         whole
+                         (sel c"substringWithRange:")
+                         [Range]
+                         span)
+                    (sel c"isEqualToString:")
+                    [(ptr i8)]
+                    before)
+               (: 0 i8)))
+        false
+        (do
+          (msg i64
+               editor
+               (sel c"insertText:replacementRange:")
+               [(ptr i8) Range]
+               (ns text)
+               span)
+          true))))
+
+(defn stop-writing! [(reason (ptr i8))] (-> i64)
+  (set! (.detached (state)) true)
+  (transport/log! c"dictation stopped-writing reason=%s"
+                  (p/cast i64 reason)
+                  0
+                  0
+                  0)
+  0)
+
+(defn write-editor! [(flat (ptr i8))] (-> i64)
+  (let [s (state)]
+    (cond (.detached s) 0
+          (= (strlen flat) (: 0 u64)) 0
+          (not (editing-target?)) (stop-writing! c"target-lost-the-keyboard")
+          (revise-text! (.editor s) (.at s) (.inserted s) flat)
+            (replace-string! (field s inserted) (strdup flat))
+          :else (stop-writing! c"target-was-edited"))
     0))
 
 ;;; ---- writing to the terminal -------------------------------------------------------
@@ -357,6 +508,7 @@
             (and (!= (p/cast i64 surface) 0)
                  (g/ghostty_surface_revisable surface))]
       (cond (.detached s) 0
+            (!= (p/cast i64 (.editor s)) 0) (write-editor! flat)
             (= (p/cast i64 surface) 0)
               (do
                 (set! (.detached s) true)
@@ -457,25 +609,73 @@
     0))
 
 (defn show-message! [(root (ptr i8)) (text (ptr i8)) (now f64)] (-> i64)
-  (pill-text! root text)
+  (pill-text! root text CUT-TAIL false)
   (set! (.message-until (state)) (+ now ERROR-SECONDS))
   (transport/log! c"dictation message=%s" (p/cast i64 text) 0 0 0)
   0)
 
-;;; Dictate into session ID until told to stop. Nil ID: nothing focused can take it.
-(defn start! [(root (ptr i8)) (id (ptr i8)) (now f64)] (-> i64)
+;;; Install Phonon in the background, and say so. It takes minutes, so nothing waits on
+;;; it: the pill says when to try again.
+(defn begin-install! [(root (ptr i8)) (now f64)] (-> i64)
   (let [s (state)
-        t (shared)]
+        (mut thread) (zeroed u64)]
+    (when (not (.installing s))
+      (lock!)
+      (set! (.install-done (shared)) false)
+      (unlock!)
+      (if (= (pthread_create (mut thread)
+                             (p/cast (ptr i8) 0)
+                             (p/cast (ptr i8) (fnptr-of installer-main))
+                             (p/cast (ptr i8) 0))
+             (: 0 i32))
+          (do
+            (pthread_detach (load thread))
+            (set! (.installing s) true)
+            (transport/log! c"dictation install-started" 0 0 0 0)
+            0)
+          (core/set-error! c"Couldn't start the Phonon install.")))
+    (show-message! root
+                   (if (.installing s)
+                       c"Installing Phonon (first use, a minute or two). Try again when it says it's ready."
+                       (core/last-error))
+                   now)))
+
+;;; Point the session at EDITOR, which has the keyboard. Text goes where the caret is, and
+;;; replaces a selection as typing would, so what's selected is what's to be replaced.
+(defn target-text! [(editor (ptr i8)) (replay-return bool)] (-> i64)
+  (let [s (state)
+        selection (msg Range editor (sel c"selectedRange") [])]
+    (set! (.editor s) (msg (ptr i8) editor (sel c"retain") []))
+    (set! (.client s) (msg (ptr i8) (client-of editor) (sel c"retain") []))
+    (set! (.at s) (.location selection))
+    (set! (.replay-return s) replay-return)
+    (replace-string! (field s inserted)
+                     (strdup (utf8 (msg (ptr i8)
+                                        (msg (ptr i8) editor (sel c"string") [])
+                                        (sel c"substringWithRange:")
+                                        [Range]
+                                        selection))))
+    0))
+
+;;; Dictate into what has the keyboard in ROOT's window until told to stop: its text if
+;;; any, otherwise session ID. Return is passed on at the end unless IN-PALETTE, where it
+;;; would run whichever action the words happened to leave selected.
+(defn start! [(root (ptr i8)) (id (ptr i8)) (in-palette bool) (now f64)]
+  (-> i64)
+  (let [s (state)
+        t (shared)
+        editor (focused-text (msg (ptr i8) root (sel c"window") []))]
     (when (not (.mutex-ready s))
       (pthread_mutex_init (p/cast (ptr i8) (field t mutex)) (p/cast (ptr i8) 0))
       (set! (.mutex-ready s) true)
       0)
-    (cond (= (p/cast i64 id) 0)
-            (show-message! root c"Dictation needs a focused terminal." now)
+    (cond (and (= (p/cast i64 editor) 0) (= (p/cast i64 id) 0))
+            (show-message! root c"Nothing focused to dictate into." now)
           (microphone-denied?)
             (show-message! root
                            c"Microphone access is off for Jim Coil. See System Settings → Privacy."
                            now)
+          (not (core/installed?)) (begin-install! root now)
           :else
             (do
               (set! (.stop t) false)
@@ -499,18 +699,25 @@
                           (pthread_detach (load thread))
                           (set! (.phase s) LISTENING)
                           (set! (.detached s) false)
+                          (set! (.submit s) false)
                           (set! (.message-until s) 0.0)
-                          (set! (.target s)
-                                (msg (ptr i8) id (sel c"retain") []))
                           (replace-string! (field s inserted)
                                            (p/cast (ptr i8) 0))
                           (replace-string! (field s preview)
                                            (p/cast (ptr i8) 0))
-                          (transport/log! c"dictation start id=%s"
-                                          (p/cast i64 (utf8 id))
-                                          0
-                                          0
-                                          0)
+                          (if (!= (p/cast i64 editor) 0)
+                              (do
+                                (target-text! editor (not in-palette))
+                                (transport/log! c"dictation start text" 0 0 0 0))
+                              (do
+                                (set! (.target s)
+                                      (msg (ptr i8) id (sel c"retain") []))
+                                (transport/log! c"dictation start id=%s"
+                                                (p/cast i64 (utf8 id))
+                                                0
+                                                0
+                                                0)))
+                          (meter! (: 0.0 f32))
                           (listening-text! root)
                           0))))))
     0))
@@ -527,25 +734,73 @@
       0)
     0))
 
+;;; Whether keys pressed now go to the target, rather than to the palette or a field the
+;;; person has since moved to.
+(defn keyboard-on-target? [(window (ptr i8))] (-> bool)
+  (let [editor (.editor (state))
+        text (focused-text window)]
+    (= (p/cast i64 text) (p/cast i64 editor))))
+
+;;; Whether a key pressed now would type over a terminal's transcript. A text target
+;;; doesn't need this, as its writes check what they replace.
+(defn typing-ends-it? [(window (ptr i8))] (-> bool)
+  (and (active?)
+       (= (p/cast i64 (.editor (state))) 0)
+       (keyboard-on-target? window)))
+
 ;;; The user typed. DEL would now delete what they typed, so leave the text as it is.
 (defn detach! [] (-> i64)
-  (when (listening?)
+  (when (active?)
     (set! (.detached (state)) true)
     (stop!)
     (transport/log! c"dictation typing-ended-it" 0 0 0 0)
     0)
   0)
 
-(defn toggle! [(root (ptr i8)) (id (ptr i8)) (now f64)] (-> i64)
+;;; Whether Return should wait for the transcript. It's what ends a dictation into
+;;; something that submits, and the target would otherwise submit without the last words.
+(defn holds-return? [(window (ptr i8))] (-> bool)
+  (and (active?) (not (.detached (state))) (keyboard-on-target? window)))
+
+(defn return! [] (-> i64)
+  (set! (.submit (state)) true)
+  (stop!))
+
+;;; Return, now the transcript is in. To the target, wherever the keyboard has gone since.
+(defn replay-return! [(surface (ptr i8))] (-> i64)
+  (let [s (state)]
+    (cond (!= (p/cast i64 (.editor s)) 0)
+            (when (and (.replay-return s) (editing-target?))
+              (msg i64
+                   (.editor s)
+                   (sel c"doCommandBySelector:")
+                   [(ptr i8)]
+                   (sel c"insertNewline:"))
+              0)
+          (!= (p/cast i64 surface) 0)
+            (do
+              (g/ghostty_surface_binding_action surface
+                                                c"text:\\x0d"
+                                                (: 9 u64))
+              0)
+          :else 0)
+    0))
+
+(defn toggle! [(root (ptr i8)) (id (ptr i8)) (in-palette bool) (now f64)]
+  (-> i64)
   (cond (listening?) (stop!)
         (active?) 0
-        :else (start! root id now)))
+        :else (start! root id in-palette now)))
 
 (defn end-session! [] (-> i64)
   (let [s (state)]
     (set! (.phase s) IDLE)
     (release (.target s))
     (set! (.target s) (p/cast (ptr i8) 0))
+    (release (.editor s))
+    (set! (.editor s) (p/cast (ptr i8) 0))
+    (release (.client s))
+    (set! (.client s) (p/cast (ptr i8) 0))
     (replace-string! (field s inserted) (p/cast (ptr i8) 0))
     (replace-string! (field s preview) (p/cast (ptr i8) 0))
     0))
@@ -560,16 +815,37 @@
       (set! (.message-until s) 0.0)
       (pill-hide!)
       0)
+    (when (.installing s)
+      (lock!)
+      (let [done (.install-done t)
+            ok (.install-ok t)]
+        (unlock!)
+        (when done
+          (set! (.installing s) false)
+          (transport/log! c"dictation install-finished ok=%lld"
+                          (if ok 1 0)
+                          0
+                          0
+                          0)
+          ; A dictation can't be running, as none starts until this reports.
+          (show-message! root
+                         (if ok
+                             c"✓ Phonon is installed and ready."
+                             (core/last-error))
+                         now)
+          0)))
     (when (active?)
       (lock!)
       (let [text (if (.fresh t) (.text t) (p/cast (ptr i8) 0))
             done (.done t)
-            failed (.failed t)]
+            failed (.failed t)
+            level (.level t)]
         (when (.fresh t)
           (set! (.text t) (p/cast (ptr i8) 0))
           (set! (.fresh t) false)
           0)
         (unlock!)
+        (meter! level)
         (when (!= (p/cast i64 text) 0)
           (write-text! surface text done)
           (free text)
@@ -585,9 +861,13 @@
                             (if (.detached s) 1 0)
                             (if nothing 1 0)
                             0)
+            (when (and (.submit s) (not failed) (not (.detached s)))
+              (replay-return! surface)
+              0)
             (cond failed (show-message! root (core/last-error) now)
                   nothing (show-message! root c"Heard nothing." now)
-                  (= (p/cast i64 surface) 0)
+                  (and (= (p/cast i64 surface) 0)
+                       (= (p/cast i64 (.editor s)) 0))
                     (show-message! root c"That terminal is gone." now)
                   :else (pill-hide!))
             (end-session!)

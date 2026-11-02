@@ -96,7 +96,25 @@
         [(ptr (ptr i8)) i32 (ptr i8) i32 u16]
         (-> i32))
 
+(extern posix_spawn_file_actions_addinherit_np
+        :cc
+        (cc/C)
+        [(ptr (ptr i8)) i32]
+        (-> i32))
+
 (extern _NSGetEnviron :cc (cc/C) [] (-> (ptr (ptr (ptr i8)))))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern mkdir :cc (cc/C) [(ptr i8) u16] (-> i32))
+
+(extern lseek :cc (cc/C) [i32 i64 i32] (-> i64))
+
+(extern strncmp :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> i32))
+
+(extern log10f :cc (cc/C) [f32] (-> f32))
+
+(extern sinf :cc (cc/C) [f32] (-> f32))
 
 (const RATE 16000)
 
@@ -145,6 +163,22 @@
   (free (p/cast (ptr i8) (.data b)))
   (set! b (zeroed Samples))
   0)
+
+;;; How loud COUNT samples are, from 0 at -60 dB or quieter to 1 at full scale, as
+;;; original Jim's meter reads them.
+(defn level-of [(samples (ptr f32)) (count i64)] (-> f32)
+  (if (<= count 0)
+      (: 0.0 f32)
+      (let [(mut sum) (: 0.0 f32)]
+        (for [i 0 count]
+          (let [sample (load (index samples i))]
+            (set! sum (+ (load sum) (* sample sample)))))
+        (let [rms (math/sqrt (/ (load sum) (p/cast f32 count)))
+              db (* (: 20.0 f32) (log10f (+ rms (: 0.000000001 f32))))
+              level (/ (+ db (: 60.0 f32)) (: 60.0 f32))]
+          (cond (< level (: 0.0 f32)) (: 0.0 f32)
+                (> level (: 1.0 f32)) (: 1.0 f32)
+                :else level)))))
 
 ;;; ---- segmenting -----------------------------------------------------------------
 ;;; Nothing is dropped from speech: closed phrases keep their trailing quiet, so the
@@ -707,7 +741,7 @@
                     c"phonon/venv/bin/phonon")
           (if (!= (access (p/cast (ptr i8) (mut bin)) (: 1 i32)) (: 0 i32))
               (do
-                (set-error! c"Phonon isn't installed. Run original Jim's scripts/install-phonon.sh.")
+                (set-error! c"Phonon isn't installed. Start dictation again to install it.")
                 (: -1 i32))
               (let [lock
                       (open (p/cast (ptr i8) (mut lock-path))
@@ -771,8 +805,10 @@
                           (set! at (+ (load at) n))))))
           true))))
 
-;;; POST COUNT samples to PORT. The trimmed transcript in a new allocation, or nil.
-(defn post-audio [(port i32) (samples (ptr f32)) (count i64)] (-> (ptr i8))
+;;; POST COUNT samples to PORT, giving it SECONDS. The trimmed transcript in a new
+;;; allocation, or nil.
+(defn post-audio [(port i32) (samples (ptr f32)) (count i64) (seconds i64)]
+  (-> (ptr i8))
   (let [wav (encode-wav samples count)
         wav-size (+ WAV-HEADER (* 2 count))
         head
@@ -789,7 +825,7 @@
                             (: 400 u64)
                             c"POST /v1/audio/transcriptions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=----jimdictation7f3a1c\r\nContent-Length: %lld\r\n\r\n"
                             (+ head-size wav-size tail-size)))
-        fd (connect-port port 60)
+        fd (connect-port port seconds)
         result
           (if (< fd (: 0 i32))
               (p/cast (ptr i8) 0)
@@ -836,19 +872,23 @@
     (free wav)
     result))
 
+;;; A decode of a long phrase on a busy machine, or the first on a cold server, can take
+;;; a while. This only catches a wedged server.
+(const DECODE-SECONDS 60)
+
 ;;; Decode on the shared server. A failed request means it died or wedged, so look again
 ;;; and retry once, and a server dying mid-dictation costs one respawn, not the session.
 (defn decode [(samples (ptr f32)) (count i64)] (-> (ptr i8))
   (let [port (ensure-server)]
     (if (< port (: 0 i32))
         (p/cast (ptr i8) 0)
-        (let [first (post-audio port samples count)]
+        (let [first (post-audio port samples count DECODE-SECONDS)]
           (if (!= (p/cast i64 first) 0)
               first
               (let [again (ensure-server)]
                 (if (< again (: 0 i32))
                     (p/cast (ptr i8) 0)
-                    (let [second (post-audio again samples count)]
+                    (let [second (post-audio again samples count DECODE-SECONDS)]
                       (when (= (p/cast i64 second) 0)
                         (set-error! c"The Phonon server didn't answer a decode.")
                         0)
@@ -975,3 +1015,282 @@
           (free (.partial s))
           (set! (.partial s) (empty-string))
           true))))
+
+;;; ---- installing Phonon -------------------------------------------------------------
+;;; As original Jim does: on first use, in the background, with the same script, lock and
+;;; files, so whichever app gets there first installs it for both.
+
+;;; Original Jim's scripts/install-phonon.sh. It's compiled in so a release can run it.
+(defn install-script [] (-> (ptr i8))
+  c"set -euo pipefail
+
+PIN=\"fermion-research==0.2.11\"
+PYTHON_VERSION=\"3.12\"
+UV_VERSION=\"0.5.9\"
+PHONON_HOME=\"${PHONON_HOME:-$HOME/.jim/phonon}\"
+VENV=\"$PHONON_HOME/venv\"
+MARKER=\"$PHONON_HOME/installed\"
+
+mkdir -p \"$PHONON_HOME\"
+rm -f \"$MARKER\"
+
+if command -v uv >/dev/null 2>&1; then
+    UV=\"$(command -v uv)\"
+elif [ -x \"$PHONON_HOME/uv/uv\" ]; then
+    UV=\"$PHONON_HOME/uv/uv\"
+else
+    echo \"[install-phonon] no uv on PATH; installing uv $UV_VERSION into $PHONON_HOME/uv\"
+    curl -LsSf \"https://astral.sh/uv/$UV_VERSION/install.sh\" \\
+        | UV_UNMANAGED_INSTALL=\"$PHONON_HOME/uv\" sh
+    UV=\"$PHONON_HOME/uv/uv\"
+fi
+echo \"[install-phonon] using $UV ($(\"$UV\" --version))\"
+
+echo \"[install-phonon] creating $VENV (Python $PYTHON_VERSION, uv-managed)\"
+rm -rf \"$VENV\"
+\"$UV\" venv --quiet --python-preference only-managed --python \"$PYTHON_VERSION\" \"$VENV\"
+echo \"[install-phonon] installing $PIN\"
+\"$UV\" pip install --quiet --python \"$VENV/bin/python\" \"$PIN\"
+
+echo \"[install-phonon] fetching and verifying the Phonon-2 model\"
+FERMION_DEVICE=cpu \"$VENV/bin/phonon\" transcribe --download-only /dev/null
+
+echo \"$PIN\" > \"$MARKER\"
+echo \"[install-phonon] done: $VENV/bin/phonon\"
+")
+
+(defn home-path [(out (ptr i8)) (home (ptr i8)) (name (ptr i8))] (-> i64)
+  (snprintf out (: 1100 u64) c"%s/%s" home name)
+  0)
+
+;;; Whether the install in HOME finished: the script writes the marker as its last step,
+;;; so an interrupted one doesn't count. Any finished install will do, whichever pin: the
+;;; two apps share it, and insisting on our own would have them reinstalling over each
+;;; other whenever their pins differ.
+(defn installed-at? [(home (ptr i8))] (-> bool)
+  (let [(mut marker) (zeroed (array i8 1100))
+        (mut bin) (zeroed (array i8 1100))
+        (mut first) (zeroed (array i8 8))]
+    (home-path (p/cast (ptr i8) (mut marker)) home c"installed")
+    (home-path (p/cast (ptr i8) (mut bin)) home c"venv/bin/phonon")
+    (let [fd (open (p/cast (ptr i8) (mut marker)) (p/cast i32 O-RDONLY))]
+      (if (< fd (: 0 i32))
+          false
+          (let [n (read fd (p/cast (ptr i8) (mut first)) (: 8 u64))]
+            (close fd)
+            (and (> n 0)
+                 (= (access (p/cast (ptr i8) (mut bin)) (: 1 i32)) (: 0 i32))))))))
+
+(defn phonon-home [(out (ptr i8))] (-> i64)
+  (jim-path out (: 1100 u64) c"phonon")
+  0)
+
+(defn installed? [] (-> bool)
+  (let [(mut home) (zeroed (array i8 1100))]
+    (phonon-home (p/cast (ptr i8) (mut home)))
+    (installed-at? (p/cast (ptr i8) (mut home)))))
+
+;;; Create PATH and the directories above it.
+(defn make-dirs! [(path (ptr i8))] (-> i64)
+  (let [n (p/cast i64 (strlen path))]
+    (for [i 1 (+ n 1)]
+      (when (or (= i n) (= (byte-at path i) (: 47 u8)))
+        (let [c (load (index path i))]
+          (set! (index path i) (: 0 i8))
+          (mkdir path (: 493 u16))
+          (set! (index path i) c)
+          0))))
+  0)
+
+;;; The last line of the N bytes at TEXT with anything on it. Cuts TEXT there.
+(defn last-line [(text (ptr i8)) (n i64)] (-> (ptr i8))
+  (let [(mut end) n]
+    (loop (if (and (> (load end) 0) (space? (byte-at text (- (load end) 1))))
+              (set! end (- (load end) 1))
+              (break)))
+    (set! (index text (load end)) (: 0 i8))
+    (let [(mut start) (load end)]
+      (loop (if (and (> (load start) 0)
+                     (!= (byte-at text (- (load start) 1)) (: 10 u8)))
+                (set! start (- (load start) 1))
+                (break)))
+      (index text (load start)))))
+
+;;; What the log says went wrong: its last line, which is what the script failed on.
+(defn report-install-failure! [(log-path (ptr i8))] (-> i64)
+  (let [(mut tail) (zeroed (array i8 2048))
+        (mut line) (zeroed (array i8 300))
+        fd (open log-path (p/cast i32 O-RDONLY))
+        size
+          (if (< fd (: 0 i32))
+              0
+              (do
+                (let [length (lseek fd 0 (: 2 i32))]
+                  (lseek fd
+                         (if (> length 2047) (- length 2047) 0)
+                         (: 0 i32)))
+                (let [n (read fd (p/cast (ptr i8) (mut tail)) (: 2047 u64))]
+                  (close fd)
+                  (if (< n 0) 0 n))))]
+    (snprintf (p/cast (ptr i8) (mut line))
+              (: 300 u64)
+              c"Phonon install failed: %s (log: ~/.jim/phonon/install.log)"
+              (last-line (p/cast (ptr i8) (mut tail)) size))
+    (set-error! (p/cast (ptr i8) (mut line)))
+    0))
+
+;;; This environment with PATH widened and PHONON_HOME set, for an installer started from
+;;; the Dock, whose PATH lacks the `uv` a person installed. Free it with
+;;; free-install-environment!.
+(defn install-environment [(home (ptr i8))] (-> (ptr (ptr i8)))
+  (let [environment (load (_NSGetEnviron))
+        (mut count) 0]
+    (loop (if (= (p/cast i64 (load (index environment (load count)))) 0)
+              (break)
+              (set! count (+ (load count) 1))))
+    (let [env
+            (p/cast (ptr (ptr i8))
+                    (malloc (p/cast u64 (* (+ (load count) 3) 8))))
+          path-line (malloc (: 8192 u64))
+          home-line (malloc (: 1200 u64))
+          (mut at) 0
+          current (getenv c"PATH")
+          user (getenv c"HOME")]
+      (snprintf path-line
+                (: 8192 u64)
+                c"PATH=%s:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/opt/local/bin:%s/.local/bin:%s/.cargo/bin"
+                (if (= (p/cast i64 current) 0)
+                    c"/usr/bin:/bin:/usr/sbin:/sbin"
+                    current)
+                user
+                user)
+      (snprintf home-line (: 1200 u64) c"PHONON_HOME=%s" home)
+      (set! (index env 0) path-line)
+      (set! (index env 1) home-line)
+      (set! at 2)
+      (for [i 0 (load count)]
+        (let [entry (load (index environment i))]
+          (when (and (!= (strncmp entry c"PATH=" (: 5 u64)) (: 0 i32))
+                     (!= (strncmp entry c"PHONON_HOME=" (: 12 u64)) (: 0 i32)))
+            (set! (index env (load at)) entry)
+            (set! at (+ (load at) 1))
+            0)))
+      (set! (index env (load at)) (p/cast (ptr i8) 0))
+      env)))
+
+(defn free-install-environment! [(env (ptr (ptr i8)))] (-> i64)
+  (free (load (index env 0)))
+  (free (load (index env 1)))
+  (free (p/cast (ptr i8) env))
+  0)
+
+;;; Run SCRIPT to install into HOME, waiting for it. False with the reason set if that
+;;; didn't leave a finished install.
+;;;
+;;; Under an exclusive lock the script inherits, so the lock outlives this app: one that
+;;; quits mid-install leaves the script running, and the next waits for it instead of
+;;; deleting the virtualenv it is building.
+(defn run-installer [(script (ptr i8)) (home (ptr i8))] (-> bool)
+  (let [(mut lock-path) (zeroed (array i8 1100))
+        (mut log-path) (zeroed (array i8 1100))
+        lock-text (p/cast (ptr i8) (mut lock-path))
+        log-text (p/cast (ptr i8) (mut log-path))]
+    (make-dirs! home)
+    (home-path lock-text home c"install.lock")
+    (home-path log-text home c"install.log")
+    (let [lock (open lock-text (p/cast i32 O-RDWR-CREAT) (: 420 i32))]
+      (when (>= lock (: 0 i32)) (flock lock LOCK-EX) 0)
+      (let [result
+              (if (installed-at? home)
+                  ; Another app finished it while this one waited.
+                  true
+                  (let [(mut attr) (zeroed (ptr i8))
+                        (mut actions) (zeroed (ptr i8))
+                        (mut pid) (zeroed i32)
+                        (mut status) (zeroed i32)
+                        (mut args) (zeroed (array (ptr i8) 5))
+                        argv (p/cast (ptr (ptr i8)) (mut args))
+                        env (install-environment home)]
+                    (set! (index argv 0) c"/bin/bash")
+                    (set! (index argv 1) c"-c")
+                    (set! (index argv 2) script)
+                    (set! (index argv 3) c"install-phonon.sh")
+                    (set! (index argv 4) (p/cast (ptr i8) 0))
+                    (posix_spawnattr_init (mut attr))
+                    (posix_spawnattr_setflags (mut attr)
+                                              (p/cast i16
+                                                      (| POSIX-SPAWN-SETPGROUP
+                                                         POSIX-SPAWN-CLOEXEC-DEFAULT)))
+                    (posix_spawnattr_setpgroup (mut attr) (: 0 i32))
+                    (posix_spawn_file_actions_init (mut actions))
+                    (posix_spawn_file_actions_addopen (mut actions)
+                                                      (: 0 i32)
+                                                      c"/dev/null"
+                                                      (p/cast i32 O-RDONLY)
+                                                      (: 0 u16))
+                    (for [fd 1 3]
+                      (posix_spawn_file_actions_addopen (mut actions)
+                                                        (p/cast i32 fd)
+                                                        log-text
+                                                        (p/cast i32
+                                                                O-WRONLY-CREAT-TRUNC)
+                                                        (: 420 u16)))
+                    (when (>= lock (: 0 i32))
+                      (posix_spawn_file_actions_addinherit_np (mut actions)
+                                                              lock)
+                      0)
+                    (let [failed
+                            (posix_spawn (mut pid)
+                                         c"/bin/bash"
+                                         (mut actions)
+                                         (mut attr)
+                                         argv
+                                         env)]
+                      (posix_spawn_file_actions_destroy (mut actions))
+                      (posix_spawnattr_destroy (mut attr))
+                      (free-install-environment! env)
+                      (if (!= failed (: 0 i32))
+                          (do
+                            (set-error! c"Couldn't run the Phonon installer.")
+                            false)
+                          (let [waited
+                                  (waitpid (load pid) (mut status) (: 0 i32))]
+                            (cond (and (= waited (load pid))
+                                       (!= (load status) (: 0 i32)))
+                                    (do
+                                      (report-install-failure! log-text)
+                                      false)
+                                  (installed-at? home) true
+                                  :else
+                                    (do
+                                      (set-error! c"The Phonon installer finished without installing it. See ~/.jim/phonon/install.log.")
+                                      false)))))))]
+        (when (>= lock (: 0 i32)) (close lock) 0)
+        result))))
+
+;;; Get the shared server up and through its first decode, which compiles the CPU runtime
+;;; in a fresh environment, so that isn't paid on someone's first words.
+(defn warm-server! [] (-> bool)
+  (let [port (ensure-server)]
+    (if (< port (: 0 i32))
+        false
+        (let [count (/ RATE 2)
+              quiet (p/cast (ptr f32) (malloc (p/cast u64 (* count 4))))]
+          (for [i 0 count]
+            (set! (index quiet i)
+                  (* (sinf (* (p/cast f32 i) (: 0.37 f32))) (: 0.001 f32))))
+          (let [text (post-audio port quiet count 180)
+                ok (!= (p/cast i64 text) 0)]
+            (free (p/cast (ptr i8) quiet))
+            (free text)
+            (when (not ok)
+              (set-error! c"Phonon installed, but its server didn't answer. See ~/.jim/phonon-server.log.")
+              0)
+            ok)))))
+
+;;; Install for real and warm the server. Blocks for minutes, so not on the main thread.
+(defn install-phonon! [] (-> bool)
+  (let [(mut home) (zeroed (array i8 1100))]
+    (phonon-home (p/cast (ptr i8) (mut home)))
+    (and (run-installer (install-script) (p/cast (ptr i8) (mut home)))
+         (warm-server!))))
