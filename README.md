@@ -13,7 +13,7 @@ downloads the Zig that Ghostty needs (0.17.0, checked against its digest) into
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
-python3 scripts/run.py
+./scripts/dev-restart.sh
 ```
 
 Pinned Ghostty is a Coil native dependency (`scripts/ghostty/link-flags.py`),
@@ -288,9 +288,37 @@ the same shells; explicitly closing a pane terminates its session. “Terminal:
 Reconnect focused terminal” retries an unavailable connection without discarding
 its saved identity. An exited shell remains readable until its pane is closed.
 
-Recovery uses an ordered, lossless disk journal of output and resizes, not a
-truncated byte tail. Its disk use and replay time grow with session output; there
-is no checkpoint compaction yet. Sessions survive app closure, not daemon crashes
-or machine restarts. Recovery of terminal graphics that reference temporary files
-has not been validated. The original Jim application and its data are untouched;
-this rewrite migrates its own earlier layout format, not original Jim sessions.
+Recovery uses an ordered in-memory journal of output and resizes that keeps the newest
+64 MiB of each session, the same limit as original Jim, so disk use and replay time
+are bounded. Older output is gone from recovery; a client replaying a trimmed journal
+is told the size, directory and input modes the trimmed part established. Sessions
+survive app closure, not daemon crashes or machine restarts. Recovery of terminal
+graphics that reference temporary files has not been validated.
+
+### Bringing projects across from original Jim
+
+Run “Project: Import from original Jim” from the action palette and pick one project.
+The list holds only projects with something left to bring across, those with terminals
+first. The project joins one of the same name, or is created with its saved directory,
+and is shown. Every terminal of it still running under original Jim's daemons comes
+with it, and those shells keep running throughout. Original Jim's saved data is only
+read. Widgets and other non-terminal panes are not brought across.
+
+Original Jim must be closed for its terminals to come. If it is open the project is
+still imported, and importing it again after quitting brings them. The list then shows
+every saved terminal, since checking which are alive would disturb them, and original
+Jim may not have saved its newest changes.
+
+An imported pane is a `jim-session --adopt` service in front of that daemon. Closing
+the app detaches from the service as usual; closing the pane ends the shell. Reopening
+original Jim takes its terminals back: the service stops without touching the shell
+and never reconnects, and the pane offers Terminal: Reconnect. While original Jim is
+open, the rewrite will not adopt a daemon. After a machine restart a pane whose daemon
+is gone starts a new shell, like any other pane.
+
+Imported shells keep the environment they started with, including `TERM`. Commands
+that need the original app, such as `jimctl open`, need it running, and the original
+daemons' shells still cannot launch GUI apps. History comes from the daemon's own
+64 MiB buffer, which records no resizes and may begin mid-sequence, so old scrollback
+can look as it does when original Jim relaunches. Modes set before that buffer begins
+are unknown to everyone, until the program sets them again.

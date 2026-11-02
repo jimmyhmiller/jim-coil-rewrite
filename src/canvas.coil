@@ -19,6 +19,12 @@
    (view (ptr i8))
    (title (ptr i8))
    (header (ptr i8))
+   ;; The line under the header, which marks the focused pane.
+   (divider (ptr i8))
+   ;; Each label's text height: a label draws at the top of its frame, so a frame
+   ;; this tall is what centers its text in the header.
+   (title-height f64)
+   (close-height f64)
    (message (ptr i8))
    (close (ptr i8))
    (terminal (ptr terminal/Terminal))
@@ -95,7 +101,7 @@
   (if (widget? v) (.view (.widget v)) (.view (term-of v))))
 
 (defn content-bounds [(bounds Rect)] (-> Rect)
-  (rect 1.0 12.0 (- (.w bounds) 2.0) (- (.h bounds) 48.0)))
+  (rect 0.0 0.0 (.w bounds) (- (.h bounds) model/HEADER)))
 
 (defn edge [(c (ptr Canvas)) (index i64)] (-> (ptr i8))
   (load (p/index (field c edges) index)))
@@ -113,15 +119,56 @@
                (nil))]
     (Point :x (.x pt) :y (- (.height c) (.y pt)))))
 
-;;; A header is always lighter than its pane's body, and more so on the
-;;; focused pane. The terminal has its own background.
+;;; How far the focused pane's header lifts above the pane color. Focus is this color,
+;;; with bright text; every pane has the same faint edge against the canvas.
+(const FOCUS-LIFT 0.1)
+
 (defn paint-header! [(c (ptr Canvas)) (v (ptr Pane)) (active bool)] (-> void)
   (let [cfg (.theme c)
-        lift (if active 0.08 0.04)]
-    (background! (.header v)
-                 (+ (.pane-r cfg) lift)
-                 (+ (.pane-g cfg) lift)
-                 (+ (.pane-b cfg) lift))
+        r (if active (+ (.pane-r cfg) FOCUS-LIFT) (.rail-r cfg))
+        g (if active (+ (.pane-g cfg) FOCUS-LIFT) (.rail-g cfg))
+        b (if active (+ (.pane-b cfg) FOCUS-LIFT) (.rail-b cfg))]
+    (background! (.header v) r g b)
+    (background! (.divider v) (+ r 0.05) (+ g 0.05) (+ b 0.05))
+    (msg i64 (layer (.view v)) (sel c"setBorderWidth:") [f64] 1.0)
+    (msg i64
+         (layer (.view v))
+         (sel c"setBorderColor:")
+         [(ptr i8)]
+         (msg (ptr i8) (color 1.0 1.0 1.0 0.07) (sel c"CGColor") []))
+    (msg i64
+         (.title v)
+         (sel c"setTextColor:")
+         [(ptr i8)]
+         (if active
+             (color (.ink-r cfg) (.ink-g cfg) (.ink-b cfg) 1.0)
+             (color (.muted-r cfg) (.muted-g cfg) (.muted-b cfg) 0.9)))
+    (msg i64
+         (.close v)
+         (sel c"setTextColor:")
+         [(ptr i8)]
+         (color (.muted-r cfg)
+                (.muted-g cfg)
+                (.muted-b cfg)
+                (if active 1.0 0.7)))
+    (do)))
+
+;;; Lay the chrome out in a pane W×H: the header across the top, its title and close
+;;; button centered in it, the close button in the square at its right end.
+(defn frame-chrome! [(v (ptr Pane)) (w f64) (h f64)] (-> void)
+  (let [top (- h model/HEADER)]
+    (frame! (.header v) (rect 0.0 top w model/HEADER))
+    (frame! (.divider v) (rect 0.0 top w 1.0))
+    (frame! (.title v)
+            (rect 12.0
+                  (+ top (/ (- model/HEADER (.title-height v)) 2.0))
+                  (- w 12.0 model/HEADER)
+                  (.title-height v)))
+    (frame! (.close v)
+            (rect (- w model/HEADER)
+                  (+ top (/ (- model/HEADER (.close-height v)) 2.0))
+                  model/HEADER
+                  (.close-height v)))
     (do)))
 
 (defn focus! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
@@ -130,16 +177,23 @@
     (set! (.dirty c) true)
     (for [i 0 (count c)]
       (let [v (pane c i)
-            active (= (p/cast i64 v) (p/cast i64 chosen))
-            cfg (.theme c)]
-        (do
-          (msg i64 (layer (.view v)) (sel c"setBorderWidth:") [f64] 0.0)
-          (paint-header! c v active))))
+            active (= (p/cast i64 v) (p/cast i64 chosen))]
+        (paint-header! c v active)))
     (msg i8
          (msg (ptr i8) (.view c) (sel c"window") [])
          (sel c"makeFirstResponder:")
          [(ptr i8)]
          (if (= (p/cast i64 chosen) 0) (nil) (content-view chosen)))))
+
+;;; Focus the terminal pane whose view is VIEW, if it is on this canvas.
+(defn focus-terminal! [(c (ptr Canvas)) (view (ptr i8))] (-> void)
+  (for [i 0 (count c)]
+    (let [v (pane c i)]
+      (when (and (not (widget? v))
+                 (= (p/cast i64 (.view (term-of v))) (p/cast i64 view)))
+        (front! c v)
+        (do))))
+  (do))
 
 (defn front! [(c (ptr Canvas)) (chosen (ptr Pane))] (-> void)
   (do
@@ -273,11 +327,7 @@
                  (sel c"setBoundsSize:")
                  [Size]
                  (Size :w (.w world) :h (.h world)))
-            (frame! (.header v) (rect 0.0 (- (.h world) 36.0) (.w world) 36.0))
-            (frame! (.title v)
-                    (rect 16.0 (- (.h world) 29.0) (- (.w world) 80.0) 22.0))
-            (frame! (.close v)
-                    (rect (- (.w world) 31.0) (- (.h world) 28.0) 24.0 24.0))
+            (frame-chrome! v (.w world) (.h world))
             (msg i64
                  (.view v)
                  (sel c"setHidden:")
@@ -313,17 +363,7 @@
       (let [v (pane c i)]
         (do
           (background! (.view v) (.pane-r cfg) (.pane-g cfg) (.pane-b cfg))
-          (paint-header! c v (= (p/cast i64 v) (p/cast i64 (.focused c))))
-          (msg i64
-               (.title v)
-               (sel c"setTextColor:")
-               [(ptr i8)]
-               (color (.ink-r cfg) (.ink-g cfg) (.ink-b cfg) 1.0))
-          (msg i64
-               (.close v)
-               (sel c"setTextColor:")
-               [(ptr i8)]
-               (color (.muted-r cfg) (.muted-g cfg) (.muted-b cfg) 1.0)))))
+          (paint-header! c v (= (p/cast i64 v) (p/cast i64 (.focused c)))))))
     (project! c)))
 
 (defn create! [(parent (ptr i8)) (width f64) (height f64) (cfg theme/Theme)]
@@ -374,38 +414,48 @@
 (defn add-chrome! [(c (ptr Canvas)) (v (ptr Pane)) (title (ptr i8))] (-> void)
   (let [host (.view v)
         bounds (.bounds v)]
-    (set! (.header v)
-          (view host (rect 0.0 (- (.h bounds) 36.0) (.w bounds) 36.0)))
-    (set! (.title v)
-          (label host
-                 c"Terminal"
-                 (rect 16.0 (- (.h bounds) 29.0) 300.0 22.0)
-                 12.0
-                 false))
+    (set! (.header v) (view host (rect 0.0 0.0 0.0 0.0)))
+    (set! (.divider v) (view host (rect 0.0 0.0 0.0 0.0)))
+    (set! (.title v) (label host c"Terminal" (rect 0.0 0.0 0.0 0.0) 12.0 false))
     (msg i64 (.title v) (sel c"setStringValue:") [(ptr i8)] title)
-    (set! (.close v)
-          (label host
-                 c"×"
-                 (rect (- (.w bounds) 31.0) (- (.h bounds) 28.0) 24.0 24.0)
-                 17.0
-                 true))
-    (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 8.0)
+    (set! (.close v) (label host c"×" (rect 0.0 0.0 0.0 0.0) 15.0 true))
+    (msg i64
+         (.close v)
+         (sel c"setFont:")
+         [(ptr i8)]
+         (msg (ptr i8)
+              (class c"NSFont")
+              (sel c"systemFontOfSize:weight:")
+              [f64 f64]
+              15.0
+              -0.4))
+    ; NSTextAlignmentCenter on arm64, the only architecture Jim is built for.
+    (msg i64 (.close v) (sel c"setAlignment:") [i64] 1)
+    (set! (.title-height v)
+          (.h (msg Size (.title v) (sel c"fittingSize") [])))
+    (set! (.close-height v)
+          (.h (msg Size (.close v) (sel c"fittingSize") [])))
+    (frame-chrome! v (.w bounds) (.h bounds))
+    (msg i64 (layer host) (sel c"setCornerRadius:") [f64] 9.0)
     (msg i64 (layer host) (sel c"setMasksToBounds:") [i8] (: 1 i8))
     (push! [(ptr Pane)] (mut (.panes c)) v)
     (apply-theme! c (.theme c))
     (focus! c v)))
 
-;;; A terminal pane for SESSION-ID whose shell starts in DIRECTORY.
+;;; A terminal pane for SESSION-ID whose shell starts in DIRECTORY, adopting the
+;;; original Jim daemon ORIGINAL unless that is sessions/NOT-ORIGINAL.
 (defn add-session-in! [(c (ptr Canvas))
                        (bounds Rect)
                        (session-id (ptr i8))
-                       (directory (ptr i8))] (-> bool)
+                       (directory (ptr i8))
+                       (original i64)] (-> bool)
   (let [v (new-pane c bounds)
         t
           (terminal/create! (.view v)
                             (content-bounds bounds)
                             (utf8 directory)
-                            session-id)]
+                            session-id
+                            original)]
     (do
       (set! (.terminal v) t)
       (add-chrome! c v (indexed-string c"Terminal " (.id v) c""))
@@ -422,9 +472,22 @@
            (p/cast i8 (if (= (p/cast i64 (.surface t)) 0) 0 1)))
       true)))
 
-(defn add-session! [(c (ptr Canvas)) (bounds Rect) (session-id (ptr i8))]
-  (-> bool)
-  (add-session-in! c bounds session-id (.directory c)))
+(defn add-session! [(c (ptr Canvas))
+                    (bounds Rect)
+                    (session-id (ptr i8))
+                    (original i64)] (-> bool)
+  (add-session-in! c bounds session-id (.directory c) original))
+
+;;; Where panes may be added without overlapping any: past the rightmost pane, or at
+;;; the origin of an empty canvas.
+(defn right-edge [(c (ptr Canvas))] (-> f64)
+  (let [(mut edge) 0.0]
+    (for [i 0 (count c)]
+      (let [r (.bounds (pane c i))]
+        (when (> (+ (.x r) (.w r) 36.0) (load edge))
+          (set! edge (+ (.x r) (.w r) 36.0))
+          0)))
+    (load edge)))
 
 (defn bytes-of [(s (ptr i8))] (-> (slice u8))
   (let [bytes (utf8 s)]
@@ -485,7 +548,8 @@
                   (add-session-in! c
                                    (next-bounds c 640.0 430.0)
                                    (sessions/identifier)
-                                   (widget-view/string text))
+                                   (widget-view/string text)
+                                   sessions/NOT-ORIGINAL)
                   0)
               (= kind api/SCROLL-TO)
                 (do (widget-view/scroll-to! w (.value item)) 0)
@@ -520,12 +584,10 @@
         bounds (.bounds v)
         t
           (terminal/create! (.view v)
-                            (rect 1.0
-                                  12.0
-                                  (- (.w bounds) 2.0)
-                                  (- (.h bounds) 48.0))
+                            (content-bounds bounds)
                             (utf8 (.directory old))
-                            (.session-id old))]
+                            (.session-id old)
+                            (.original old))]
     (if (= (p/cast i64 (.surface t)) 0)
         (do (terminal/free! t) false)
         (do
@@ -537,8 +599,24 @@
           (focus! c v)
           true))))
 
+;;; The Ghostty surface of the terminal running session ID, if it's in this canvas.
+(defn surface-of-session [(c (ptr Canvas)) (id (ptr i8))] (-> (ptr i8))
+  (let [(mut found) (nil)]
+    (for [i 0 (count c)]
+      (let [v (pane c i)]
+        (when (and (not (widget? v))
+                   (!= (msg i8
+                            (.session-id (term-of v))
+                            (sel c"isEqualToString:")
+                            [(ptr i8)]
+                            id)
+                       (: 0 i8)))
+          (set! found (.surface (term-of v)))
+          0)))
+    (load found)))
+
 (defn add! [(c (ptr Canvas)) (bounds Rect)] (-> bool)
-  (add-session! c bounds (sessions/identifier)))
+  (add-session! c bounds (sessions/identifier) sessions/NOT-ORIGINAL))
 
 (defn add-visible! [(c (ptr Canvas))] (-> bool)
   (let [camera (.camera c)
@@ -554,7 +632,9 @@
   (if (widget? v)
       (widget-view/free! (.widget v))
       (do
-        (when closing (sessions/kill! (.session-id (term-of v))) 0)
+        (when closing
+          (sessions/kill! (.session-id (term-of v)) (.original (term-of v)))
+          0)
         (terminal/free! (term-of v))))
   (do))
 
@@ -633,7 +713,66 @@
 ;;; Dragging beyond the viewport therefore neither loses a pane nor types into
 ;;; a terminal. Ordinary wheel events inside a terminal remain terminal scroll.
 (defn handle! [(c (ptr Canvas)) (event (ptr i8))] (-> bool)
-  (if (.exposed c) (expose-handle! c event) (handle-panes! c event)))
+  (if (.exposed c)
+      (do (clear-resize-cursor!) (expose-handle! c event))
+      (handle-panes! c event)))
+
+;;; ---- resize cursor ----------------------------------------------------------------
+;;; Like Jim: a double-headed cursor over the band a press would resize from. One app
+;;; has one cursor, whichever canvas set it, so what it shows is kept here.
+(defn cursor-edges-cell [] (-> (ptr i64))
+  (p/alloc-static i64))
+
+(defn show-resize-cursor! [(edges i64)] (-> void)
+  (when (!= edges (load (cursor-edges-cell)))
+    (set! (cursor-edges-cell) edges)
+    (msg i64
+         (if (= edges 0)
+             (msg (ptr i8) (class c"NSCursor") (sel c"arrowCursor") [])
+             (msg (ptr i8)
+                  (class c"NSCursor")
+                  (sel c"frameResizeCursorFromPosition:inDirections:")
+                  [u64 u64]
+                  (model/cursor-position edges)
+                  (: 3 u64)))
+         (sel c"set")
+         [])
+    0)
+  (do))
+
+(defn clear-resize-cursor! [] (-> void)
+  (show-resize-cursor! 0))
+
+;;; The edges a press at WORLD would resize, by the same rules as the press.
+(defn edges-under [(c (ptr Canvas)) (world Point)] (-> i64)
+  (let [v (hit c world)]
+    (if (or (.space-held c) (= (p/cast i64 v) 0))
+        0
+        (let [r (.bounds v)
+              local-x (- (.x world) (.x r))
+              local-y (- (.y world) (.y r))]
+          (if (model/on-close? (.w r) local-x local-y)
+              0
+              (model/edges-at (.w r)
+                              (.h r)
+                              local-x
+                              local-y
+                              (/ 6.0 (.zoom (display-camera c)))))))))
+
+(defn hover! [(c (ptr Canvas)) (event (ptr i8))] (-> void)
+  (when (= (.gesture c) 0)
+    (let [screen (point c event)]
+      (show-resize-cursor! (if (model/contains? (rect 0.0
+                                                      0.0
+                                                      (.width c)
+                                                      (.height c))
+                                                screen)
+                               (edges-under c
+                                            (model/screen-to-world (display-camera c)
+                                                                   screen))
+                               0))
+      0))
+  (do))
 
 (defn handle-panes! [(c (ptr Canvas)) (event (ptr i8))] (-> bool)
   (let [kind (msg i64 event (sel c"type") [])
@@ -654,7 +793,7 @@
               0)
           false)
         (if (not relevant)
-            false
+            (do (when (= kind 5) (hover! c event) 0) false)
             (let [screen (point c event)
                   world (model/screen-to-world (display-camera c) screen)
                   v (hit c world)
@@ -748,8 +887,9 @@
                                                               local-y
                                                               (/ 6.0
                                                                  (.zoom (display-camera c))))]
-                                        (cond (and (< local-y 36.0)
-                                                   (> local-x (- (.w r) 36.0)))
+                                        (cond (model/on-close? (.w r)
+                                                               local-x
+                                                               local-y)
                                                 (do
                                                   (set! (.drag-pane c)
                                                         (no-pane))
@@ -760,7 +900,7 @@
                                                   (set! (.resize-edges c) edges)
                                                   (set! (.gesture c) 3)
                                                   true)
-                                              (< local-y 36.0)
+                                              (model/in-header? local-y)
                                                 (do
                                                   (set! (.gesture c) 2)
                                                   true)
@@ -1214,7 +1354,15 @@
                     (storage/put! item c"state" state)
                     0)
                   0)
-                (storage/put! item c"session" (.session-id (term-of v))))
+                (do
+                  (storage/put! item c"session" (.session-id (term-of v)))
+                  (when (!= (.original (term-of v)) sessions/NOT-ORIGINAL)
+                    (storage/put! item
+                                  c"original"
+                                  (storage/number (p/cast f64
+                                                          (.original (term-of v)))))
+                    0)
+                  0))
             (storage/put! item c"width" (storage/number (.w r)))
             (storage/put! item c"height" (storage/number (.h r)))
             (storage/add! panes item)
@@ -1291,7 +1439,12 @@
                                                                      c"NSString")
                                                       (sessions/valid-id? id))
                                                  id
-                                                 (sessions/identifier)))))))
+                                                 (sessions/identifier)))
+                                           (if (storage/numeric? r c"original")
+                                               (p/cast i64
+                                                       (storage/value r
+                                                                      c"original"))
+                                               sessions/NOT-ORIGINAL)))))
                   (set! ok false)
                   0)))
           (let [focused (storage/value dict c"focused")]

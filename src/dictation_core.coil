@@ -1,0 +1,977 @@
+(module jim.dictation-core)
+(import "coil.cc" :as cc)
+(import "coil.math" :as math)
+(import "coil.os" :as os)
+(import "coil.primitive" :as p)
+
+;;; Hands-free dictation's engine: phrases cut from the microphone's audio and decoded
+;;; by a Phonon server, reported as the whole transcript so far. No AppKit, because it
+;;; runs on its own thread. The rules and numbers are original Jim's
+;;; (crates/jim-app/src/dictation/phonon.rs), which are Phonon's own apart from the cap.
+
+(extern malloc :cc (cc/C) [u64] (-> (ptr i8)))
+
+(extern realloc :cc (cc/C) [(ptr i8) u64] (-> (ptr i8)))
+
+(extern free :cc (cc/C) [(ptr i8)] (-> void))
+
+(extern memcpy :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(extern memmove :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(extern memcmp :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> i32))
+
+(extern strlen :cc (cc/C) [(ptr i8)] (-> u64))
+
+(extern strcmp :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern strnstr :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(extern strcasestr :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern strtol :cc (cc/C) [(ptr i8) (ptr (ptr i8)) i32] (-> i64))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
+
+(extern close :cc (cc/C) [i32] (-> i32))
+
+(extern read :cc (cc/C) [i32 (ptr i8) u64] (-> i64))
+
+(extern write :cc (cc/C) [i32 (ptr i8) u64] (-> i64))
+
+(extern rename :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern access :cc (cc/C) [(ptr i8) i32] (-> i32))
+
+(extern flock :cc (cc/C) [i32 i32] (-> i32))
+
+(extern kill :cc (cc/C) [i32 i32] (-> i32))
+
+(extern usleep :cc (cc/C) [u32] (-> i32))
+
+(extern socket :cc (cc/C) [i32 i32 i32] (-> i32))
+
+(extern connect :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
+
+(extern bind :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
+
+(extern getsockname :cc (cc/C) [i32 (ptr i8) (ptr u32)] (-> i32))
+
+(extern setsockopt :cc (cc/C) [i32 i32 i32 (ptr i8) u32] (-> i32))
+
+(extern send :cc (cc/C) [i32 (ptr i8) u64 i32] (-> i64))
+
+(extern recv :cc (cc/C) [i32 (ptr i8) u64 i32] (-> i64))
+
+(extern posix_spawn
+        :cc
+        (cc/C)
+        [(ptr i32)
+         (ptr i8)
+         (ptr (ptr i8))
+         (ptr (ptr i8))
+         (ptr (ptr i8))
+         (ptr (ptr i8))]
+        (-> i32))
+
+(extern posix_spawnattr_init :cc (cc/C) [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawnattr_destroy :cc (cc/C) [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawnattr_setflags :cc (cc/C) [(ptr (ptr i8)) i16] (-> i32))
+
+(extern posix_spawnattr_setpgroup :cc (cc/C) [(ptr (ptr i8)) i32] (-> i32))
+
+(extern posix_spawn_file_actions_init :cc (cc/C) [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawn_file_actions_destroy :cc (cc/C) [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawn_file_actions_addopen
+        :cc
+        (cc/C)
+        [(ptr (ptr i8)) i32 (ptr i8) i32 u16]
+        (-> i32))
+
+(extern _NSGetEnviron :cc (cc/C) [] (-> (ptr (ptr (ptr i8)))))
+
+(const RATE 16000)
+
+;;; RMS is measured over 50 ms blocks.
+(const BLOCK 800)
+
+;;; A phrase closes after 0.7 s of quiet following speech.
+(const SILENCE-CLOSE-BLOCKS 14)
+
+;;; A phrase closes at 15 s regardless, at the quietest block in its last 5 s.
+(const MAX-SEGMENT-BLOCKS 300)
+
+(const CAP-LOOKBACK-BLOCKS 100)
+
+;;; What an idle microphone keeps when 15 s of room tone is dropped.
+(const IDLE-KEEP 16000)
+
+;;; The first partial decode of a phrase, then one per this much new audio.
+(const FIRST-PARTIAL 5600)
+
+(const PARTIAL-EVERY 8000)
+
+;;; ---- growing sample buffers -----------------------------------------------------
+
+(defstruct Samples [(data (ptr f32)) (len i64) (cap i64)])
+
+(defn samples-reserve! [(b (ptr Samples)) (wanted i64)] (-> i64)
+  (when (> wanted (.cap b))
+    (let [cap (if (> wanted (* 2 (.cap b))) wanted (* 2 (.cap b)))]
+      (set! (.data b)
+            (p/cast (ptr f32)
+                    (realloc (p/cast (ptr i8) (.data b)) (p/cast u64 (* cap 4)))))
+      (set! (.cap b) cap)
+      0))
+  0)
+
+(defn samples-push! [(b (ptr Samples)) (from (ptr f32)) (count i64)] (-> i64)
+  (samples-reserve! b (+ (.len b) count))
+  (memcpy (p/cast (ptr i8) (index (.data b) (.len b)))
+          (p/cast (ptr i8) from)
+          (p/cast u64 (* count 4)))
+  (set! (.len b) (+ (.len b) count))
+  0)
+
+(defn samples-free! [(b (ptr Samples))] (-> i64)
+  (free (p/cast (ptr i8) (.data b)))
+  (set! b (zeroed Samples))
+  0)
+
+;;; ---- segmenting -----------------------------------------------------------------
+;;; Nothing is dropped from speech: closed phrases keep their trailing quiet, so the
+;;; phrases plus the in-flight audio are a gap-free copy of what came in. Only an idle,
+;;; never-voiced stretch of room tone is trimmed.
+
+(defstruct Phrases [(items (ptr Samples)) (len i64) (cap i64) (head i64)])
+
+(defn phrases-push! [(q (ptr Phrases)) (phrase Samples)] (-> i64)
+  (when (>= (.len q) (.cap q))
+    (let [cap (if (= (.cap q) 0) 8 (* 2 (.cap q)))]
+      (set! (.items q)
+            (p/cast (ptr Samples)
+                    (realloc (p/cast (ptr i8) (.items q))
+                             (p/cast u64 (* cap (p/cast i64 (sizeof Samples)))))))
+      (set! (.cap q) cap)
+      0))
+  (set! (index (.items q) (.len q)) phrase)
+  (set! (.len q) (+ (.len q) 1))
+  0)
+
+(defn phrases-waiting? [(q (ptr Phrases))] (-> bool)
+  (< (.head q) (.len q)))
+
+(defn phrases-pop! [(q (ptr Phrases))] (-> Samples)
+  (let [phrase (load (index (.items q) (.head q)))]
+    (set! (.head q) (+ (.head q) 1))
+    (when (= (.head q) (.len q))
+      (set! (.head q) 0)
+      (set! (.len q) 0)
+      0)
+    phrase))
+
+(defstruct Segmenter
+  [(audio Samples) (rms Samples) (peak f32) (voiced bool) (last-voice i64)])
+
+;;; Begin a new phrase with what's in AUDIO, re-measured against its own peak.
+(defn restart! [(seg (ptr Segmenter))] (-> i64)
+  (set! (.len (field seg rms)) 0)
+  (set! (.peak seg) (: 0.0 f32))
+  (set! (.voiced seg) false)
+  (set! (.last-voice seg) 0)
+  0)
+
+;;; Move the first BLOCKS blocks of the phrase out to CLOSED. The rest starts the next.
+(defn cut! [(seg (ptr Segmenter)) (blocks i64) (closed (ptr Phrases))] (-> i64)
+  (let [audio (field seg audio)
+        count (* blocks BLOCK)
+        (mut phrase) (zeroed Samples)]
+    (samples-push! (mut phrase) (.data audio) count)
+    (phrases-push! closed (load phrase))
+    (memmove (p/cast (ptr i8) (.data audio))
+             (p/cast (ptr i8) (index (.data audio) count))
+             (p/cast u64 (* (- (.len audio) count) 4)))
+    (set! (.len audio) (- (.len audio) count))
+    (restart! seg)
+    0))
+
+(defn block-rms [(data (ptr f32))] (-> f32)
+  (let [(mut sum) (: 0.0 f32)]
+    (for [i 0 BLOCK]
+      (let [sample (load (index data i))]
+        (set! sum (+ (load sum) (* sample sample)))))
+    (math/sqrt (/ (load sum) (: 800.0 f32)))))
+
+(defn quietest-block [(seg (ptr Segmenter)) (from i64) (to i64)] (-> i64)
+  (let [rms (.data (field seg rms))
+        (mut best) (- to 1)]
+    (for [i from to]
+      (when (< (load (index rms i)) (load (index rms (load best))))
+        (set! best i)
+        0))
+    (load best)))
+
+(defn segmenter-push! [(seg (ptr Segmenter))
+                       (samples (ptr f32))
+                       (count i64)
+                       (closed (ptr Phrases))] (-> i64)
+  (samples-push! (field seg audio) samples count)
+  (let [audio (field seg audio)
+        rms (field seg rms)]
+    (loop (if (>= (.len rms) (/ (.len audio) BLOCK))
+              (break)
+              (let [i (.len rms)
+                    (mut level) (block-rms (index (.data audio) (* i BLOCK)))]
+                (samples-push! rms (mut level) 1)
+                (when (> (load level) (.peak seg))
+                  (set! (.peak seg) (load level))
+                  0)
+                (let [gate (* (: 0.18 f32) (.peak seg))
+                      floor (: 0.004 f32)]
+                  (when (> (load level) (if (> floor gate) floor gate))
+                    (set! (.voiced seg) true)
+                    (set! (.last-voice seg) (+ i 1))
+                    0))
+                (let [blocks (+ i 1)]
+                  (cond (and (.voiced seg)
+                             (>= (- blocks (.last-voice seg))
+                                 SILENCE-CLOSE-BLOCKS))
+                          (cut! seg blocks closed)
+                        (>= blocks MAX-SEGMENT-BLOCKS)
+                          (if (.voiced seg)
+                              (cut! seg
+                                    (+ (quietest-block seg
+                                                       (- blocks
+                                                          CAP-LOOKBACK-BLOCKS)
+                                                       blocks)
+                                       1)
+                                    closed)
+                              (do
+                                (memmove (p/cast (ptr i8) (.data audio))
+                                         (p/cast (ptr i8)
+                                                 (index (.data audio)
+                                                        (- (.len audio)
+                                                           IDLE-KEEP)))
+                                         (p/cast u64 (* IDLE-KEEP 4)))
+                                (set! (.len audio) IDLE-KEEP)
+                                (restart! seg)
+                                0))
+                        :else 0)))))
+    0))
+
+;;; ---- text -----------------------------------------------------------------------
+
+(defn byte-at [(s (ptr i8)) (i i64)] (-> u8)
+  (p/cast u8 (load (index s i))))
+
+(defn space? [(c u8)] (-> bool)
+  (or (= c (: 32 u8))
+      (and (>= c (: 9 u8)) (<= c (: 13 u8)))))
+
+(defn closing-mark? [(c u8)] (-> bool)
+  (or (= c (: 46 u8))
+      (= c (: 44 u8))
+      (= c (: 33 u8))
+      (= c (: 63 u8))
+      (= c (: 59 u8))
+      (= c (: 58 u8))))
+
+;;; A copy of TEXT on one line: engines put newlines between segments, an actively
+;;; harmful artifact at a shell prompt. Single spaces, and none before closing
+;;; punctuation that ends a word, so "the weekend ." is fixed but "a .5 inch" is not.
+(defn flatten-text [(text (ptr i8))] (-> (ptr i8))
+  (let [n (p/cast i64 (strlen text))
+        out (malloc (p/cast u64 (+ n 1)))
+        (mut at) 0
+        (mut pending) false]
+    (for [i 0 n]
+      (let [c (byte-at text i)]
+        (if (space? c)
+            (set! pending (> (load at) 0))
+            (do
+              (when (load pending)
+                (let [next (if (< (+ i 1) n) (byte-at text (+ i 1)) (: 32 u8))]
+                  (when (not (and (closing-mark? c) (space? next)))
+                    (set! (index out (load at)) (: 32 i8))
+                    (set! at (+ (load at) 1))
+                    0)
+                  0)
+                (set! pending false)
+                0)
+              (set! (index out (load at)) (p/cast i8 c))
+              (set! at (+ (load at) 1))
+              0))))
+    (set! (index out (load at)) (: 0 i8))
+    out))
+
+;;; A newly allocated "A B", with exactly one space between them, or either alone.
+(defn join-text [(a (ptr i8)) (b (ptr i8))] (-> (ptr i8))
+  (let [(mut joined) (zeroed (ptr i8))
+        an (p/cast i64 (strlen a))
+        bn (p/cast i64 (strlen b))
+        out (malloc (p/cast u64 (+ an bn 2)))]
+    (snprintf out
+              (p/cast u64 (+ an bn 2))
+              c"%s%s%s"
+              a
+              (if (or (= an 0) (= bn 0)) c"" c" ")
+              b)
+    (set! joined (flatten-text out))
+    (free out)
+    (load joined)))
+
+(defn utf8-continuation? [(c u8)] (-> bool)
+  (= (& c (: 192 u8)) (: 128 u8)))
+
+;;; How many characters: a line editor deletes one per DEL, not one per byte.
+(defn char-count [(s (ptr i8))] (-> i64)
+  (let [(mut count) 0
+        n (p/cast i64 (strlen s))]
+    (for [i 0 n]
+      (when (not (utf8-continuation? (byte-at s i)))
+        (set! count (+ (load count) 1))
+        0))
+    (load count)))
+
+;;; The bytes A and B share from the start, ending on a character boundary.
+(defn common-prefix [(a (ptr i8)) (b (ptr i8))] (-> i64)
+  (let [(mut at) 0
+        an (p/cast i64 (strlen a))
+        bn (p/cast i64 (strlen b))]
+    (loop (if (and (< (load at) an)
+                   (< (load at) bn)
+                   (= (byte-at a (load at)) (byte-at b (load at))))
+              (set! at (+ (load at) 1))
+              (break)))
+    (loop (if (and (> (load at) 0)
+                   (or (and (< (load at) an)
+                            (utf8-continuation? (byte-at a (load at))))
+                       (and (< (load at) bn)
+                            (utf8-continuation? (byte-at b (load at))))))
+              (set! at (- (load at) 1))
+              (break)))
+    (load at)))
+
+;;; Where the last MAX bytes of TEXT begin, on a character boundary.
+(defn tail-start [(text (ptr i8)) (max i64)] (-> i64)
+  (let [n (p/cast i64 (strlen text))
+        (mut at) (if (> n max) (- n max) 0)]
+    (loop (if (and (< (load at) n)
+                   (utf8-continuation? (byte-at text (load at))))
+              (set! at (+ (load at) 1))
+              (break)))
+    (load at)))
+
+;;; ---- WAV and HTTP ---------------------------------------------------------------
+
+(defn put-u32-le! [(out (ptr i8)) (at i64) (value u32)] (-> i64)
+  (for [i 0 4]
+    (set! (index out (+ at i))
+          (p/cast i8 (& (>> value (p/cast u32 (* i 8))) (: 255 u32)))))
+  0)
+
+(defn put-u16-le! [(out (ptr i8)) (at i64) (value u32)] (-> i64)
+  (for [i 0 2]
+    (set! (index out (+ at i))
+          (p/cast i8 (& (>> value (p/cast u32 (* i 8))) (: 255 u32)))))
+  0)
+
+(const WAV-HEADER 44)
+
+;;; COUNT samples as a 16-bit mono WAV in a new allocation, WAV-HEADER + 2 × COUNT long.
+(defn encode-wav [(samples (ptr f32)) (count i64)] (-> (ptr i8))
+  (let [size (+ WAV-HEADER (* 2 count))
+        out (malloc (p/cast u64 size))]
+    (memcpy out c"RIFF" (: 4 u64))
+    (put-u32-le! out 4 (p/cast u32 (- size 8)))
+    (memcpy (index out 8) c"WAVEfmt " (: 8 u64))
+    (put-u32-le! out 16 (: 16 u32))
+    (put-u16-le! out 20 (: 1 u32))
+    (put-u16-le! out 22 (: 1 u32))
+    (put-u32-le! out 24 (p/cast u32 RATE))
+    (put-u32-le! out 28 (p/cast u32 (* 2 RATE)))
+    (put-u16-le! out 32 (: 2 u32))
+    (put-u16-le! out 34 (: 16 u32))
+    (memcpy (index out 36) c"data" (: 4 u64))
+    (put-u32-le! out 40 (p/cast u32 (* 2 count)))
+    (for [i 0 count]
+      (let [sample (load (index samples i))
+            clamped
+              (cond (> sample (: 1.0 f32)) (: 1.0 f32)
+                    (< sample (: -1.0 f32)) (: -1.0 f32)
+                    :else sample)
+            value (p/cast i32 (* clamped (: 32767.0 f32)))]
+        (put-u16-le! out
+                     (+ WAV-HEADER (* 2 i))
+                     (p/cast u32 (& value (: 65535 i32))))))
+    out))
+
+;;; The body of the HTTP response in BYTES, decoded in place if chunked. BYTES must be
+;;; NUL-terminated. Nil if it isn't a complete 200 response.
+(defn http-body [(bytes (ptr i8)) (length i64) (out-length (ptr i64))]
+  (-> (ptr i8))
+  (let [end (strnstr bytes c"\r\n\r\n" (p/cast u64 length))]
+    (if (or (= (p/cast i64 end) 0)
+            (< length 12)
+            (!= (memcmp (index bytes 8) c" 200" (: 4 u64)) (: 0 i32)))
+        (p/cast (ptr i8) 0)
+        (let [body (index end 4)
+              body-at (- (p/cast i64 body) (p/cast i64 bytes))
+              chunked
+                (let [saved (load body)]
+                  (set! (index bytes body-at) (: 0 i8))
+                  (let [found (strcasestr bytes c"transfer-encoding: chunked")]
+                    (set! (index bytes body-at) saved)
+                    (!= (p/cast i64 found) 0)))]
+          (if (not chunked)
+              (do
+                (set! (index out-length 0) (- length body-at))
+                body)
+              (let [(mut from) body-at
+                    (mut to) 0
+                    (mut complete) false]
+                (loop (let [(mut rest) (zeroed (ptr i8))
+                            size
+                              (strtol (index bytes (load from))
+                                      (mut rest)
+                                      (: 16 i32))
+                            line
+                              (strnstr (load rest)
+                                       c"\r\n"
+                                       (p/cast u64
+                                               (- length
+                                                  (- (p/cast i64 (load rest))
+                                                     (p/cast i64 bytes)))))]
+                        (cond (= (p/cast i64 line) 0) (break)
+                              (= size 0) (do (set! complete true) (break))
+                              :else
+                                (let [data-at
+                                        (+ (- (p/cast i64 line)
+                                              (p/cast i64 bytes))
+                                           2)]
+                                  (if (> (+ data-at size) length)
+                                      (break)
+                                      (do
+                                        (memmove (index body (load to))
+                                                 (index bytes data-at)
+                                                 (p/cast u64 size))
+                                        (set! to (+ (load to) size))
+                                        (set! from (+ data-at size 2))))))))
+                (if (load complete)
+                    (do (set! (index out-length 0) (load to)) body)
+                    (p/cast (ptr i8) 0))))))))
+
+;;; ---- the shared Phonon server ---------------------------------------------------
+;;; Exactly original Jim's arrangement (dictation/server.rs): one server per user,
+;;; recorded in ~/.jim/phonon-server, that outlives the app, because loading the model
+;;; is the slow part. Both apps adopt what is recorded, so they never run two.
+
+(const AF-INET 2)
+
+(const SOCK-STREAM 1)
+
+(const SOL-SOCKET 65535)
+
+(const SO-RCVTIMEO 4102)
+
+(const SO-SNDTIMEO 4101)
+
+(const SO-NOSIGPIPE 4130)
+
+(const O-RDONLY 0)
+
+(const O-WRONLY-CREAT-TRUNC 1537)
+
+(const O-RDWR-CREAT 514)
+
+(const LOCK-EX 2)
+
+(const LOCK-UN 8)
+
+(const POSIX-SPAWN-SETPGROUP 2)
+
+(const POSIX-SPAWN-CLOEXEC-DEFAULT 16384)
+
+;;; Why the last thing failed, for the status pill. Written only on the worker thread
+;;; before it reports the failure.
+(defn error-cell [] (-> (ptr (array i8 300)))
+  (p/alloc-static (array i8 300)))
+
+(defn last-error [] (-> (ptr i8))
+  (p/cast (ptr i8) (error-cell)))
+
+(defn set-error! [(text (ptr i8))] (-> i64)
+  (snprintf (last-error) (: 300 u64) c"%s" text)
+  0)
+
+(defn jim-path [(out (ptr i8)) (capacity u64) (name (ptr i8))] (-> i64)
+  (snprintf out capacity c"%s/.jim/%s" (getenv c"HOME") name)
+  0)
+
+(defn loopback-address [(out (ptr i8)) (port i32)] (-> i64)
+  (set! (index out 0) (: 16 i8))
+  (set! (index out 1) (p/cast i8 AF-INET))
+  (set! (index out 2) (p/cast i8 (>> port (: 8 i32))))
+  (set! (index out 3) (p/cast i8 (& port (: 255 i32))))
+  (set! (index out 4) (: 127 i8))
+  (set! (index out 5) (: 0 i8))
+  (set! (index out 6) (: 0 i8))
+  (set! (index out 7) (: 1 i8))
+  0)
+
+;;; A connected socket to PORT with SECONDS to send and receive in, or -1.
+(defn connect-port [(port i32) (seconds i64)] (-> i32)
+  (let [fd (socket AF-INET SOCK-STREAM (: 0 i32))
+        (mut address) (zeroed (array i8 16))
+        (mut timeout) (zeroed (array i64 2))
+        (mut yes) (: 1 i32)]
+    (if (< fd (: 0 i32))
+        (: -1 i32)
+        (do
+          (set! (index (p/cast (ptr i64) (mut timeout)) 0) seconds)
+          (setsockopt fd
+                      SOL-SOCKET
+                      SO-RCVTIMEO
+                      (p/cast (ptr i8) (mut timeout))
+                      (: 16 u32))
+          (setsockopt fd
+                      SOL-SOCKET
+                      SO-SNDTIMEO
+                      (p/cast (ptr i8) (mut timeout))
+                      (: 16 u32))
+          (setsockopt fd
+                      SOL-SOCKET
+                      SO-NOSIGPIPE
+                      (p/cast (ptr i8) (mut yes))
+                      (: 4 u32))
+          (loopback-address (p/cast (ptr i8) (mut address)) port)
+          (if (< (connect fd (p/cast (ptr i8) (mut address)) (: 16 u32))
+                 (: 0 i32))
+              (do (close fd) (: -1 i32))
+              fd)))))
+
+(defn port-answers? [(port i32)] (-> bool)
+  (let [fd (connect-port port 2)]
+    (if (< fd (: 0 i32)) false (do (close fd) true))))
+
+;;; The port of the recorded server if it's alive and answering, otherwise -1.
+(defn recorded-port [] (-> i32)
+  (let [(mut path) (zeroed (array i8 1100))
+        (mut text) (zeroed (array i8 256))
+        out (p/cast (ptr i8) (mut path))
+        bytes (p/cast (ptr i8) (mut text))]
+    (jim-path out (: 1100 u64) c"phonon-server")
+    (let [fd (open out (p/cast i32 O-RDONLY))]
+      (if (< fd (: 0 i32))
+          (: -1 i32)
+          (let [n (read fd bytes (: 255 u64))
+                (mut rest) (zeroed (ptr i8))]
+            (close fd)
+            (if (<= n 0)
+                (: -1 i32)
+                (let [pid (strtol bytes (mut rest) (: 10 i32))
+                      port
+                        (strtol (load rest)
+                                (p/cast (ptr (ptr i8)) 0)
+                                (: 10 i32))]
+                  (if (and (> pid 0)
+                           (> port 0)
+                           (= (kill (p/cast i32 pid) (: 0 i32)) (: 0 i32))
+                           (port-answers? (p/cast i32 port)))
+                      (p/cast i32 port)
+                      (: -1 i32)))))))))
+
+(defn free-port [] (-> i32)
+  (let [fd (socket AF-INET SOCK-STREAM (: 0 i32))
+        (mut address) (zeroed (array i8 16))
+        (mut length) (: 16 u32)
+        bytes (p/cast (ptr i8) (mut address))]
+    (loopback-address bytes (: 0 i32))
+    (if (or (< fd (: 0 i32))
+            (< (bind fd bytes (: 16 u32)) (: 0 i32))
+            (< (getsockname fd bytes (mut length)) (: 0 i32)))
+        (do (when (>= fd (: 0 i32)) (close fd) 0) (: -1 i32))
+        (let [port
+                (| (<< (p/cast i32 (byte-at bytes 2)) (: 8 i32))
+                   (p/cast i32 (byte-at bytes 3)))]
+          (close fd)
+          port))))
+
+;;; Start `phonon serve` in its own process group, logging to its own file, with the
+;;; environment plus the two settings original Jim gives it.
+(defn spawn-server [(bin (ptr i8)) (port i32)] (-> i32)
+  (let [(mut port-text) (zeroed (array i8 16))
+        (mut log) (zeroed (array i8 1100))
+        (mut attr) (zeroed (ptr i8))
+        (mut actions) (zeroed (ptr i8))
+        (mut pid) (zeroed i32)
+        (mut args) (zeroed (array (ptr i8) 7))
+        environment (load (_NSGetEnviron))
+        (mut count) 0]
+    (snprintf (p/cast (ptr i8) (mut port-text)) (: 16 u64) c"%d" port)
+    (jim-path (p/cast (ptr i8) (mut log)) (: 1100 u64) c"phonon-server.log")
+    (let [argv (p/cast (ptr (ptr i8)) (mut args))]
+      (set! (index argv 0) bin)
+      (set! (index argv 1) c"serve")
+      (set! (index argv 2) c"--host")
+      (set! (index argv 3) c"127.0.0.1")
+      (set! (index argv 4) c"--port")
+      (set! (index argv 5) (p/cast (ptr i8) (mut port-text)))
+      (set! (index argv 6) (p/cast (ptr i8) 0))
+      (loop (if (= (p/cast i64 (load (index environment (load count)))) 0)
+                (break)
+                (set! count (+ (load count) 1))))
+      (let [env
+              (p/cast (ptr (ptr i8))
+                      (malloc (p/cast u64 (* (+ (load count) 3) 8))))]
+        (for [i 0 (load count)]
+          (set! (index env i) (load (index environment i))))
+        (set! (index env (load count)) c"FERMION_DEVICE=cpu")
+        (set! (index env (+ (load count) 1)) c"HF_HUB_OFFLINE=1")
+        (set! (index env (+ (load count) 2)) (p/cast (ptr i8) 0))
+        (posix_spawnattr_init (mut attr))
+        (posix_spawnattr_setflags (mut attr)
+                                  (p/cast i16
+                                          (| POSIX-SPAWN-SETPGROUP
+                                             POSIX-SPAWN-CLOEXEC-DEFAULT)))
+        (posix_spawnattr_setpgroup (mut attr) (: 0 i32))
+        (posix_spawn_file_actions_init (mut actions))
+        (posix_spawn_file_actions_addopen (mut actions)
+                                          (: 0 i32)
+                                          c"/dev/null"
+                                          (p/cast i32 O-RDONLY)
+                                          (: 0 u16))
+        (for [fd 1 3]
+          (posix_spawn_file_actions_addopen (mut actions)
+                                            (p/cast i32 fd)
+                                            (p/cast (ptr i8) (mut log))
+                                            (p/cast i32 O-WRONLY-CREAT-TRUNC)
+                                            (: 420 u16)))
+        (let [failed
+                (posix_spawn (mut pid)
+                             bin
+                             (mut actions)
+                             (mut attr)
+                             argv
+                             env)]
+          (posix_spawn_file_actions_destroy (mut actions))
+          (posix_spawnattr_destroy (mut attr))
+          (free (p/cast (ptr i8) env))
+          (if (!= failed (: 0 i32)) (: -1 i32) (load pid)))))))
+
+(defn write-record [(pid i32) (port i32) (bin (ptr i8))] (-> i64)
+  (let [(mut path) (zeroed (array i8 1100))
+        (mut temporary) (zeroed (array i8 1100))
+        (mut text) (zeroed (array i8 1300))
+        out (p/cast (ptr i8) (mut path))
+        tmp (p/cast (ptr i8) (mut temporary))
+        line (p/cast (ptr i8) (mut text))]
+    (jim-path out (: 1100 u64) c"phonon-server")
+    (jim-path tmp (: 1100 u64) c"phonon-server.tmp")
+    (let [n
+            (snprintf line
+                      (: 1300 u64)
+                      c"%d\n%d\nphonon-2 cpu %s 0\n"
+                      pid
+                      port
+                      bin)
+          fd (open tmp (p/cast i32 O-WRONLY-CREAT-TRUNC) (: 420 i32))]
+      (when (>= fd (: 0 i32))
+        (write fd line (p/cast u64 n))
+        (close fd)
+        (rename tmp out)
+        0)
+      0)))
+
+;;; The port of a running server, starting one if need be. Holds the same lock as
+;;; original Jim, so the two apps can't both start one. -1 with the reason set.
+(defn ensure-server [] (-> i32)
+  (let [running (recorded-port)]
+    (if (>= running (: 0 i32))
+        running
+        (let [(mut lock-path) (zeroed (array i8 1100))
+              (mut bin) (zeroed (array i8 1100))]
+          (jim-path (p/cast (ptr i8) (mut lock-path))
+                    (: 1100 u64)
+                    c"phonon-server.lock")
+          (jim-path (p/cast (ptr i8) (mut bin))
+                    (: 1100 u64)
+                    c"phonon/venv/bin/phonon")
+          (if (!= (access (p/cast (ptr i8) (mut bin)) (: 1 i32)) (: 0 i32))
+              (do
+                (set-error! c"Phonon isn't installed. Run original Jim's scripts/install-phonon.sh.")
+                (: -1 i32))
+              (let [lock
+                      (open (p/cast (ptr i8) (mut lock-path))
+                            (p/cast i32 O-RDWR-CREAT)
+                            (: 420 i32))]
+                (when (>= lock (: 0 i32)) (flock lock LOCK-EX) 0)
+                (let [found (recorded-port)
+                      port
+                        (if (>= found (: 0 i32))
+                            found
+                            (let [chosen (free-port)
+                                  pid
+                                    (if (< chosen (: 0 i32))
+                                        (: -1 i32)
+                                        (spawn-server (p/cast (ptr i8)
+                                                              (mut bin))
+                                                      chosen))]
+                              (if (< pid (: 0 i32))
+                                  (: -1 i32)
+                                  (let [(mut waited) 0]
+                                    ; A cold load takes ~9 s. The first run in an
+                                    ; environment also compiles its CPU runtime.
+                                    (loop (cond (port-answers? chosen) (break)
+                                                (>= (load waited) 480) (break)
+                                                :else
+                                                  (do
+                                                    (usleep (: 250000 u32))
+                                                    (set! waited
+                                                          (+ (load waited) 1)))))
+                                    (if (port-answers? chosen)
+                                        (do
+                                          (write-record pid
+                                                        chosen
+                                                        (p/cast (ptr i8)
+                                                                (mut bin)))
+                                          chosen)
+                                        (: -1 i32))))))]
+                  (when (>= lock (: 0 i32))
+                    (flock lock LOCK-UN)
+                    (close lock)
+                    0)
+                  (when (< port (: 0 i32))
+                    (set-error! c"The Phonon server wouldn't start. See ~/.jim/phonon-server.log.")
+                    0)
+                  port)))))))
+
+(defn send-all [(fd i32) (bytes (ptr i8)) (length i64)] (-> bool)
+  (let [(mut at) 0]
+    (block
+      :done
+        (do
+          (loop (if (>= (load at) length)
+                    (break)
+                    (let [n
+                            (send fd
+                                  (index bytes (load at))
+                                  (p/cast u64 (- length (load at)))
+                                  (: 0 i32))]
+                      (if (<= n 0)
+                          (return-from :done false)
+                          (set! at (+ (load at) n))))))
+          true))))
+
+;;; POST COUNT samples to PORT. The trimmed transcript in a new allocation, or nil.
+(defn post-audio [(port i32) (samples (ptr f32)) (count i64)] (-> (ptr i8))
+  (let [wav (encode-wav samples count)
+        wav-size (+ WAV-HEADER (* 2 count))
+        head
+          c"------jimdictation7f3a1c\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        tail
+          c"\r\n------jimdictation7f3a1c\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nphonon-2\r\n------jimdictation7f3a1c\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\ntext\r\n------jimdictation7f3a1c--\r\n"
+        head-size (p/cast i64 (strlen head))
+        tail-size (p/cast i64 (strlen tail))
+        (mut request) (zeroed (array i8 400))
+        request-bytes (p/cast (ptr i8) (mut request))
+        request-size
+          (p/cast i64
+                  (snprintf request-bytes
+                            (: 400 u64)
+                            c"POST /v1/audio/transcriptions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=----jimdictation7f3a1c\r\nContent-Length: %lld\r\n\r\n"
+                            (+ head-size wav-size tail-size)))
+        fd (connect-port port 60)
+        result
+          (if (< fd (: 0 i32))
+              (p/cast (ptr i8) 0)
+              (if (not (and (send-all fd request-bytes request-size)
+                            (send-all fd head head-size)
+                            (send-all fd wav wav-size)
+                            (send-all fd tail tail-size)))
+                  (p/cast (ptr i8) 0)
+                  (let [(mut capacity) 65536
+                        (mut length) 0
+                        (mut reply) (malloc (: 65536 u64))]
+                    (loop (when (>= (+ (load length) 1) (load capacity))
+                            (set! capacity (* 2 (load capacity)))
+                            (set! reply
+                                  (realloc (load reply)
+                                           (p/cast u64 (load capacity))))
+                            0)
+                      (let [n
+                              (recv fd
+                                    (index (load reply) (load length))
+                                    (p/cast u64
+                                            (- (- (load capacity) (load length))
+                                               1))
+                                    (: 0 i32))]
+                        (if (<= n 0)
+                            (break)
+                            (set! length (+ (load length) n)))))
+                    (set! (index (load reply) (load length)) (: 0 i8))
+                    (let [(mut body-length) 0
+                          body
+                            (http-body (load reply)
+                                       (load length)
+                                       (mut body-length))
+                          text
+                            (if (= (p/cast i64 body) 0)
+                                (p/cast (ptr i8) 0)
+                                (do
+                                  (set! (index body (load body-length))
+                                        (: 0 i8))
+                                  (flatten-text body)))]
+                      (free (load reply))
+                      text))))]
+    (when (>= fd (: 0 i32)) (close fd) 0)
+    (free wav)
+    result))
+
+;;; Decode on the shared server. A failed request means it died or wedged, so look again
+;;; and retry once, and a server dying mid-dictation costs one respawn, not the session.
+(defn decode [(samples (ptr f32)) (count i64)] (-> (ptr i8))
+  (let [port (ensure-server)]
+    (if (< port (: 0 i32))
+        (p/cast (ptr i8) 0)
+        (let [first (post-audio port samples count)]
+          (if (!= (p/cast i64 first) 0)
+              first
+              (let [again (ensure-server)]
+                (if (< again (: 0 i32))
+                    (p/cast (ptr i8) 0)
+                    (let [second (post-audio again samples count)]
+                      (when (= (p/cast i64 second) 0)
+                        (set-error! c"The Phonon server didn't answer a decode.")
+                        0)
+                      second))))))))
+
+;;; ---- a session --------------------------------------------------------------------
+;;; At most one decode per step, and a partial always decodes the phrase as it stands
+;;; now, so slow decodes just mean partials further apart and no backlog ever builds.
+
+(defstruct Session
+  [(seg Segmenter)
+   (closed Phrases)
+   (finals (ptr i8))
+   (partial (ptr i8))
+   (partial-at i64)
+   (dirty bool)])
+
+(defn empty-string [] (-> (ptr i8))
+  (let [out (malloc (: 1 u64))]
+    (set! (index out 0) (: 0 i8))
+    out))
+
+(defn session-init! [(s (ptr Session))] (-> i64)
+  (set! s (zeroed Session))
+  (set! (.finals s) (empty-string))
+  (set! (.partial s) (empty-string))
+  (set! (.partial-at s) -1)
+  0)
+
+(defn session-free! [(s (ptr Session))] (-> i64)
+  (samples-free! (field (field s seg) audio))
+  (samples-free! (field (field s seg) rms))
+  (loop (if (phrases-waiting? (field s closed))
+            (let [(mut phrase) (phrases-pop! (field s closed))]
+              (samples-free! (mut phrase)))
+            (break)))
+  (free (p/cast (ptr i8) (.items (field s closed))))
+  (free (.finals s))
+  (free (.partial s))
+  0)
+
+;;; The whole transcript so far, in a new allocation.
+(defn session-text [(s (ptr Session))] (-> (ptr i8))
+  (join-text (.finals s) (.partial s)))
+
+(defn session-push! [(s (ptr Session)) (samples (ptr f32)) (count i64)] (-> i64)
+  (let [before (.len (field s closed))]
+    (segmenter-push! (field s seg) samples count (field s closed))
+    (when (!= before (.len (field s closed)))
+      (set! (.partial-at s) -1)
+      0)
+    0))
+
+;;; Decode a closed phrase into the frozen text. False with the reason set if it failed.
+(defn freeze! [(s (ptr Session)) (phrase (ptr Samples))] (-> bool)
+  (let [text (decode (.data phrase) (.len phrase))]
+    (samples-free! phrase)
+    (if (= (p/cast i64 text) 0)
+        false
+        (do
+          (let [joined (join-text (.finals s) text)]
+            (free (.finals s))
+            (set! (.finals s) joined)
+            (free text)
+            0)
+          ; The partial was this phrase's, or an older one's. Either way it's superseded.
+          (free (.partial s))
+          (set! (.partial s) (empty-string))
+          (set! (.dirty s) true)
+          true))))
+
+(defn partial-due? [(s (ptr Session))] (-> bool)
+  (let [n (.len (field (field s seg) audio))]
+    (and (.voiced (field s seg))
+         (if (< (.partial-at s) 0)
+             (>= n FIRST-PARTIAL)
+             (>= n (+ (.partial-at s) PARTIAL-EVERY))))))
+
+;;; Do whatever is due: 1 if the transcript changed, 0 if not, -1 with the reason set.
+(defn session-step! [(s (ptr Session))] (-> i64)
+  (let [ok
+          (cond (phrases-waiting? (field s closed))
+                  (let [(mut phrase) (phrases-pop! (field s closed))]
+                    (freeze! s (mut phrase)))
+                (partial-due? s)
+                  (let [audio (field (field s seg) audio)
+                        n (.len audio)
+                        text (decode (.data audio) n)]
+                    (if (= (p/cast i64 text) 0)
+                        false
+                        (do
+                          (set! (.partial-at s) n)
+                          (if (and (> (strlen text) (: 0 u64))
+                                   (!= (strcmp text (.partial s)) (: 0 i32)))
+                              (do
+                                (free (.partial s))
+                                (set! (.partial s) text)
+                                (set! (.dirty s) true)
+                                true)
+                              (do (free text) true)))))
+                :else true)]
+    (cond (not ok) -1
+          (.dirty s) (do (set! (.dirty s) false) 1)
+          :else 0)))
+
+;;; All the audio is in. Freeze what's left. False with the reason set if it failed.
+(defn session-finish! [(s (ptr Session))] (-> bool)
+  (block
+    :done
+      (do
+        (loop (if (phrases-waiting? (field s closed))
+                  (let [(mut phrase) (phrases-pop! (field s closed))]
+                    (when (not (freeze! s (mut phrase)))
+                      (return-from :done false))
+                    0)
+                  (break)))
+        (let [seg (field s seg)
+              audio (field seg audio)]
+          (when (and (.voiced seg) (> (.len audio) 0))
+            (when (not (freeze! s audio))
+              (return-from :done false))
+            (set! audio (zeroed Samples))
+            0)
+          (free (.partial s))
+          (set! (.partial s) (empty-string))
+          true))))

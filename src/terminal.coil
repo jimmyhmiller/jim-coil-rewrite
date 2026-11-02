@@ -1,4 +1,5 @@
 (module jim.terminal)
+(import "coil.cc" :as cc)
 (import "jim.timings" :as timings)
 (import "jim.native" :use *)
 (import "jim.ghostty" :as g)
@@ -12,6 +13,7 @@
    (surface (ptr i8))
    (directory (ptr i8))
    (session-id (ptr i8))
+   (original i64)
    (marked (ptr i8))
    (accum (ptr i8))
    (selection Range)
@@ -281,6 +283,199 @@
                                     c"copy_to_clipboard"
                                     17))
 
+;;; ---- drag and drop --------------------------------------------------------------
+;;; What is dropped arrives as the text a shell needs, as Ghostty's own app does it:
+;;; files as escaped paths, so an agent or command in the terminal can open them.
+
+(extern NSTemporaryDirectory :cc (cc/C) [] (-> (ptr i8)))
+
+;;; The view dropped onto since last asked, so the canvas can focus its pane.
+(defn dropped-cell [] (-> (ptr (ptr i8)))
+  (p/alloc-static (ptr i8)))
+
+(defn take-dropped! [] (-> (ptr i8))
+  (let [view (load (dropped-cell))]
+    (set! (dropped-cell) (nil))
+    view))
+
+(defn replace-all [(s (ptr i8)) (from (ptr i8)) (to (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       s
+       (sel c"stringByReplacingOccurrencesOfString:withString:")
+       [(ptr i8) (ptr i8)]
+       from
+       to))
+
+(defn append [(a (ptr i8)) (b (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) a (sel c"stringByAppendingString:") [(ptr i8)] b))
+
+;;; PATH, safe to type at a shell prompt.
+(defn shell-escaped [(path (ptr i8))] (-> (ptr i8))
+  (let [specials
+          [c"\\"
+           c" "
+           c"("
+           c")"
+           c"["
+           c"]"
+           c"{"
+           c"}"
+           c"<"
+           c">"
+           c"\""
+           c"'"
+           c"`"
+           c"!"
+           c"#"
+           c"$"
+           c"&"
+           c";"
+           c"|"
+           c"*"
+           c"?"
+           c"\t"]
+        (mut out) path]
+    (for [i 0 22]
+      (let [special (ns (get specials i))]
+        (set! out (replace-all (load out) special (append (ns c"\\") special)))))
+    (load out)))
+
+(defn dropped-files [(board (ptr i8))] (-> (ptr i8))
+  (let [classes
+          (msg (ptr i8)
+               (class c"NSArray")
+               (sel c"arrayWithObject:")
+               [(ptr i8)]
+               (class c"NSURL"))
+        options
+          (msg (ptr i8)
+               (class c"NSDictionary")
+               (sel c"dictionaryWithObject:forKey:")
+               [(ptr i8) (ptr i8)]
+               (msg (ptr i8)
+                    (class c"NSNumber")
+                    (sel c"numberWithBool:")
+                    [i8]
+                    (: 1 i8))
+               (ns c"NSPasteboardURLReadingFileURLsOnlyKey"))
+        urls
+          (msg (ptr i8)
+               board
+               (sel c"readObjectsForClasses:options:")
+               [(ptr i8) (ptr i8)]
+               classes
+               options)
+        (mut text) (ns c"")]
+    (for [i 0 (msg i64 urls (sel c"count") [])]
+      (set! text
+            (append (load text)
+                    (append (shell-escaped (msg (ptr i8)
+                                                (msg (ptr i8)
+                                                     urls
+                                                     (sel c"objectAtIndex:")
+                                                     [i64]
+                                                     i)
+                                                (sel c"path")
+                                                []))
+                            (ns c" ")))))
+    (load text)))
+
+;;; Image data with no file behind it, as from a browser, saved where a path can reach
+;;; it. Nil if BOARD holds no image, or it could not be saved.
+(defn dropped-image [(board (ptr i8))] (-> (ptr i8))
+  (let [png
+          (msg (ptr i8)
+               board
+               (sel c"dataForType:")
+               [(ptr i8)]
+               (ns c"public.png"))
+        tiff
+          (if (= (p/cast i64 png) 0)
+              (msg (ptr i8)
+                   board
+                   (sel c"dataForType:")
+                   [(ptr i8)]
+                   (ns c"public.tiff"))
+              (nil))
+        data
+          (if (= (p/cast i64 tiff) 0)
+              png
+              (msg (ptr i8)
+                   (msg (ptr i8)
+                        (class c"NSBitmapImageRep")
+                        (sel c"imageRepWithData:")
+                        [(ptr i8)]
+                        tiff)
+                   (sel c"representationUsingType:properties:")
+                   [u64 (ptr i8)]
+                   (: 4 u64)
+                   (msg (ptr i8) (class c"NSDictionary") (sel c"dictionary") [])))
+        path
+          (append (NSTemporaryDirectory)
+                  (append (append (ns c"jim-drop-") (sessions/identifier))
+                          (ns c".png")))]
+    (if (and (!= (p/cast i64 data) 0)
+             (!= (msg i8
+                      data
+                      (sel c"writeToFile:atomically:")
+                      [(ptr i8) i8]
+                      path
+                      (: 1 i8))
+                 (: 0 i8)))
+        (append (shell-escaped path) (ns c" "))
+        (nil))))
+
+;;; The text a drop of BOARD types: files, else an image, else plain text. Nil if none.
+(defn dropped-text [(board (ptr i8))] (-> (ptr i8))
+  (let [files (dropped-files board)]
+    (if (> (msg u64 files (sel c"length") []) (: 0 u64))
+        files
+        (let [image (dropped-image board)]
+          (if (!= (p/cast i64 image) 0)
+              image
+              (msg (ptr i8)
+                   board
+                   (sel c"stringForType:")
+                   [(ptr i8)]
+                   (ns c"public.utf8-plain-text")))))))
+
+(defn dragging-entered [(self (ptr i8)) (cmd (ptr i8)) (info (ptr i8))] (-> u64)
+  (: 1 u64))
+
+(defn perform-drag [(self (ptr i8)) (cmd (ptr i8)) (info (ptr i8))] (-> i8)
+  (let [t (terminal self)
+        text (dropped-text (msg (ptr i8) info (sel c"draggingPasteboard") []))]
+    (if (or (= (p/cast i64 (.surface t)) 0) (= (p/cast i64 text) 0))
+        (: 0 i8)
+        (let [bytes (utf8 text)]
+          (g/ghostty_surface_text (.surface t) bytes (strlen bytes))
+          (set! (dropped-cell) self)
+          ; The next thing wanted is usually Return in this terminal.
+          (msg i64
+               (msg (ptr i8)
+                    (class c"NSApplication")
+                    (sel c"sharedApplication")
+                    [])
+               (sel c"activateIgnoringOtherApps:")
+               [i8]
+               (: 1 i8))
+          (: 1 i8)))))
+
+(defn register-drops! [(view (ptr i8))] (-> void)
+  (let [types (new c"NSMutableArray")]
+    (for [i 0 4]
+      (msg i64
+           types
+           (sel c"addObject:")
+           [(ptr i8)]
+           (ns (cond (= i 0) c"public.file-url"
+                     (= i 1) c"public.png"
+                     (= i 2) c"public.tiff"
+                     :else c"public.utf8-plain-text"))))
+    (msg i64 view (sel c"registerForDraggedTypes:") [(ptr i8)] types)
+    (release types)
+    (do)))
+
 (defn paste [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
   (g/ghostty_surface_binding_action (.surface (terminal self))
                                     c"paste_from_clipboard"
@@ -445,6 +640,14 @@
                      c"scrollWheel:"
                      (p/cast (ptr i8) (fnptr-of scroll))
                      c"v@:@")
+            (method! cls
+                     c"draggingEntered:"
+                     (p/cast (ptr i8) (fnptr-of dragging-entered))
+                     c"Q@:@")
+            (method! cls
+                     c"performDragOperation:"
+                     (p/cast (ptr i8) (fnptr-of perform-drag))
+                     c"c@:@")
             (method! cls c"copy:" (p/cast (ptr i8) (fnptr-of copy)) c"v@:@")
             (method! cls c"paste:" (p/cast (ptr i8) (fnptr-of paste)) c"v@:@")
             (method! cls
@@ -684,7 +887,8 @@
 (defn create! [(parent (ptr i8))
                (bounds Rect)
                (cwd (ptr i8))
-               (session-id (ptr i8))] (-> (ptr Terminal))
+               (session-id (ptr i8))
+               (original i64)] (-> (ptr Terminal))
   (let [v
           (msg (ptr i8)
                (msg (ptr i8) (view-class) (sel c"alloc") [])
@@ -701,20 +905,28 @@
     (do
       (set! (.view t) v)
       (set! (.session-id t) (msg (ptr i8) session-id (sel c"retain") []))
+      (set! (.original t) original)
       (set! (.directory t) (msg (ptr i8) (ns cwd) (sel c"retain") []))
       (set! (.marked t) (new c"NSMutableString"))
       (set! (.accum t) (new c"NSMutableString"))
       (objc_setAssociatedObject v (association-key) (p/cast (ptr i8) t) 0)
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
+      (register-drops! v)
       (set! (.platform-tag config) 1)
       (set! (.view config) v)
       (set! (.userdata config) (p/cast (ptr i8) t))
       (set! (.scale config) scale)
       (set! (.cwd config) cwd)
-      (let [fd (sessions/open! session-id cwd)]
+      (let [fd (sessions/open! session-id cwd (field t original))]
         (if (>= fd (: 0 i32))
             (set! (.surface t)
-                  (g/ghostty_surface_new_session (load (app-cell)) config fd))
+                  (g/ghostty_surface_new_session (load (app-cell))
+                                                 config
+                                                 fd
+                                                 (p/cast u32
+                                                         (* (.w bounds) scale))
+                                                 (p/cast u32
+                                                         (* (.h bounds) scale))))
             0))
       (if (!= (p/cast i64 (.surface t)) 0)
           (g/ghostty_surface_set_size (.surface t)

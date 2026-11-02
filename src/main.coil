@@ -1,4 +1,5 @@
 (module jim.main)
+(import "jim.dictation" :as dictation)
 (import "coil.cc" :as cc)
 (import "jim.native" :use *)
 (import "jim.terminal" :as terminal)
@@ -7,6 +8,8 @@
 (import "jim.canvas" :as canvas)
 (import "jim.widget-view" :as widget-view)
 (import "jim.storage" :as storage)
+(import "jim.original" :as original)
+(import "jim.sessions" :as sessions)
 (import "jim.projects" :as projects)
 (import "jim.sidebar" :as sidebar)
 (import "coil.arraylist" :as al)
@@ -52,6 +55,10 @@
    (overview bool)
    (angle f64)
    (dragging bool)
+   ;; The frame to come back to, held for a moment after launch.
+   (window-target Rect)
+   (window-pending bool)
+   (window-settle-until f64)
    (drag-x f64)
    (drag-angle f64)
    ;; The cube's tilt (workspace's tilt), set by dragging up and down from
@@ -652,6 +659,28 @@
     (al/ArrayList::free! (mut problem))
     (do)))
 
+;;; The session of the focused terminal, or nil if the focus isn't one.
+(defn focused-session [] (-> (ptr i8))
+  (if (and (>= (.selected (shell)) 0)
+           (!= (p/cast i64 (.focused (current))) 0)
+           (not (canvas/widget? (.focused (current)))))
+      (.session-id (canvas/term-of (.focused (current))))
+      (nil)))
+
+(defn dictation-toggle! [] (-> void)
+  (dictation/toggle! (.root (shell)) (focused-session) (timings/now))
+  (do))
+
+;;; The surface of the session being dictated into, wherever it is now.
+(defn dictation-surface [] (-> (ptr i8))
+  (let [(mut found) (nil)
+        id (dictation/target)]
+    (when (!= (p/cast i64 id) 0)
+      (for [i 0 (count)]
+        (let [surface (canvas/surface-of-session (project i) id)]
+          (when (!= (p/cast i64 surface) 0) (set! found surface) 0))))
+    (load found)))
+
 (defn background-maintenance! [] (-> void)
   (let [s (shell)
         bounds (msg Rect (.root s) (sel c"bounds") [])]
@@ -743,6 +772,105 @@
       (add-project-view! record)
       (sync-selection!))))
 
+;;; The saved projects the import picker is offering, by id, in the picker's order.
+(defn import-choices [] (-> (ptr (ptr i8)))
+  (p/alloc-static (ptr i8)))
+
+;;; Offer the projects original Jim saved that still have something to bring across.
+(defn choose-original-project! [] (-> void)
+  (let [s (shell)
+        model (.model s)
+        state (original/read-state)]
+    (if (= (p/cast i64 state) 0)
+        (do (status! c"No saved state from original Jim") (do))
+        (let [check-alive (not (sessions/original-running?))]
+          ; Imported terminals are recognized from the saved layouts.
+          (save-layout!)
+          (let [ids (original/choices model state check-alive)
+                titles (storage/array)]
+            (if (= (storage/count ids) 0)
+                (do (status! c"Nothing left to import from original Jim") (do))
+                (do
+                  (for [i 0 (storage/count ids)]
+                    (storage/add! titles
+                                  (original/choice-title model
+                                                         state
+                                                         (projects/find (storage/get state
+                                                                                     c"projects")
+                                                                        (p/cast i64
+                                                                                (msg f64
+                                                                                     (storage/at ids
+                                                                                                 i)
+                                                                                     (sel c"doubleValue")
+                                                                                     [])))
+                                                         check-alive)))
+                  (release (load (import-choices)))
+                  (set! (import-choices) (msg (ptr i8) ids (sel c"retain") []))
+                  (palette/pick! c"Import a project from original Jim…"
+                                 titles)
+                  (do))))))))
+
+;;; Bring one saved project across and show it: it joins a project of the same name if
+;;; there is one, with every terminal of it still running. Original Jim being open
+;;; leaves the terminals with it. Importing the project again later brings them.
+(defn import-original-project! [(picked i64)] (-> void)
+  (let [s (shell)
+        model (.model s)
+        state (original/read-state)
+        wanted
+          (p/cast i64
+                  (msg f64
+                       (storage/at (load (import-choices)) picked)
+                       (sel c"doubleValue")
+                       []))
+        from
+          (if (= (p/cast i64 state) 0)
+              (nil)
+              (projects/find (storage/get state c"projects") wanted))]
+    (if (= (p/cast i64 from) 0)
+        (do
+          (status! c"That project is no longer in original Jim's saved state")
+          (do))
+        (let [running (sessions/original-running?)
+              existing (original/project-named model (original/name-of from))
+              record
+                (if (= (p/cast i64 existing) 0)
+                    (let [created (original/add-project! model from)]
+                      (add-project-view! created)
+                      created)
+                    existing)
+              c (canvas-of (projects/id record))
+              shift (canvas/right-edge c)
+              waiting (original/pending-terminals model state from false)
+              panes
+                (if running
+                    (storage/array)
+                    (original/pending-terminals model state from true))]
+          (for [i 0 (storage/count panes)]
+            (let [pane (storage/at panes i)]
+              (canvas/add-session! c
+                                   (original/bounds pane shift)
+                                   (sessions/identifier)
+                                   (original/session-id pane))
+              0))
+          (projects/hide! model (projects/id record) false)
+          (projects/select! model (projects/id record))
+          (sync-selection!)
+          (status! (cond (and running (> (storage/count waiting) 0))
+                           c"Project imported. Quit original Jim and import it again for its terminals"
+                         (= (storage/count panes) 0) c"Project imported"
+                         :else
+                           (utf8 (indexed-string c"Project imported with terminals: "
+                                                 (storage/count panes)
+                                                 c""))))
+          (do)))))
+
+(defn canvas-of [(wanted i64)] (-> (ptr canvas/Canvas))
+  (let [(mut found) (project 0)]
+    (for [i 0 (count)]
+      (when (= (.id (runtime i)) wanted) (set! found (project i)) 0))
+    (load found)))
+
 (defn add-project-view! [(record (ptr i8))] (-> bool)
   (let [s (shell)
         f
@@ -806,6 +934,7 @@
         bounds (msg Rect (.root s) (sel c"bounds") [])
         now (animation/animation-now)]
     (do
+      (hold-window-frame! now)
       (coast!)
       (settle!)
       (if (or (< (.width s) (.w bounds))
@@ -814,6 +943,7 @@
               (> (.height s) (.h bounds)))
           (layout!)
           (do))
+      (dictation/pump! (.root s) (dictation-surface) now)
       (let [reloaded (widget-view/maintain! now (> now (.maintenance-at s)))]
         (for [i 0 (count)]
           (canvas/widgets-serve! (project i))
@@ -826,6 +956,7 @@
           (do
             (set! (.maintenance-at s) (+ now 0.2))
             (background-maintenance!)
+            (remember-window-frame!)
             (let [(mut dirty) false
                   (mut dragging) false]
               (do
@@ -896,6 +1027,7 @@
         (= id 8) (if (>= (.selected (shell)) 0) (toggle!) (do))
         (= id 9) (theme-load!)
         (= id 10) (timings/toggle!)
+        (= id 31) (dictation-toggle!)
         (= id 29)
           (when (and (>= (.selected (shell)) 0) (not (.overview (shell))))
             (canvas/toggle-expose! (current)))
@@ -918,6 +1050,7 @@
                                                             actions/FIRST-PROJECT))))
               (sync-selection!))
           (= id 15) (new-project!)
+          (= id 30) (choose-original-project!)
           (= id 16)
             (if (>= (.selected s) 0)
                 (sidebar/rename! (projects/active model))
@@ -1105,9 +1238,18 @@
                           (set! (.gesture (project i)) 0)))
                       (palette/show!)))
                 true)
-            (palette/open?) (palette/handle! event)
-            (sidebar/handle! event) true
+            (palette/open?)
+              (do (canvas/clear-resize-cursor!) (palette/handle! event))
+            (sidebar/handle! event) (do (canvas/clear-resize-cursor!) true)
             (timings/owns-event? event) false
+            (and (= kind 10) (dictation/listening?) (= key (: 53 u16)))
+              (do (dictation/stop!) true)
+            (and (= kind 10)
+                 (dictation/listening?)
+                 (!= (actions/key-action key flags) 31))
+              (do (dictation/detach!) false)
+            (and (= kind 5) (or (< (.selected s) 0) (.overview s)))
+              (do (canvas/clear-resize-cursor!) false)
             (and (>= (.selected s) 0)
                  (not (.overview s))
                  (canvas/handle! (current) event))
@@ -1255,6 +1397,120 @@
               0)))
       (load ok))))
 
+;;; Seconds after launch that the saved window frame is held.
+(const WINDOW-SETTLE 3.0)
+
+;;; Record the window's frame in the saved state when it has changed. Not while full
+;;; screen or minimized: those are not the size to come back to.
+(defn remember-window-frame! [] (-> void)
+  (when (not (.window-pending (shell))) (record-window-frame!) 0)
+  (do))
+
+(defn record-window-frame! [] (-> i64)
+  (let [s (shell)
+        window (.window s)
+        r (msg Rect window (sel c"frame") [])
+        full-screen
+          (!= (& (msg u64 window (sel c"styleMask") []) (: 16384 u64))
+              (: 0 u64))
+        minimized (!= (msg i8 window (sel c"isMiniaturized") []) (: 0 i8))
+        stored (storage/get (.model s) c"window")
+        same
+          (and (storage/numeric? stored c"width")
+               (= (storage/value stored c"x") (.x r))
+               (= (storage/value stored c"y") (.y r))
+               (= (storage/value stored c"width") (.w r))
+               (= (storage/value stored c"height") (.h r)))]
+    (when (not (or full-screen minimized same))
+      (let [frame (storage/dictionary)]
+        (storage/put! frame c"x" (storage/number (.x r)))
+        (storage/put! frame c"y" (storage/number (.y r)))
+        (storage/put! frame c"width" (storage/number (.w r)))
+        (storage/put! frame c"height" (storage/number (.h r)))
+        (storage/put! (.model s) c"window" frame)
+        (when (> (count) 0) (set! (.dirty (project 0)) true) 0)
+        0))
+    0))
+
+;;; Stage Manager centers a newly launched window at a size of its own, just after it
+;;; appears. For a moment after launch put the saved frame back, and record nothing:
+;;; that frame is not one the user chose. Pressing the mouse ends it, as they may be
+;;; moving the window themselves.
+(defn hold-window-frame! [(now f64)] (-> void)
+  (let [s (shell)]
+    (when (.window-pending s)
+      (when (= (.window-settle-until s) 0.0)
+        (set! (.window-settle-until s) (+ now WINDOW-SETTLE))
+        0)
+      (if (or (> now (.window-settle-until s))
+              (!= (msg u64 (class c"NSEvent") (sel c"pressedMouseButtons") [])
+                  (: 0 u64)))
+          (set! (.window-pending s) false)
+          (let [r (msg Rect (.window s) (sel c"frame") [])
+                wanted (.window-target s)]
+            (when (or (!= (.x r) (.x wanted))
+                      (!= (.y r) (.y wanted))
+                      (!= (.w r) (.w wanted))
+                      (!= (.h r) (.h wanted)))
+              (msg i64
+                   (.window s)
+                   (sel c"setFrame:display:")
+                   [Rect i8]
+                   wanted
+                   (: 1 i8))
+              0)
+            0))
+      0)
+    (do)))
+
+;;; The screen a saved frame belongs on: the one holding its center, or the main one.
+(defn screen-area [(r Rect)] (-> Rect)
+  (let [screens (msg (ptr i8) (class c"NSScreen") (sel c"screens") [])
+        (mut found)
+          (msg Rect
+               (msg (ptr i8) (class c"NSScreen") (sel c"mainScreen") [])
+               (sel c"visibleFrame")
+               [])
+        x (+ (.x r) (/ (.w r) 2.0))
+        y (+ (.y r) (/ (.h r) 2.0))]
+    (for [i 0 (storage/count screens)]
+      (let [screen (storage/at screens i)
+            f (msg Rect screen (sel c"frame") [])]
+        (when (and (>= x (.x f))
+                   (< x (+ (.x f) (.w f)))
+                   (>= y (.y f))
+                   (< y (+ (.y f) (.h f))))
+          (set! found (msg Rect screen (sel c"visibleFrame") []))
+          0)))
+    (load found)))
+
+;;; Reopen at the saved size, shifted fully on screen. AppKit's own frame autosave is
+;;; not used: restoring a window flush with a screen edge, it clamps the window
+;;; narrower and then saves that. As original Jim found, a window must be moved to
+;;; fit, not shrunk, unless it is larger than the screen.
+(defn restore-window-frame! [(window (ptr i8)) (saved (ptr i8))] (-> void)
+  (let [stored (storage/get saved c"window")]
+    (if (storage/numeric? stored c"width")
+        (let [r
+                (rect (storage/value stored c"x")
+                      (storage/value stored c"y")
+                      (max (storage/value stored c"width") 900.0)
+                      (max (storage/value stored c"height") 580.0))]
+          (let [fitted (fit-rect r (screen-area r))]
+            (msg i64
+                 window
+                 (sel c"setFrame:display:")
+                 [Rect i8]
+                 fitted
+                 (: 0 i8))
+            (set! (.window-target (shell)) fitted)
+            (set! (.window-pending (shell)) true)
+            (do)))
+        ; A frame saved by the autosave this replaced.
+        (do
+          (msg i8 window (sel c"setFrameUsingName:") [(ptr i8)] (ns c"Jim"))
+          (do)))))
+
 (defn setup! [] (-> bool)
   (let [s (shell)
         app
@@ -1303,6 +1559,7 @@
           (msg i64 window (sel c"setTitle:") [(ptr i8)] (ns c"Jim · Coil"))
           (msg i64 window (sel c"setReleasedWhenClosed:") [i8] (: 0 i8))
           (msg i64 window (sel c"setMinSize:") [Size] (Size :w 900.0 :h 580.0))
+          (restore-window-frame! window saved)
           (msg i64
                window
                (sel c"setAcceptsMouseMovedEvents:")
@@ -1469,7 +1726,9 @@
                                       (sel c"dateWithTimeIntervalSinceNow:")
                                       [f64]
                                       (if (or (widget-view/any-animating?)
+                                              (dictation/active?)
                                               (coasting?)
+                                              (.window-pending s)
                                               (> (.settle-at s) 0.0))
                                           (/ 1.0 60.0)
                                           0.2))
@@ -1490,6 +1749,16 @@
                             (if (>= action 0) (invoke! action) (do)))
                           (let [action (sidebar/take-action!)]
                             (if (!= action -1) (invoke! action) (do)))
+                          (let [dropped (terminal/take-dropped!)]
+                            (when (and (!= (p/cast i64 dropped) 0)
+                                       (>= (.selected s) 0)
+                                       (not (.overview s)))
+                              (canvas/focus-terminal! (current) dropped)
+                              0))
+                          (let [picked (palette/take-pick!)]
+                            (when (>= picked 0)
+                              (import-original-project! picked)
+                              0))
                           (let [action (palette/take-submission!)]
                             (if (>= action 0)
                                 (submit! action (palette/text))
@@ -1510,6 +1779,7 @@
                                                (* 1000.0
                                                   (- (timings/now) start)))))
                           (release frame-pool)))))
+                  (remember-window-frame!)
                   (save-layout!)
                   (palette/free!)
                   (timings/free!)

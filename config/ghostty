@@ -11,5 +11,9 @@ confirm-close-surface = false
 clipboard-read = deny
 clipboard-write = allow
 
+# Original Jim moves about a line per 9 points of trackpad travel on a Retina
+# display. Ghostty's core, unscaled, moves one per cell height in pixels.
+mouse-scroll-multiplier = precision:4,discrete:3
+
 # Invalid input should never produce an audible bell.
 bell-features = no-system,no-audio

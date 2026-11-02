@@ -5,6 +5,7 @@
 
 (deftest command-t-opens-terminal-but-plain-t-does-not
   (assert (= (actions/key-action (: 17 u16) (: 1048576 u64)) 0))
+  (assert (= (actions/key-action (: 17 u16) (: 1179648 u64)) 31))
   (assert (= (actions/key-action (: 17 u16) (: 0 u64)) -1))
   (assert (= (actions/key-action (: 45 u16) (: 1048576 u64)) 0)))
 
@@ -42,3 +43,22 @@
   (assert (= (actions/key-action (: 14 u16) (: 1179648 u64)) 29))
   (assert (= (actions/key-action (: 14 u16) (: 1048576 u64)) -1))
   (assert (>= (actions/match-score (ns c"mission control") 29) 0)))
+
+(deftest the-palette-scrolls-only-as-far-as-its-rows
+  (assert (= (palette/scrolled-offset 0 40 3) 3))
+  (assert (= (palette/scrolled-offset 3 40 -1) 2))
+  (assert (= (palette/scrolled-offset 1 40 -5) 0))
+  (assert (= (palette/scrolled-offset 28 40 5) 30))
+  (assert (= (palette/scrolled-offset 0 6 5) 0))
+  (assert (= (palette/scrolled-offset 0 0 -2) 0)))
+
+(deftest scrolling-keeps-the-selection-on-a-visible-row
+  (assert (= (palette/selection-in-view 0 3) 3))
+  (assert (= (palette/selection-in-view 20 3) 12))
+  (assert (= (palette/selection-in-view 7 3) 7)))
+
+(deftest a-pick-is-consumed-exactly-once
+  (let [state (palette/state)]
+    (set! (.picked state) 2)
+    (assert (= (palette/take-pick!) 2))
+    (assert (= (palette/take-pick!) -1))))

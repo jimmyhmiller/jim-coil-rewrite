@@ -13,6 +13,10 @@ extern "c" fn jim_session_send(c_int, u32, ?[*]const u8, usize) c_int;
 extern "c" fn jim_session_receive(c_int, *u32, [*]u8, usize) c_int;
 extern "c" fn jim_session_shutdown(c_int) void;
 extern "c" fn jim_session_close(c_int) void;
+extern "c" fn jim_session_log_client(c_int, [*:0]const u8, ?[*:0]const u8) void;
+extern "c" fn jim_session_readable(c_int, c_int) c_int;
+/// How long a service may leave an attach unanswered before the log says so.
+const attach_patience_ms = 5000;
 
 fd: c_int,
 reader: ?std.Thread = null,
@@ -45,6 +49,8 @@ pub fn deinit(self: *Session) void {
 pub fn initTerminal(self: *Session, t: *terminal.Terminal) void {
     self.cols = t.cols;
     self.rows = t.rows;
+    self.width = @intCast(@min(t.width_px, 65535));
+    self.height = @intCast(@min(t.height_px, 65535));
     const defaults = [_]terminal.color.RGB{
         t.colors.foreground.default orelse .{ .r = 255, .g = 255, .b = 255 },
         t.colors.background.default orelse .{ .r = 0, .g = 0, .b = 0 },
@@ -69,6 +75,9 @@ pub fn threadEnter(self: *Session, allocator: Allocator, io: *termio.Termio, td:
     td.backend = .{ .session = .{} };
     io.terminal_stream.handler.session_render_only = true;
     io.terminal_stream.handler.session_replaying = true;
+    io.renderer_state.mutex.lockUncancelable(global.io());
+    io.renderer_state.session_replaying = true;
+    io.renderer_state.mutex.unlock(global.io());
     try self.sendSize(3);
     self.writer = try std.Thread.spawn(.{}, writeLoop, .{self});
     errdefer {
@@ -130,6 +139,19 @@ fn enqueue(self: *Session, kind: u32, bytes: []const u8) !void {
     self.queue_mutex.lockUncancelable(global.io());
     defer self.queue_mutex.unlock(global.io());
     if (self.closed.load(.acquire)) return error.SessionDisconnected;
+    // Only the newest size matters. Sending every size a surface passed through while
+    // the history replayed would resize the shell to each of them in turn.
+    if (kind == 3) {
+        var queued = self.head;
+        while (queued) |waiting| : (queued = waiting.next) {
+            if (waiting.kind == 3) {
+                @memcpy(waiting.bytes, frame.bytes);
+                self.allocator.free(frame.bytes);
+                self.allocator.destroy(frame);
+                return;
+            }
+        }
+    }
     // Configure defaults before any input queued while the history was replaying.
     if (kind == 5) {
         frame.next = self.head;
@@ -164,13 +186,36 @@ fn writeLoop(self: *Session) void {
         }
     }
 }
+fn endReplay(io: *termio.Termio) void {
+    io.renderer_state.mutex.lockUncancelable(global.io());
+    io.terminal_stream.handler.session_replaying = false;
+    io.renderer_state.session_replaying = false;
+    io.renderer_state.mutex.unlock(global.io());
+}
 fn readLoop(self: *Session, io: *termio.Termio) void {
     var buffer: [65536]u8 = undefined;
     var exited = false;
+    var reason: [*:0]const u8 = "receive-failed";
+    jim_session_log_client(self.fd, "attach-sent", null);
+    // A stuck service still accepts the connection, in the kernel, and then never
+    // speaks. Say so rather than show an empty pane forever.
+    var stalled = jim_session_readable(self.fd, attach_patience_ms) == 0;
+    if (stalled) {
+        jim_session_log_client(self.fd, "attach-unanswered", "service sent nothing in 5s");
+        io.renderer_state.mutex.lockUncancelable(global.io());
+        io.renderer_state.session_replaying = false;
+        io.renderer_state.mutex.unlock(global.io());
+        io.processOutput("[Terminal service is not responding. Still waiting for it.]\r\n");
+    }
     while (true) {
         var kind: u32 = 0;
         const n = jim_session_receive(self.fd, &kind, &buffer, buffer.len);
         if (n < 0) break;
+        if (stalled) {
+            stalled = false;
+            jim_session_log_client(self.fd, "attach-answered-late", null);
+            io.processOutput("\x1bc");
+        }
         const bytes = buffer[0..@intCast(n)];
         switch (kind) {
             16 => {
@@ -178,10 +223,16 @@ fn readLoop(self: *Session, io: *termio.Termio) void {
                 io.renderer_state.yieldToDemand(global.io());
             },
             3 => {
-                if (bytes.len != 8) break;
+                if (bytes.len != 8) {
+                    reason = "bad-size-frame";
+                    break;
+                }
                 const cols = std.mem.readInt(u16, bytes[0..2], .big);
                 const rows = std.mem.readInt(u16, bytes[2..4], .big);
-                if (cols == 0 or rows == 0) break;
+                if (cols == 0 or rows == 0) {
+                    reason = "zero-size-frame";
+                    break;
+                }
                 io.renderer_state.mutex.lockUncancelable(global.io());
                 io.terminal.resize(io.alloc, .{ .cols = cols, .rows = rows, .cell_size_px = .{
                     .width = std.mem.readInt(u16, bytes[4..6], .big) / cols,
@@ -196,11 +247,12 @@ fn readLoop(self: *Session, io: *termio.Termio) void {
             },
             17 => {
                 if (bytes.len == 1 and bytes[0] >= 1) {
-                    self.enqueue(5, &self.colors) catch break;
+                    self.enqueue(5, &self.colors) catch {
+                        reason = "enqueue-colors-failed";
+                        break;
+                    };
                 }
-                io.renderer_state.mutex.lockUncancelable(global.io());
-                io.terminal_stream.handler.session_replaying = false;
-                io.renderer_state.mutex.unlock(global.io());
+                endReplay(io);
                 self.queue_mutex.lockUncancelable(global.io());
                 self.ready.store(true, .release);
                 self.queue_changed.signal(global.io());
@@ -212,18 +264,26 @@ fn readLoop(self: *Session, io: *termio.Termio) void {
                 if (self.ready.load(.acquire)) io.processOutput("\r\n[Session exited]\r\n");
             },
             19 => {
-                io.processOutput("\r\n[Terminal service error]\r\n");
+                var line: [512]u8 = undefined;
+                io.processOutput(std.fmt.bufPrint(&line, "\r\n[Terminal service stopped: {s}]\r\n", .{bytes}) catch
+                    "\r\n[Terminal service stopped]\r\n");
+                if (bytes.len < buffer.len) {
+                    buffer[bytes.len] = 0;
+                    reason = @ptrCast(bytes.ptr);
+                }
                 break;
             },
-            else => break,
+            else => {
+                reason = "unknown-frame-kind";
+                break;
+            },
         }
     }
+    if (!self.stopping.load(.acquire)) jim_session_log_client(self.fd, "disconnected", reason);
     self.ready.store(false, .release);
     self.closeTransport();
-    if (!exited and !self.stopping.load(.acquire)) {
-        io.renderer_state.mutex.lockUncancelable(global.io());
-        io.terminal_stream.handler.session_replaying = false;
-        io.renderer_state.mutex.unlock(global.io());
-        io.processOutput("\r\n[Disconnected. Use Terminal: Reconnect in the action palette.]\r\n");
+    endReplay(io);
+    if (!self.stopping.load(.acquire)) {
+        io.processOutput(if (exited) "" else "\r\n[Disconnected. Use Terminal: Reconnect in the action palette.]\r\n");
     }
 }

@@ -1,0 +1,275 @@
+(module jim.original-test)
+(import "jim.original" :as original)
+(import "jim.projects" :as projects)
+(import "jim.storage" :as s)
+(import "jim.native" :use *)
+(import "jim.sessions" :as sessions)
+(import "jim.session.transport" :as transport)
+(import "coil.primitive" :as p)
+(import "coil.os" :as os)
+(import "coil.cc" :as cc)
+
+(extern mkdtemp :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+;;; The shape of a real ~/.jim/projects.json, reduced to what the import reads.
+(defn state [] (-> (ptr i8))
+  (original/parse (msg (ptr i8)
+                       (ns c"{\"active_workspace\":1,
+                \"workspaces\":[{\"id\":1,\"hidden\":[75]}],
+                \"projects\":[{\"id\":61,\"name\":\"Coil\",\"default_cwd\":\"/tmp/coil\"},
+                              {\"id\":75,\"name\":\"OO Lang\"}],
+                \"panes\":[
+                  {\"kind\":\"terminal\",\"project_id\":61,\"pos\":[10.0,20.0],\"size\":[640.0,400.0],\"config\":{\"session_id\":1960}},
+                  {\"kind\":\"script_widget\",\"project_id\":61,\"pos\":[0.0,0.0],\"size\":[300.0,130.0],\"config\":{\"session_id\":5}},
+                  {\"kind\":\"terminal\",\"project_id\":75,\"pos\":[-5.0,-9.0],\"size\":[99.0,9999.0],\"config\":{\"session_id\":758}},
+                  {\"kind\":\"terminal\",\"project_id\":75,\"pos\":[1.0,1.0],\"size\":[640.0,400.0],\"config\":{}}]}")
+                       (sel c"dataUsingEncoding:")
+                       [u64]
+                       4)))
+
+(deftest only-terminals-with-a-session-are-brought-across
+  (let [terminals (original/terminals (state))]
+    (assert (= (s/count terminals) 2))
+    (assert (= (original/session-id (s/at terminals 0)) 1960))
+    (assert (= (original/session-id (s/at terminals 1)) 758))))
+
+(deftest panes-find-their-project-and-directory
+  (let [saved (state)
+        terminals (original/terminals saved)
+        coil (original/project-of saved (s/at terminals 0))
+        lang (original/project-of saved (s/at terminals 1))]
+    (assert (= (msg i8
+                    (original/directory-of coil)
+                    (sel c"isEqualToString:")
+                    [(ptr i8)]
+                    (ns c"/tmp/coil"))
+               (: 1 i8)))
+    (assert (= (msg i8
+                    (original/directory-of lang)
+                    (sel c"hasPrefix:")
+                    [(ptr i8)]
+                    (ns c"/"))
+               (: 1 i8)))))
+
+(deftest bounds-keep-the-layout-restorable-and-the-pane-reachable
+  (let [terminals (original/terminals (state))
+        kept (original/bounds (s/at terminals 0) 100.0)
+        clamped (original/bounds (s/at terminals 1) 0.0)]
+    (assert (= (.x kept) 110.0))
+    (assert (= (.y kept) 20.0))
+    (assert (= (.w kept) 640.0))
+    (assert (= (.x clamped) 0.0))
+    (assert (= (.y clamped) 0.0))
+    (assert (= (.w clamped) 320.0))
+    (assert (= (.h clamped) 4096.0))))
+
+(deftest importing-again-finds-what-is-already-here
+  (let [root (projects/fresh)
+        record (projects/new-project! root (ns c"Coil"))
+        layout (s/dictionary)
+        panes (s/array)
+        pane (s/dictionary)]
+    (s/put! pane c"original" (s/number 1960.0))
+    (s/add! panes pane)
+    (s/put! layout c"panes" panes)
+    (s/put! record c"layout" layout)
+    (assert (original/imported? root 1960))
+    (assert (not (original/imported? root 758)))
+    (assert (= (projects/id (original/project-named root (ns c"Coil")))
+               (projects/id record)))
+    (assert (= (p/cast i64 (original/project-named root (ns c"Missing"))) 0))))
+
+(deftest a-daemon-named-twice-is-seen-once
+  (let [seen (s/array)]
+    (assert (not (original/listed? seen 7)))
+    (s/add! seen (s/number 7.0))
+    (assert (original/listed? seen 7))))
+
+(deftest original-sockets-are-where-original-jim-puts-them
+  (let [path (ns (sessions/original-socket 1960))]
+    (assert (= (msg i8
+                    path
+                    (sel c"hasPrefix:")
+                    [(ptr i8)]
+                    (ns c"/tmp/.terminal-bevy-"))
+               (: 1 i8)))
+    (assert (= (msg i8 path (sel c"hasSuffix:") [(ptr i8)] (ns c"/1960.sock"))
+               (: 1 i8)))))
+
+;;; Runs the real launcher and service, against a private directory. A daemon that is
+;;; gone must read as ENOENT, the signal to start a new shell, with no service left.
+(deftest adopting-a-daemon-that-is-gone-reports-enoent
+  (let [(mut template) (zeroed (array i8 64))
+        directory (p/cast (ptr i8) (mut template))
+        (mut socket) (zeroed (array i8 96))
+        (mut missing) (zeroed (array i8 96))]
+    (snprintf directory (: 64 u64) c"/tmp/jim-original-test-XXXXXX")
+    (assert (!= (p/cast i64 (mkdtemp directory)) 0))
+    (snprintf (p/cast (ptr i8) (mut socket)) (: 96 u64) c"%s/s.sock" directory)
+    (snprintf (p/cast (ptr i8) (mut missing))
+              (: 96 u64)
+              c"%s/gone.sock"
+              directory)
+    (let [fd
+            (transport/session-adopt (sessions/in-base c"build/jim-session")
+                                     (p/cast (ptr i8) (mut socket))
+                                     directory
+                                     (sessions/in-base c"build/ghostty/share/ghostty")
+                                     (p/cast (ptr i8) (mut missing)))]
+      (assert (= fd (: -1 i32)))
+      (assert (= (os/errno) transport/ENOENT))
+      (assert (not (transport/session-running? (p/cast (ptr i8) (mut socket))))))
+    (msg i8
+         (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+         (sel c"removeItemAtPath:error:")
+         [(ptr i8) (ptr i8)]
+         (ns directory)
+         (nil))
+    (do)))
+
+(defn saved-projects [] (-> (ptr i8))
+  (original/parse (msg (ptr i8)
+                       (ns c"{\"projects\":[{\"id\":1,\"name\":\"Quiet\",\"default_cwd\":\"/tmp/q\"},
+                              {\"id\":61,\"name\":\"Coil\",\"default_cwd\":\"/tmp/coil\"},
+                              {\"id\":75,\"name\":\"OO Lang\",\"default_cwd\":\"/tmp/oo\"}],
+                \"panes\":[
+                  {\"kind\":\"terminal\",\"project_id\":75,\"pos\":[0.0,0.0],\"size\":[640.0,400.0],\"config\":{\"session_id\":758}},
+                  {\"kind\":\"terminal\",\"project_id\":61,\"pos\":[0.0,0.0],\"size\":[640.0,400.0],\"config\":{\"session_id\":1960}},
+                  {\"kind\":\"terminal\",\"project_id\":61,\"pos\":[0.0,0.0],\"size\":[640.0,400.0],\"config\":{\"session_id\":1960}},
+                  {\"kind\":\"terminal\",\"project_id\":61,\"pos\":[0.0,0.0],\"size\":[640.0,400.0],\"config\":{\"session_id\":1961}}]}")
+                       (sel c"dataUsingEncoding:")
+                       [u64]
+                       4)))
+
+(defn id-at [(ids (ptr i8)) (i i64)] (-> i64)
+  (p/cast i64 (msg f64 (s/at ids i) (sel c"doubleValue") [])))
+
+(defn saved-project [(saved (ptr i8)) (id i64)] (-> (ptr i8))
+  (projects/find (s/get saved c"projects") id))
+
+(defn equal? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (= (msg i8 a (sel c"isEqualToString:") [(ptr i8)] (ns b)) (: 1 i8)))
+
+(deftest a-project-comes-across-alone-with-its-directory
+  (let [root (projects/fresh)
+        saved (saved-projects)
+        record (original/add-project! root (saved-project saved 75))]
+    (assert (= (s/count (projects/list root)) 1))
+    (assert (equal? (s/get record c"directory") c"/tmp/oo"))
+    (assert (= (projects/active root) (projects/id record)))
+    (assert (projects/valid? root))))
+
+(deftest the-picker-offers-projects-with-terminals-first
+  (let [root (projects/fresh)
+        saved (saved-projects)
+        ids (original/choices root saved false)]
+    (assert (= (s/count ids) 3))
+    (assert (= (id-at ids 0) 61))
+    (assert (= (id-at ids 1) 75))
+    (assert (= (id-at ids 2) 1))
+    (assert (equal? (original/choice-title root
+                                           saved
+                                           (saved-project saved 61)
+                                           false)
+                    c"Coil  ·  2 terminals"))
+    (assert (equal? (original/choice-title root
+                                           saved
+                                           (saved-project saved 75)
+                                           false)
+                    c"OO Lang  ·  1 terminal"))
+    (assert (equal? (original/choice-title root
+                                           saved
+                                           (saved-project saved 1)
+                                           false)
+                    c"Quiet"))))
+
+(deftest a-daemon-named-twice-is-one-terminal
+  (let [root (projects/fresh)
+        saved (saved-projects)]
+    (assert (= (s/count (original/pending-terminals root
+                                                    saved
+                                                    (saved-project saved 61)
+                                                    false))
+               2))))
+
+(deftest a-project-stays-on-offer-only-while-something-is-left
+  (let [root (projects/fresh)
+        saved (saved-projects)
+        coil (saved-project saved 61)
+        quiet (saved-project saved 1)
+        record (original/add-project! root coil)
+        layout (s/dictionary)
+        panes (s/array)
+        pane (s/dictionary)]
+    (original/add-project! root quiet)
+    ; Here by name, with its terminals still to come.
+    (assert (original/importable? root saved coil false))
+    (assert (not (original/importable? root saved quiet false)))
+    (s/put! pane c"original" (s/number 1960.0))
+    (s/add! panes pane)
+    (s/put! layout c"panes" panes)
+    (s/put! record c"layout" layout)
+    (assert (original/importable? root saved coil false))
+    (let [second (s/dictionary)]
+      (s/put! second c"original" (s/number 1961.0))
+      (s/add! panes second))
+    (assert (not (original/importable? root saved coil false)))))
+
+(deftest a-saved-project-needs-an-id-and-a-name
+  (let [good (s/dictionary)
+        nameless (s/dictionary)]
+    (s/put! good c"id" (s/number 1.0))
+    (s/put! good c"name" (ns c"Coil"))
+    (s/put! nameless c"id" (s/number 2.0))
+    (assert (original/project? good))
+    (assert (not (original/project? nameless)))))
+
+(extern setenv :cc (cc/C) [(ptr i8) (ptr i8) i32] (-> i32))
+
+(extern unsetenv :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern getpid :cc (cc/C) [] (-> i32))
+
+(defn write-file! [(path (ptr i8)) (contents (ptr i8))] (-> void)
+  (msg i8
+       (ns contents)
+       (sel c"writeToFile:atomically:encoding:error:")
+       [(ptr i8) i8 u64 (ptr i8)]
+       (ns path)
+       (: 1 i8)
+       (: 4 u64)
+       (nil))
+  (do))
+
+;;; A daemon is known alive from its files alone. A socket that exists here is a plain
+;;; file, so a connection attempt could not succeed: this also shows none is needed.
+(deftest a-daemon-is-known-alive-without-connecting-to-it
+  (let [(mut template) (zeroed (array i8 32))
+        directory (p/cast (ptr i8) (mut template))]
+    (snprintf directory (: 32 u64) c"/tmp/jim-alive-XXXXXX")
+    (assert (!= (p/cast i64 (mkdtemp directory)) 0))
+    (setenv c"TERMINAL_BEVY_RUNTIME_DIR" directory 1)
+    ; Nothing there yet.
+    (assert (not (sessions/original-alive? 7)))
+    ; A socket and the pid of a live process.
+    (write-file! (sessions/original-socket 7) c"")
+    (write-file! (sessions/original-file 7 c".pid")
+                 (utf8 (indexed-string c"" (p/cast i64 (getpid)) c"")))
+    (assert (sessions/original-alive? 7))
+    ; A pid no process can have.
+    (write-file! (sessions/original-file 7 c".pid") c"99999999")
+    (assert (not (sessions/original-alive? 7)))
+    ; A live process but no socket.
+    (write-file! (sessions/original-file 8 c".pid")
+                 (utf8 (indexed-string c"" (p/cast i64 (getpid)) c"")))
+    (assert (not (sessions/original-alive? 8)))
+    (unsetenv c"TERMINAL_BEVY_RUNTIME_DIR")
+    (msg i8
+         (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+         (sel c"removeItemAtPath:error:")
+         [(ptr i8) (ptr i8)]
+         (ns directory)
+         (nil))
+    (do)))

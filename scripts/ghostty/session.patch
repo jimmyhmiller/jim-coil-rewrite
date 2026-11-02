@@ -188,13 +188,13 @@
  
      /// The current title of the surface. The embedded apprt saves this so
      /// that getTitle works without the implementer needing to save it.
-@@ -502,10 +503,14 @@
+@@ -502,16 +503,20 @@
      };
  
      pub fn init(self: *Surface, app: *App, opts: Options) !void {
-+        return self.initSession(app, opts, -1);
++        return self.initSession(app, opts, -1, 800, 600);
 +    }
-+    pub fn initSession(self: *Surface, app: *App, opts: Options, fd: c_int) !void {
++    pub fn initSession(self: *Surface, app: *App, opts: Options, fd: c_int, width: u32, height: u32) !void {
          self.* = .{
              .app = app,
              .platform = try .init(opts.platform_tag, opts.platform),
@@ -203,18 +203,25 @@
              .core_surface = undefined,
              .content_scale = .{
                  .x = @floatCast(opts.scale_factor),
+                 .y = @floatCast(opts.scale_factor),
+             },
+-            .size = .{ .width = 800, .height = 600 },
++            .size = .{ .width = width, .height = height },
+             .cursor_pos = .{ .x = -1, .y = -1 },
+         };
+ 
 @@ -1856,6 +1861,21 @@
          return try app.newSurface(opts.*);
      }
  
 +    extern "c" fn jim_session_close(fd: c_int) void;
-+    export fn ghostty_surface_new_session(app: *App, opts: *const Surface.Options, fd: c_int) ?*Surface {
++    export fn ghostty_surface_new_session(app: *App, opts: *const Surface.Options, fd: c_int, width: u32, height: u32) ?*Surface {
 +        const surface = app.core_app.alloc.create(Surface) catch {
 +            jim_session_close(fd);
 +            return null;
 +        };
 +        surface.session_fd = fd;
-+        surface.initSession(app, opts.*, fd) catch |err| {
++        surface.initSession(app, opts.*, fd, width, height) catch |err| {
 +            if (surface.session_fd >= 0) jim_session_close(surface.session_fd);
 +            log.err("error initializing session surface: {}", .{err});
 +            app.core_app.alloc.destroy(surface);
@@ -224,6 +231,25 @@
 +    }
      export fn ghostty_surface_free(ptr: *Surface) void {
          ptr.app.closeSurface(ptr);
+     }
+@@ -2140,6 +2160,18 @@
+ 
+     /// Returns true if the surface currently has mouse capturing
+     /// enabled.
++    /// Whether what is written here can later be taken back with DEL: a line editor
++    /// on the primary screen, taking pastes as text, and not grabbing the mouse.
++    export fn ghostty_surface_revisable(surface: *Surface) bool {
++        const core = &surface.core_surface;
++        core.renderer_state.mutex.lockUncancelable(global.io());
++        defer core.renderer_state.mutex.unlock(global.io());
++        const t = &core.io.terminal;
++        return t.modes.get(.bracketed_paste) and
++            t.screens.active_key == .primary and
++            t.flags.mouse_event == .none;
++    }
++
+     export fn ghostty_surface_mouse_captured(surface: *Surface) bool {
+         return surface.core_surface.mouseCaptured();
      }
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
@@ -331,3 +357,41 @@
      });
      const runtime_str = try alloc.print("{d} ms", .{info.runtime_ms});
  
+--- a/src/renderer/State.zig
++++ b/src/renderer/State.zig
+@@ -32,6 +32,10 @@
+ /// Mouse state. This only contains state relevant to what renderers
+ /// need about the mouse.
+ mouse: Mouse = .{},
++
++/// True while a Jim session replays its history. Frames are held until it ends,
++/// so the history is not seen scrolling past. Protected by the mutex.
++session_replaying: bool = false,
+ 
+ /// The number of threads currently waiting to acquire `mutex` via
+ /// `lockDemand`. This is not protected by the mutex; it is read by
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -1420,6 +1420,9 @@
+                 state.lockDemand(global.io());
+                 defer state.unlockDemand(global.io());
+ 
++                // A session replaying its history shows it only once complete.
++                if (state.session_replaying) return;
++
+                 // If we're in a synchronized output state, we pause all rendering.
+                 if (state.terminal.modes.get(.synchronized_output)) {
+                     log.debug("synchronized output started, skipping render", .{});
+@@ -1766,7 +1769,12 @@
+             // If we have no graphics context we can't draw. This is
+             // only the case while unrealized (GTK) or after the render
+             // thread exits; displayRealized rebuilds the swap chain.
+             if (!self.display_realized) return false;
++
++            // A Jim session holding frames for its replay has built nothing yet: the
++            // grid size is undefined and the background buffer has one cell, so the
++            // shader would read past it and draw whatever memory follows.
++            if (self.cells.size.rows == 0 or self.cells.size.columns == 0) return false;
+ 
+             // Get our swap chain, rebuilding it if it was released
+             // while we were hidden. Rebuilding is deferred to draw

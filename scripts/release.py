@@ -183,7 +183,8 @@ def main():
             'CFBundleExecutable': 'jim-coil', 'CFBundlePackageType': 'APPL',
             'CFBundleShortVersionString': version, 'CFBundleVersion': version,
             'LSMinimumSystemVersion': minimum_macos(app_binary),
-            'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication'}, f)
+            'NSHighResolutionCapable': True,
+            'NSMicrophoneUsageDescription': 'Jim transcribes your speech into the focused terminal when you start dictation.', 'NSPrincipalClass': 'NSApplication'}, f)
 
     # The app, its libraries and the code in Resources (jim-session) may reach
     # only into the bundle and macOS.

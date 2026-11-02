@@ -1,0 +1,596 @@
+(module jim.dictation)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "jim.native" :use *)
+(import "jim.ghostty" :as g)
+(import "jim.dictation-core" :as core)
+(import "jim.session.transport" :as transport)
+
+;;; Hands-free dictation, as in original Jim. ⌘⇧T starts it and Escape or ⌘⇧T stops it.
+;;; Words appear in the focused terminal while you speak and settle as the engine gets
+;;; more context. The target is chosen when dictation starts, and focus can move on.
+;;;
+;;; A terminal is a byte stream and a paste can't be unsent, so a revision is DEL × n
+;;; then the new text, which only means "delete what we wrote" to a line editor. It is
+;;; sent only while the child passes `ghostty_surface_revisable`. A child that fails
+;;; never gets a preview: its transcript stays on the pill and lands as one paste at the
+;;; end. Typing during dictation ends it, since DELs would then delete what was typed.
+
+(extern pthread_create
+        :cc
+        (cc/C)
+        [(ptr u64) (ptr i8) (ptr i8) (ptr i8)]
+        (-> i32))
+
+(extern pthread_detach :cc (cc/C) [u64] (-> i32))
+
+(extern pthread_mutex_init :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern pthread_mutex_lock :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern pthread_mutex_unlock :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern usleep :cc (cc/C) [u32] (-> i32))
+
+(extern free :cc (cc/C) [(ptr i8)] (-> void))
+
+(extern strlen :cc (cc/C) [(ptr i8)] (-> u64))
+
+(extern malloc :cc (cc/C) [u64] (-> (ptr i8)))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+(extern memcpy :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(defstruct AudioFormat
+  [(sample-rate f64)
+   (format-id u32)
+   (flags u32)
+   (bytes-per-packet u32)
+   (frames-per-packet u32)
+   (bytes-per-frame u32)
+   (channels u32)
+   (bits u32)
+   (reserved u32)])
+
+(static-assert (= (sizeof AudioFormat) 40)
+               "AudioStreamBasicDescription ABI size")
+
+(extern AudioQueueNewInput
+        :cc
+        (cc/C)
+        [(ptr AudioFormat)
+         (ptr i8)
+         (ptr i8)
+         (ptr i8)
+         (ptr i8)
+         u32
+         (ptr (ptr i8))]
+        (-> i32))
+
+(extern AudioQueueAllocateBuffer
+        :cc
+        (cc/C)
+        [(ptr i8) u32 (ptr (ptr i8))]
+        (-> i32))
+
+(extern AudioQueueEnqueueBuffer
+        :cc
+        (cc/C)
+        [(ptr i8) (ptr i8) u32 (ptr i8)]
+        (-> i32))
+
+(extern AudioQueueStart :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern AudioQueueStop :cc (cc/C) [(ptr i8) u8] (-> i32))
+
+(extern AudioQueueDispose :cc (cc/C) [(ptr i8) u8] (-> i32))
+
+(const LINEAR-PCM 1819304813)
+
+;;; kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+(const FLOAT-PACKED 9)
+
+;;; 100 ms of 32-bit samples.
+(const BUFFER-BYTES 6400)
+
+;;; AudioQueueBuffer: mAudioData at 8, mAudioDataByteSize at 16.
+(const BUFFER-DATA-OFFSET 8)
+
+(const BUFFER-SIZE-OFFSET 16)
+
+(const ERROR-SECONDS 5.0)
+
+(const PILL-WIDTH 420.0)
+
+(const PILL-HEIGHT 30.0)
+
+(const PILL-TOP 64.0)
+
+(const IDLE 0)
+
+(const LISTENING 1)
+
+(const FINISHING 2)
+
+;;; ---- shared with the audio and worker threads, under the mutex ---------------------
+
+(defstruct Shared
+  [(mutex (array i8 64))
+   (pending core/Samples)
+   (stop bool)
+   (done bool)
+   (failed bool)
+   (text (ptr i8))
+   (fresh bool)
+   (capturing bool)])
+
+(defn shared [] (-> (ptr Shared))
+  (p/alloc-static Shared))
+
+(defn lock! [] (-> i64)
+  (pthread_mutex_lock (p/cast (ptr i8) (field (shared) mutex)))
+  0)
+
+(defn unlock! [] (-> i64)
+  (pthread_mutex_unlock (p/cast (ptr i8) (field (shared) mutex)))
+  0)
+
+;;; The audio queue's thread. Under the mutex, because the worker drains PENDING.
+(defn on-audio [(user (ptr i8))
+                (queue (ptr i8))
+                (buffer (ptr i8))
+                (time (ptr i8))
+                (packets u32)
+                (description (ptr i8))] (-> void)
+  (let [data (load (p/cast (ptr (ptr f32)) (index buffer BUFFER-DATA-OFFSET)))
+        bytes (load (p/cast (ptr u32) (index buffer BUFFER-SIZE-OFFSET)))
+        s (shared)]
+    (lock!)
+    (core/samples-push! (field s pending)
+                        data
+                        (/ (p/cast i64 bytes) 4))
+    (let [capturing (.capturing s)]
+      (unlock!)
+      (when capturing
+        (AudioQueueEnqueueBuffer queue buffer (: 0 u32) (p/cast (ptr i8) 0))
+        0))
+    (do)))
+
+(export-c [on-audio :as "jim_dictation_on_audio"])
+
+;;; Publish TEXT, which the main thread then owns, in place of any it hasn't taken.
+(defn publish! [(text (ptr i8))] (-> i64)
+  (let [s (shared)]
+    (lock!)
+    (when (!= (p/cast i64 (.text s)) 0) (free (.text s)) (do))
+    (set! (.text s) text)
+    (set! (.fresh s) true)
+    (unlock!)
+    0))
+
+(defn finish-worker! [(failed bool)] (-> i64)
+  (let [s (shared)]
+    (lock!)
+    (set! (.failed s) failed)
+    (set! (.done s) true)
+    (unlock!)
+    0))
+
+;;; Move what's been captured into the session. Whether to stop comes back with it, read
+;;; under the same lock, so a stop means all the captured audio has been taken.
+(defn drain! [(session (ptr core/Session))] (-> bool)
+  (let [s (shared)
+        pending (field s pending)]
+    (lock!)
+    (let [stop (.stop s)
+          taken (load pending)]
+      (set! pending (zeroed core/Samples))
+      (unlock!)
+      (when (> (.len taken) 0)
+        (core/session-push! session (.data taken) (.len taken))
+        0)
+      (free (p/cast (ptr i8) (.data taken)))
+      stop)))
+
+(defn worker-main [(argument (ptr i8))] (-> (ptr i8))
+  (let [(mut session) (zeroed core/Session)
+        state (p/cast (ptr core/Session) (mut session))]
+    (core/session-init! state)
+    (block
+      :done
+        (loop (if (drain! state)
+                  (let [ok (core/session-finish! state)]
+                    (when ok (publish! (core/session-text state)) 0)
+                    (finish-worker! (not ok))
+                    (return-from :done 0))
+                  (let [step (core/session-step! state)]
+                    (cond (< step 0)
+                            (do (finish-worker! true) (return-from :done 0))
+                          (> step 0) (publish! (core/session-text state))
+                          :else 0)
+                    (usleep (: 30000 u32))))))
+    (core/session-free! state)
+    (p/cast (ptr i8) 0)))
+
+(export-c [worker-main :as "jim_dictation_worker"])
+
+;;; ---- the main thread -----------------------------------------------------------------
+
+(defstruct State
+  [(phase i64)
+   (target (ptr i8))
+   (detached bool)
+   (inserted (ptr i8))
+   (preview (ptr i8))
+   (in-place bool)
+   (queue (ptr i8))
+   (pill (ptr i8))
+   (label (ptr i8))
+   (message-until f64)
+   (mutex-ready bool)])
+
+(defn state [] (-> (ptr State))
+  (p/alloc-static State))
+
+(defn listening? [] (-> bool)
+  (= (.phase (state)) LISTENING))
+
+(defn active? [] (-> bool)
+  (!= (.phase (state)) IDLE))
+
+;;; The session being dictated into, so the caller can find its surface again: a pane
+;;; can reconnect or close while dictation runs.
+(defn target [] (-> (ptr i8))
+  (.target (state)))
+
+(defn replace-string! [(cell (ptr (ptr i8))) (value (ptr i8))] (-> i64)
+  (when (!= (p/cast i64 (load cell)) 0) (free (load cell)) (do))
+  (set! cell value)
+  0)
+
+;;; ---- the pill -------------------------------------------------------------------------
+
+(defn ensure-pill! [(root (ptr i8))] (-> i64)
+  (let [s (state)]
+    (when (= (p/cast i64 (.pill s)) 0)
+      (let [pill (view root (rect 0.0 0.0 PILL-WIDTH PILL-HEIGHT))]
+        (msg i64 (layer pill) (sel c"setCornerRadius:") [f64] 15.0)
+        (msg i64 (layer pill) (sel c"setBorderWidth:") [f64] 1.0)
+        (msg i64
+             (layer pill)
+             (sel c"setBorderColor:")
+             [(ptr i8)]
+             (msg (ptr i8) (color 0.25 0.33 0.42 1.0) (sel c"CGColor") []))
+        (msg i64
+             (layer pill)
+             (sel c"setBackgroundColor:")
+             [(ptr i8)]
+             (msg (ptr i8) (color 0.08 0.10 0.13 0.96) (sel c"CGColor") []))
+        (set! (.pill s) pill)
+        (set! (.label s)
+              (label pill
+                     c""
+                     (rect 14.0 6.0 (- PILL-WIDTH 28.0) 18.0)
+                     12.0
+                     false))
+        (msg i64
+             (.label s)
+             (sel c"setLineBreakMode:")
+             [u64]
+             (: 3 u64))
+        (msg i64 pill (sel c"setHidden:") [i8] (: 1 i8))
+        0))
+    0))
+
+(defn pill-text! [(root (ptr i8)) (text (ptr i8))] (-> i64)
+  (let [s (state)
+        bounds (msg Rect root (sel c"bounds") [])
+        flipped (!= (msg i8 root (sel c"isFlipped") []) (: 0 i8))]
+    (ensure-pill! root)
+    (frame! (.pill s)
+            (rect (/ (- (.w bounds) PILL-WIDTH) 2.0)
+                  (if flipped
+                      PILL-TOP
+                      (- (.h bounds) (+ PILL-TOP PILL-HEIGHT)))
+                  PILL-WIDTH
+                  PILL-HEIGHT))
+    (msg i64 (.label s) (sel c"setStringValue:") [(ptr i8)] (ns text))
+    (msg i64
+         root
+         (sel c"addSubview:positioned:relativeTo:")
+         [(ptr i8) i64 (ptr i8)]
+         (.pill s)
+         1
+         (nil))
+    (msg i64 (.pill s) (sel c"setHidden:") [i8] (: 0 i8))
+    0))
+
+(defn pill-hide! [] (-> i64)
+  (let [pill (.pill (state))]
+    (when (!= (p/cast i64 pill) 0)
+      (msg i64 pill (sel c"setHidden:") [i8] (: 1 i8))
+      0)
+    0))
+
+(defn listening-text! [(root (ptr i8))] (-> i64)
+  (let [s (state)
+        (mut line) (zeroed (array i8 300))
+        out (p/cast (ptr i8) (mut line))
+        preview (.preview s)]
+    (snprintf out
+              (: 300 u64)
+              (cond (= (.phase s) FINISHING) c"Finishing… %s"
+                    (.detached s) c"Stopped writing · %s"
+                    :else c"● Listening · Esc to stop  %s")
+              (if (= (p/cast i64 preview) 0)
+                  c""
+                  (index preview (core/tail-start preview 56))))
+    (pill-text! root out)
+    0))
+
+;;; ---- writing to the terminal -------------------------------------------------------
+
+(defn send-deletes! [(surface (ptr i8)) (count i64)] (-> i64)
+  (when (> count 0)
+    (let [size (+ 6 (* 4 count))
+          action (malloc (p/cast u64 (+ size 1)))]
+      (memcpy action c"text:" (: 5 u64))
+      (for [i 0 count]
+        (memcpy (index action (+ 5 (* i 4))) c"\\x7f" (: 4 u64)))
+      (set! (index action (+ 5 (* count 4))) (: 0 i8))
+      (g/ghostty_surface_binding_action surface
+                                        action
+                                        (p/cast u64 (+ 5 (* count 4))))
+      (free action)
+      0))
+  0)
+
+;;; Make the text at the prompt read TEXT, retyping only what differs from what's there.
+(defn write-text! [(surface (ptr i8)) (text (ptr i8)) (final bool)] (-> i64)
+  (let [s (state)
+        flat (core/flatten-text text)
+        inserted (.inserted s)
+        had-text (!= (p/cast i64 inserted) 0)]
+    (replace-string! (field s preview) (core/flatten-text flat))
+    (let [revisable
+            (and (!= (p/cast i64 surface) 0)
+                 (g/ghostty_surface_revisable surface))]
+      (cond (.detached s) 0
+            (= (p/cast i64 surface) 0)
+              (do
+                (set! (.detached s) true)
+                (transport/log! c"dictation target-gone" 0 0 0 0)
+                0)
+            (and had-text (not revisable))
+              (do
+                (set! (.detached s) true)
+                (transport/log! c"dictation target-started-full-screen-program"
+                                0
+                                0
+                                0
+                                0)
+                0)
+            (and (not final) (not revisable)) 0
+            :else
+              (let [shared-bytes
+                      (if had-text (core/common-prefix inserted flat) 0)
+                    deletes
+                      (if had-text
+                          (core/char-count (index inserted shared-bytes))
+                          0)
+                    rest (index flat shared-bytes)
+                    rest-size (strlen rest)]
+                (send-deletes! surface deletes)
+                (when (> rest-size (: 0 u64))
+                  (g/ghostty_surface_text surface rest rest-size)
+                  0)
+                (replace-string! (field s inserted) (core/flatten-text flat))
+                0)))
+    (free flat)
+    0))
+
+;;; ---- starting and stopping ---------------------------------------------------------
+
+(defn microphone-denied? [] (-> bool)
+  (let [status
+          (msg i64
+               (class c"AVCaptureDevice")
+               (sel c"authorizationStatusForMediaType:")
+               [(ptr i8)]
+               (ns c"soun"))]
+    (or (= status 1) (= status 2))))
+
+(defn start-capture! [] (-> bool)
+  (let [s (state)
+        (mut format)
+          (: (AudioFormat
+               :sample-rate 16000.0
+               :format-id (p/cast u32 LINEAR-PCM)
+               :flags (p/cast u32 FLOAT-PACKED)
+               :bytes-per-packet (: 4 u32)
+               :frames-per-packet (: 1 u32)
+               :bytes-per-frame (: 4 u32)
+               :channels (: 1 u32)
+               :bits (: 32 u32)
+               :reserved (: 0 u32))
+             AudioFormat)
+        (mut queue) (zeroed (ptr i8))]
+    (if (!= (AudioQueueNewInput (mut format)
+                                (p/cast (ptr i8) (fnptr-of on-audio))
+                                (p/cast (ptr i8) 0)
+                                (p/cast (ptr i8) 0)
+                                (p/cast (ptr i8) 0)
+                                (: 0 u32)
+                                (mut queue))
+            (: 0 i32))
+        false
+        (do
+          (set! (.capturing (shared)) true)
+          (for [i 0 4]
+            (let [(mut buffer) (zeroed (ptr i8))]
+              (AudioQueueAllocateBuffer (load queue)
+                                        (p/cast u32 BUFFER-BYTES)
+                                        (mut buffer))
+              (AudioQueueEnqueueBuffer (load queue)
+                                       (load buffer)
+                                       (: 0 u32)
+                                       (p/cast (ptr i8) 0))))
+          (if (!= (AudioQueueStart (load queue) (p/cast (ptr i8) 0)) (: 0 i32))
+              (do
+                (set! (.capturing (shared)) false)
+                (AudioQueueDispose (load queue) (: 1 u8))
+                false)
+              (do (set! (.queue s) (load queue)) true))))))
+
+(defn stop-capture! [] (-> i64)
+  (let [s (state)]
+    (when (!= (p/cast i64 (.queue s)) 0)
+      ; Synchronous, so the last callbacks' audio is in before the worker's final drain.
+      (AudioQueueStop (.queue s) (: 1 u8))
+      (lock!)
+      (set! (.capturing (shared)) false)
+      (unlock!)
+      (AudioQueueDispose (.queue s) (: 1 u8))
+      (set! (.queue s) (p/cast (ptr i8) 0))
+      0)
+    0))
+
+(defn show-message! [(root (ptr i8)) (text (ptr i8)) (now f64)] (-> i64)
+  (pill-text! root text)
+  (set! (.message-until (state)) (+ now ERROR-SECONDS))
+  (transport/log! c"dictation message=%s" (p/cast i64 text) 0 0 0)
+  0)
+
+;;; Dictate into session ID until told to stop. Nil ID: nothing focused can take it.
+(defn start! [(root (ptr i8)) (id (ptr i8)) (now f64)] (-> i64)
+  (let [s (state)
+        t (shared)]
+    (when (not (.mutex-ready s))
+      (pthread_mutex_init (p/cast (ptr i8) (field t mutex)) (p/cast (ptr i8) 0))
+      (set! (.mutex-ready s) true)
+      0)
+    (cond (= (p/cast i64 id) 0)
+            (show-message! root c"Dictation needs a focused terminal." now)
+          (microphone-denied?)
+            (show-message! root
+                           c"Microphone access is off for Jim Coil. See System Settings → Privacy."
+                           now)
+          :else
+            (do
+              (set! (.stop t) false)
+              (set! (.done t) false)
+              (set! (.failed t) false)
+              (set! (.fresh t) false)
+              (if (not (start-capture!))
+                  (show-message! root c"Couldn't open the microphone." now)
+                  (let [(mut thread) (zeroed u64)
+                        failed
+                          (pthread_create (mut thread)
+                                          (p/cast (ptr i8) 0)
+                                          (p/cast (ptr i8)
+                                                  (fnptr-of worker-main))
+                                          (p/cast (ptr i8) 0))]
+                    (if (!= failed (: 0 i32))
+                        (do
+                          (stop-capture!)
+                          (show-message! root c"Couldn't start dictation." now))
+                        (do
+                          (pthread_detach (load thread))
+                          (set! (.phase s) LISTENING)
+                          (set! (.detached s) false)
+                          (set! (.message-until s) 0.0)
+                          (set! (.target s)
+                                (msg (ptr i8) id (sel c"retain") []))
+                          (replace-string! (field s inserted)
+                                           (p/cast (ptr i8) 0))
+                          (replace-string! (field s preview)
+                                           (p/cast (ptr i8) 0))
+                          (transport/log! c"dictation start id=%s"
+                                          (p/cast i64 (utf8 id))
+                                          0
+                                          0
+                                          0)
+                          (listening-text! root)
+                          0))))))
+    0))
+
+;;; Stop listening. The last words still decode, and land when the worker finishes.
+(defn stop! [] (-> i64)
+  (let [s (state)]
+    (when (listening?)
+      (set! (.phase s) FINISHING)
+      (stop-capture!)
+      (lock!)
+      (set! (.stop (shared)) true)
+      (unlock!)
+      0)
+    0))
+
+;;; The user typed. DEL would now delete what they typed, so leave the text as it is.
+(defn detach! [] (-> i64)
+  (when (listening?)
+    (set! (.detached (state)) true)
+    (stop!)
+    (transport/log! c"dictation typing-ended-it" 0 0 0 0)
+    0)
+  0)
+
+(defn toggle! [(root (ptr i8)) (id (ptr i8)) (now f64)] (-> i64)
+  (cond (listening?) (stop!)
+        (active?) 0
+        :else (start! root id now)))
+
+(defn end-session! [] (-> i64)
+  (let [s (state)]
+    (set! (.phase s) IDLE)
+    (release (.target s))
+    (set! (.target s) (p/cast (ptr i8) 0))
+    (replace-string! (field s inserted) (p/cast (ptr i8) 0))
+    (replace-string! (field s preview) (p/cast (ptr i8) 0))
+    0))
+
+;;; Run from the app's main loop. SURFACE is the target session's, or nil if it's gone.
+(defn pump! [(root (ptr i8)) (surface (ptr i8)) (now f64)] (-> i64)
+  (let [s (state)
+        t (shared)]
+    (when (and (= (.phase s) IDLE)
+               (> (.message-until s) 0.0)
+               (> now (.message-until s)))
+      (set! (.message-until s) 0.0)
+      (pill-hide!)
+      0)
+    (when (active?)
+      (lock!)
+      (let [text (if (.fresh t) (.text t) (p/cast (ptr i8) 0))
+            done (.done t)
+            failed (.failed t)]
+        (when (.fresh t)
+          (set! (.text t) (p/cast (ptr i8) 0))
+          (set! (.fresh t) false)
+          0)
+        (unlock!)
+        (when (!= (p/cast i64 text) 0)
+          (write-text! surface text done)
+          (free text)
+          (listening-text! root)
+          0)
+        (when done
+          (let [nothing
+                  (or (= (p/cast i64 (.preview s)) 0)
+                      (= (strlen (.preview s)) (: 0 u64)))]
+            (stop-capture!)
+            (transport/log! c"dictation end failed=%lld detached=%lld nothing=%lld"
+                            (if failed 1 0)
+                            (if (.detached s) 1 0)
+                            (if nothing 1 0)
+                            0)
+            (cond failed (show-message! root (core/last-error) now)
+                  nothing (show-message! root c"Heard nothing." now)
+                  (= (p/cast i64 surface) 0)
+                    (show-message! root c"That terminal is gone." now)
+                  :else (pill-hide!))
+            (end-session!)
+            0))
+        0))
+    0))

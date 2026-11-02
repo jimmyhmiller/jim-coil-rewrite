@@ -177,6 +177,15 @@
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
       v)))
 
+;;; R moved to lie within AREA, and made smaller only where it does not fit.
+(defn fit-rect [(r Rect) (area Rect)] (-> Rect)
+  (let [w (min (.w r) (.w area))
+        h (min (.h r) (.h area))]
+    (rect (max (.x area) (min (.x r) (- (+ (.x area) (.w area)) w)))
+          (max (.y area) (min (.y r) (- (+ (.y area) (.h area)) h)))
+          w
+          h)))
+
 (defn method! [(cls (ptr i8)) (name (ptr i8)) (fn (ptr i8)) (encoding (ptr i8))]
   (-> i8)
   (p/cast i8 (if (class_addMethod cls (sel name) fn encoding) 1 0)))

@@ -1,0 +1,91 @@
+(module jim.drop-test)
+(import "jim.terminal" :as terminal)
+(import "jim.native" :use *)
+
+(defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (!= (msg i8 a (sel c"isEqualToString:") [(ptr i8)] (ns b)) (: 0 i8)))
+
+(defn board [] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSPasteboard") (sel c"pasteboardWithUniqueName") []))
+
+(defn file-url [(path (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSURL") (sel c"fileURLWithPath:") [(ptr i8)] (ns path)))
+
+(deftest paths-are-escaped-for-a-shell
+  (assert (same? (terminal/shell-escaped (ns c"/tmp/plain.png"))
+                 c"/tmp/plain.png"))
+  (assert (same? (terminal/shell-escaped (ns c"/tmp/a b(1).png"))
+                 c"/tmp/a\\ b\\(1\\).png"))
+  (assert (same? (terminal/shell-escaped (ns c"/tmp/it's $5\\.png"))
+                 c"/tmp/it\\'s\\ \\$5\\\\.png")))
+
+(deftest dropped-files-become-escaped-paths
+  (let [b (board)
+        urls (new c"NSMutableArray")]
+    (msg i64 urls (sel c"addObject:") [(ptr i8)] (file-url c"/tmp/one.png"))
+    (msg i64
+         urls
+         (sel c"addObject:")
+         [(ptr i8)]
+         (file-url c"/tmp/two words.png"))
+    (msg i64 b (sel c"clearContents") [])
+    (msg i8 b (sel c"writeObjects:") [(ptr i8)] urls)
+    (assert (same? (terminal/dropped-text b)
+                   c"/tmp/one.png /tmp/two\\ words.png "))
+    (release urls)
+    (msg i64 b (sel c"releaseGlobally") [])
+    (do)))
+
+(deftest dropped-text-is-typed-as-it-is
+  (let [b (board)]
+    (msg i64 b (sel c"clearContents") [])
+    (msg i8
+         b
+         (sel c"setString:forType:")
+         [(ptr i8) (ptr i8)]
+         (ns c"hello there")
+         (ns c"public.utf8-plain-text"))
+    (assert (same? (terminal/dropped-text b) c"hello there"))
+    (msg i64 b (sel c"releaseGlobally") [])
+    (do)))
+
+(deftest a-dropped-image-with-no-file-is-saved-to-one
+  (let [b (board)
+        bytes
+          (msg (ptr i8)
+               (ns c"not really a png")
+               (sel c"dataUsingEncoding:")
+               [u64]
+               (: 4 u64))]
+    (msg i64 b (sel c"clearContents") [])
+    (msg i8
+         b
+         (sel c"setData:forType:")
+         [(ptr i8) (ptr i8)]
+         bytes
+         (ns c"public.png"))
+    (let [text (terminal/dropped-text b)
+          path (replace-trailing-space text)
+          written
+            (msg (ptr i8)
+                 (class c"NSData")
+                 (sel c"dataWithContentsOfFile:")
+                 [(ptr i8)]
+                 path)]
+      (assert (!= (msg i8 written (sel c"isEqualToData:") [(ptr i8)] bytes)
+                  (: 0 i8)))
+      (msg i8
+           (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+           (sel c"removeItemAtPath:error:")
+           [(ptr i8) (ptr i8)]
+           path
+           (nil)))
+    (msg i64 b (sel c"releaseGlobally") [])
+    (do)))
+
+(defn replace-trailing-space [(text (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       text
+       (sel c"substringToIndex:")
+       [u64]
+       (- (msg u64 text (sel c"length") []) (: 1 u64))))

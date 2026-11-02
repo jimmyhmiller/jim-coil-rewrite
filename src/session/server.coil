@@ -4,6 +4,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.os" :as os)
 (import "coil.primitive" :as p)
+(import "coil.math" :use [min])
 
 (const FRAME-CAPACITY 65548)
 
@@ -75,6 +76,94 @@
 ;;; session's terminal keeps.
 (const SCROLLBACK-MAX-LINES 28)
 
+;;; GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS and GHOSTTY_TERMINAL_DATA_MODE.
+(const DATA-KITTY-FLAGS 8)
+
+(const DATA-MODE 37)
+
+;;; ---- bounded history ------------------------------------------------------------
+;;; A session keeps the newest 64 MiB of its output, as original Jim's daemons do.
+;;; Older frames leave the front of the journal in steps, so a busy terminal does
+;;; not hand memory back for every read.
+(const HISTORY-LIMIT 67108864)
+
+(const TRIM-STEP 1048576)
+
+;;; A client this far behind has stopped reading. It loses its connection rather
+;;; than holding the journal's memory.
+(const STALLED-CLIENT-LIMIT 268435456)
+
+;;; The journal is a ring in memory, so a full disk can't touch a terminal. This much
+;;; address space is reserved, and only what holds history is ever resident: the
+;;; stalled limit, the newest history, and more than one loop can append.
+(const JOURNAL-CAPACITY 335544320)
+
+(const PROT-READ-WRITE 3)
+
+(const MAP-PRIVATE-ANON 4098)
+
+(const MAP-FIXED-PRIVATE-ANON 4114)
+
+;;; ---- original Jim's daemon ------------------------------------------------------
+;;; Frames are a big-endian u32 length and a bincode message with standard config:
+;;; variable-length integers and enum variants numbered from zero.
+(const UPSTREAM-RX-CAPACITY 131072)
+
+(const UPSTREAM-INPUT-CHUNK 65000)
+
+(const MESSAGE-ATTACH 0)
+
+(const MESSAGE-INPUT 1)
+
+(const MESSAGE-RESIZE 2)
+
+(const MESSAGE-KILL 4)
+
+(const MESSAGE-ATTACHED 0)
+
+(const MESSAGE-OUTPUT 1)
+
+(const MESSAGE-REPLAY-START 2)
+
+(const MESSAGE-REPLAY-END 3)
+
+(const MESSAGE-CHILD-EXITED 4)
+
+;;; How far adoption has come. Clients wait until the daemon's history is journaled
+;;; so that all of it reaches them as replay rather than as live output.
+(const PHASE-CONNECTING 0)
+
+(const PHASE-ATTACHED 1)
+
+(const PHASE-REPLAYING 2)
+
+(const PHASE-LIVE 3)
+
+;;; Poll ticks of silence from the daemon before adoption gives up.
+(const UPSTREAM-PATIENCE 25)
+
+(const NO-EXIT -1)
+
+(const SOL-LOCAL 0)
+
+(const LOCAL-PEERPID 2)
+
+(const SO-SNDTIMEO 4101)
+
+(const O-NOCTTY 131072)
+
+(const S-IFCHR 8192)
+
+(const PROC-PIDTBSDINFO 3)
+
+(const BSDINFO-SIZE 136)
+
+(const BSDINFO-TDEV 108)
+
+(const BSDINFO-TPGID 112)
+
+(const TIOCGWINSZ 1074295912)
+
 (defstruct SockaddrUn [(length u8) (family u8) (path (array i8 104))])
 
 (defstruct PollFd [(fd i32) (events i16) (revents i16)])
@@ -84,6 +173,8 @@
 (defstruct Timespec [(seconds i64) (nanoseconds i64)])
 
 (defstruct Winsize [(rows u16) (cols u16) (width u16) (height u16)])
+
+(defstruct ModeQuery [(mode u16) (value bool)])
 
 (defstruct Passwd
   [(name (ptr i8))
@@ -112,10 +203,15 @@
    (secondary GhosttySecondary)
    (tertiary GhosttyTertiary)])
 
+;;; Darwin's struct sigaction.
+(defstruct Sigaction [(handler (ptr i8)) (mask u32) (flags i32)])
+
+(static-assert (= (sizeof Sigaction) 16) "Darwin sigaction ABI size")
+
 (defstruct Session
   [(pty i32)
    (client i32)
-   (journal i32)
+   (journal (ptr i8))
    (child i32)
    (end i64)
    (cursor i64)
@@ -134,7 +230,28 @@
    (stopping bool)
    (terminal (ptr i8))
    (color-scheme i32)
-   (cwd (array i8 1024))])
+   (cwd (array i8 1024))
+   (start i64)
+   (punched i64)
+   (base-size (array i8 8))
+   (base-directory (array i8 3136))
+   (base-directory-length i64)
+   (base-owed i64)
+   (modes-owed bool)
+   (initial-cols u16)
+   (initial-rows u16)
+   (upstream bool)
+   (phase i64)
+   (patience i64)
+   (upstream-exit i64)
+   (upstream-rx (array i8 131072))
+   (upstream-rx-len i64)
+   (upstream-tx (array i8 65600))
+   (upstream-tx-len i64)
+   (upstream-tx-at i64)
+   (size-owed bool)
+   (owed-cols u16)
+   (owed-rows u16)])
 
 (static-assert (= (sizeof SockaddrUn) 106) "Darwin sockaddr_un ABI size")
 
@@ -143,6 +260,8 @@
 (static-assert (= (sizeof Winsize) 8) "Darwin winsize ABI size")
 
 (static-assert (= (sizeof GhosttyColor) 3) "Ghostty RGB ABI size")
+
+(static-assert (= (sizeof ModeQuery) 4) "GhosttyTerminalModeConfig ABI size")
 
 (extern socket :cc (cc/C) [i32 i32 i32] (-> i32))
 
@@ -153,6 +272,8 @@
 (extern accept :cc (cc/C) [i32 (ptr i8) (ptr u32)] (-> i32))
 
 (extern setsockopt :cc (cc/C) [i32 i32 i32 (ptr i8) u32] (-> i32))
+
+(extern getsockopt :cc (cc/C) [i32 i32 i32 (ptr i8) (ptr u32)] (-> i32))
 
 (extern getpeereid :cc (cc/C) [i32 (ptr u32) (ptr u32)] (-> i32))
 
@@ -165,10 +286,6 @@
 (extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
 (extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
-
-(extern pread :cc (cc/C) [i32 (ptr i8) isize i64] (-> isize))
-
-(extern pwrite :cc (cc/C) [i32 (ptr i8) isize i64] (-> isize))
 
 (extern close :cc (cc/C) [i32] (-> i32))
 
@@ -200,6 +317,18 @@
 
 (extern kill :cc (cc/C) [i32 i32] (-> i32))
 
+(extern strrchr :cc (cc/C) [(ptr i8) i32] (-> (ptr i8)))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+(extern strerror :cc (cc/C) [i32] (-> (ptr i8)))
+
+(extern sigaction :cc (cc/C) [i32 (ptr Sigaction) (ptr Sigaction)] (-> i32))
+
+(extern raise :cc (cc/C) [i32] (-> i32))
+
+(extern proc_name :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
+
 (extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
 
 (extern tcgetpgrp :cc (cc/C) [i32] (-> i32))
@@ -228,13 +357,13 @@
 
 (extern memset :cc (cc/C) [(ptr i8) i32 isize] (-> (ptr i8)))
 
-(extern tmpfile :cc (cc/C) [] (-> (ptr i8)))
-
-(extern fileno :cc (cc/C) [(ptr i8)] (-> i32))
-
-(extern fclose :cc (cc/C) [(ptr i8)] (-> i32))
+(extern mmap :cc (cc/C) [(ptr i8) u64 i32 i32 i32 i64] (-> (ptr i8)))
 
 (extern proc_pidinfo :cc (cc/C) [i32 i32 u64 (ptr i8) i32] (-> i32))
+
+(extern proc_listchildpids :cc (cc/C) [i32 (ptr i8) i32] (-> i32))
+
+(extern devname :cc (cc/C) [i32 u16] (-> (ptr i8)))
 
 (extern ghostty_terminal_new
         :cc
@@ -250,6 +379,8 @@
 
 (extern ghostty_terminal_free :cc (cc/C) [(ptr i8)] (-> void))
 
+(extern ghostty_terminal_get :cc (cc/C) [(ptr i8) i32 (ptr i8)] (-> i32))
+
 (defn bytes [(array (ptr i8))] (-> (ptr i8))
   array)
 
@@ -257,7 +388,14 @@
   (let [flags (fcntl fd F-GETFL)]
     (and (>= flags 0) (>= (fcntl fd F-SETFL (| flags O-NONBLOCK)) 0))))
 
-(defn disconnect-client [(s (ptr Session))] (-> i64)
+(defn disconnect-client [(s (ptr Session)) (reason (ptr i8))] (-> i64)
+  (when (>= (.client s) 0)
+    (transport/log! c"client-dropped reason=%s errno=%lld"
+                    (p/cast i64 reason)
+                    (p/cast i64 (os/errno))
+                    0
+                    0)
+    0)
   (if (>= (.client s) 0) (close (.client s)) 0)
   (set! (.client s) (: -1 i32))
   (set! (.rx-len s) 0)
@@ -296,32 +434,75 @@
   (put-u32-be! out 8 (p/cast u32 length))
   0)
 
+;;; Something went wrong that the shell need not die for.
+(defn survived! [(site (ptr i8))] (-> i64)
+  (transport/log! c"survived site=%s errno=%lld"
+                  (p/cast i64 site)
+                  (os/errno)
+                  0
+                  0))
+
+;;; Why the service failed, for the client's pane: the log may be on the full disk.
+(defn failure-reason [] (-> (ptr i8))
+  (p/cast (ptr i8) (p/alloc-static (array i8 400))))
+
+;;; Mark this service failed, recording where and why. Stopping ends the shell, so this
+;;; line is all that will ever explain it. Read errno before anything can change it.
+(defn fail! [(s (ptr Session)) (site (ptr i8))] (-> i64)
+  (let [code (os/errno)]
+    (transport/log! c"FAILED site=%s errno=%lld (%s)"
+                    (p/cast i64 site)
+                    code
+                    (p/cast i64 (strerror (p/cast i32 code)))
+                    0)
+    (transport/log! c"  state journal_start=%lld journal_end=%lld cursor=%lld input_queued=%lld"
+                    (.start s)
+                    (.end s)
+                    (.cursor s)
+                    (- (.input-len s) (.input-at s)))
+    (when (not (.failed s))
+      (snprintf (failure-reason)
+                (: 400 u64)
+                c"site=%s errno=%lld (%s)"
+                site
+                code
+                (strerror (p/cast i32 code)))
+      0)
+    (set! (.failed s) true)
+    0))
+
+;;; Offsets into the journal only ever grow. Each lives at its remainder in the ring.
+(defn journal-put [(s (ptr Session)) (offset i64) (bytes (ptr i8)) (length i64)]
+  (-> i64)
+  (let [at (% offset JOURNAL-CAPACITY)
+        first (min length (- JOURNAL-CAPACITY at))]
+    (memcpy (index (.journal s) at) bytes (p/cast isize first))
+    (memcpy (.journal s) (index bytes first) (p/cast isize (- length first)))
+    0))
+
+(defn journal-get [(s (ptr Session)) (offset i64) (out (ptr i8)) (length i64)]
+  (-> i64)
+  (let [at (% offset JOURNAL-CAPACITY)
+        first (min length (- JOURNAL-CAPACITY at))]
+    (memcpy out (index (.journal s) at) (p/cast isize first))
+    (memcpy (index out first) (.journal s) (p/cast isize (- length first)))
+    0))
+
 (defn append-frame [(s (ptr Session)) (kind u32) (data (ptr i8)) (length i64)]
-  (-> bool)
-  (let [(mut frame) (zeroed (array i8 65548))
-        out (p/cast (ptr i8) (mut frame))]
-    (write-header out kind length)
-    (memcpy (index out 12) data (p/cast isize length))
-    (let [(mut at) 0]
-      (block
-        :done
-          (loop (if (>= (load at) (+ length 12))
-                    (break true)
-                    (let [n
-                            (pwrite (.journal s)
-                                    (index out (load at))
-                                    (p/cast isize
-                                            (- (+ length 12) (load at)))
-                                    (+ (.end s) (load at)))]
-                      (if (and (< n 0) (= (os/errno) EINTR))
-                          0
-                          (if (<= n 0)
-                              (do
-                                (set! (.failed s) true)
-                                (return-from :done false))
-                              (set! at (+ (load at) (p/cast i64 n)))))))
-            (set! (.end s) (+ (+ (.end s) length) 12))
-            true)))))
+  (-> i64)
+  (let [(mut header) (zeroed (array i8 12))
+        out (p/cast (ptr i8) (mut header))
+        size (+ length 12)]
+    ; Trimming runs every loop, which holds this far below capacity. Reaching it means
+    ; that is broken, and writing on would overwrite history a client is reading.
+    (if (> (+ (- (.end s) (.start s)) size) JOURNAL-CAPACITY)
+        (fail! s c"journal-over-capacity")
+        (do
+          (write-header out kind length)
+          (journal-put s (.end s) out 12)
+          (journal-put s (+ (.end s) 12) data length)
+          (set! (.end s) (+ (.end s) size))
+          0))))
 
 (defn queue-input [(s (ptr Session)) (data (ptr i8)) (length i64)] (-> i64)
   (if (.exited s)
@@ -336,7 +517,7 @@
               (set! (.input-at s) 0))
             0)
         (if (> length (- INPUT-CAPACITY (.input-len s)))
-            (set! (.failed s) true)
+            (survived! c"input-queue-full-input-dropped")
             (do
               (memcpy (index (field s input) (.input-len s))
                       data
@@ -348,7 +529,12 @@
                       (userdata (ptr i8))
                       (data (ptr i8))
                       (length u64)] (-> void)
-  (queue-input (p/cast (ptr Session) userdata) data (p/cast i64 length)))
+  (let [s (p/cast (ptr Session) userdata)]
+    ; Queries in a daemon's history were answered long ago.
+    (when (not (and (.upstream s) (= (.phase s) PHASE-REPLAYING)))
+      (queue-input s data (p/cast i64 length))
+      0)
+    (do)))
 
 (defn terminal-attributes [(terminal (ptr i8))
                            (userdata (ptr i8))
@@ -414,32 +600,35 @@
                 (> cols (: 1000 u16))
                 (> rows (: 1000 u16)))
             0
-            (if (not (append-frame s
-                                   (p/cast u32 transport/JIM-RESIZE)
-                                   data
-                                   length))
-                0
-                (if (!= (ghostty_terminal_resize (.terminal s)
-                                                 cols
-                                                 rows
-                                                 (p/cast u32 (/ width cols))
-                                                 (p/cast u32 (/ height rows)))
-                        (: 0 i32))
-                    (do (set! (.failed s) true) 0)
-                    (let [(mut size)
-                            (: (Winsize
-                                 :rows rows
-                                 :cols cols
-                                 :width width
-                                 :height height)
-                               Winsize)]
-                      (if (and (not (.exited s))
-                               (< (ioctl (.pty s)
-                                         (p/cast u64 TIOCSWINSZ)
-                                         (p/cast (ptr i8) (mut size)))
-                                  0))
-                          (set! (.failed s) true)
-                          0))))))))
+            (do
+              (append-frame s (p/cast u32 transport/JIM-RESIZE) data length)
+              (if (!= (ghostty_terminal_resize (.terminal s)
+                                               cols
+                                               rows
+                                               (p/cast u32 (/ width cols))
+                                               (p/cast u32 (/ height rows)))
+                      (: 0 i32))
+                  (do (survived! c"resize-terminal-core") 0)
+                  (let [(mut size)
+                          (: (Winsize
+                               :rows rows
+                               :cols cols
+                               :width width
+                               :height height)
+                             Winsize)]
+                    (if (.upstream s)
+                        (when (not (.exited s))
+                          (set! (.owed-cols s) cols)
+                          (set! (.owed-rows s) rows)
+                          (set! (.size-owed s) true)
+                          0)
+                        (if (and (not (.exited s))
+                                 (< (ioctl (.pty s)
+                                           (p/cast u64 TIOCSWINSZ)
+                                           (p/cast (ptr i8) (mut size)))
+                                    0))
+                            (survived! c"resize-pty-ioctl")
+                            0)))))))))
 
 (defn url-safe? [(value u8)] (-> bool)
   (or (and (>= value (: 97 u8)) (<= value (: 122 u8)))
@@ -451,16 +640,34 @@
       (= value (: 46 u8))
       (= value (: 126 u8))))
 
+;;; The kernel's record of PID: its controlling terminal and foreground group. An
+;;; adopted shell's PTY belongs to its daemon, so this is how to reach them.
+(defn bsd-field [(pid i32) (offset i64)] (-> i32)
+  (let [(mut info) (zeroed (array i8 136))
+        bytes (p/cast (ptr i8) (mut info))]
+    (if (or (<= pid (: 0 i32))
+            (!= (proc_pidinfo pid PROC-PIDTBSDINFO 0 bytes BSDINFO-SIZE)
+                (: 136 i32)))
+        (: -1 i32)
+        (load (p/cast (ptr i32) (index bytes offset))))))
+
+(defn foreground-group [(s (ptr Session))] (-> i32)
+  (if (.upstream s) (bsd-field (.child s) BSDINFO-TPGID) (tcgetpgrp (.pty s))))
+
 (defn update-directory [(s (ptr Session))] (-> i64)
   (if (.exited s)
       0
-      (let [info (p/alloc-stack (array i8 2352))
-            foreground (tcgetpgrp (.pty s))]
+      (let [(mut info) (zeroed (array i8 2352))
+            foreground (foreground-group s)]
         (if (or (<= foreground 0)
-                (!= (proc_pidinfo foreground 9 0 (p/cast (ptr i8) info) 2352)
+                (!= (proc_pidinfo foreground
+                                  9
+                                  0
+                                  (p/cast (ptr i8) (mut info))
+                                  2352)
                     (: 2352 i32)))
             0
-            (let [cwd (p/cast (ptr i8) (index info 152))]
+            (let [cwd (index (p/cast (ptr i8) (mut info)) 152)]
               (if (or (= (byte-at cwd 0) (: 0 u8))
                       (= (strcmp cwd (index (field s cwd) 0)) 0))
                   0
@@ -507,12 +714,10 @@
                                                                               u8)))))
                                             (set! out-at (+ (load out-at) 3))))
                                       (set! source-at (+ (load source-at) 1)))))
-                          (if (append-frame s
-                                            (p/cast u32 transport/JIM-DIRECTORY)
-                                            out
-                                            (load out-at))
-                              0
-                              0))))))))))
+                          (append-frame s
+                                        (p/cast u32 transport/JIM-DIRECTORY)
+                                        out
+                                        (load out-at)))))))))))
 
 (defn prepare-output [(s (ptr Session))] (-> i64)
   (if (or (< (.client s) 0) (< (.tx-at s) (.tx-len s)))
@@ -520,36 +725,564 @@
       (do
         (set! (.tx-at s) 0)
         (set! (.tx-len s) 0)
-        (if (and (not (.ready s)) (= (.cursor s) (.replay-end s)))
-            (let [out (index (field s tx) 0)]
-              (write-header out (p/cast u32 transport/JIM-READY) 1)
-              (put-byte! out 12 (: 1 u8))
-              (set! (.tx-len s) 13)
-              (set! (.ready s) true)
-              0)
-            (if (>= (.cursor s) (.end s))
-                0
+        (prepare-base s)
+        (if (or (> (.tx-len s) 0) (> (.base-owed s) 0))
+            0
+            (if (and (not (.ready s)) (= (.cursor s) (.replay-end s)))
                 (let [out (index (field s tx) 0)]
-                  (if (!= (pread (.journal s) out (p/cast isize 12) (.cursor s))
-                          12)
-                      (set! (.failed s) true)
+                  (if (.modes-owed s)
+                      (do (prepare-modes s) (set! (.modes-owed s) false) 0)
+                      (do
+                        (write-header out (p/cast u32 transport/JIM-READY) 1)
+                        (put-byte! out 12 (: 1 u8))
+                        (set! (.tx-len s) 13)
+                        (set! (.ready s) true)
+                        0)))
+                (if (>= (.cursor s) (.end s))
+                    0
+                    (let [out (index (field s tx) 0)]
+                      (journal-get s (.cursor s) out 12)
                       (let [length (p/cast i64 (u32-be out 8))]
-                        (if (or (> length transport/MAX-PAYLOAD)
-                                (!= (pread (.journal s)
-                                           (index out 12)
-                                           (p/cast isize length)
-                                           (+ (.cursor s) 12))
-                                    (p/cast isize length)))
-                            (set! (.failed s) true)
+                        (if (> length transport/MAX-PAYLOAD)
+                            (disconnect-client s c"journal-frame-too-long")
                             (do
+                              (journal-get s
+                                           (+ (.cursor s) 12)
+                                           (index out 12)
+                                           length)
                               (set! (.tx-len s) (+ length 12))
-                              (set! (.cursor s) (+ (.cursor s) (.tx-len s))))))))))
+                              (set! (.cursor s)
+                                    (+ (.cursor s) (.tx-len s)))
+                              0)))))))
         0)))
 
+;;; Replay that starts after trimmed history first needs what the trimmed frames
+;;; established: the size the kept frames were written at, and the directory.
+(defn prepare-base [(s (ptr Session))] (-> i64)
+  (let [out (index (field s tx) 0)]
+    (when (= (.base-owed s) 2)
+      (set! (.base-owed s) 1)
+      (write-header out (p/cast u32 transport/JIM-RESIZE) 8)
+      (memcpy (index out 12) (index (field s base-size) 0) (p/cast isize 8))
+      (set! (.tx-len s) 20)
+      0)
+    (when (and (= (.base-owed s) 1) (= (.tx-len s) 0))
+      (set! (.base-owed s) 0)
+      (when (> (.base-directory-length s) 0)
+        (write-header out
+                      (p/cast u32 transport/JIM-DIRECTORY)
+                      (.base-directory-length s))
+        (memcpy (index out 12)
+                (index (field s base-directory) 0)
+                (p/cast isize (.base-directory-length s)))
+        (set! (.tx-len s) (+ (.base-directory-length s) 12))
+        0)
+      0)
+    0))
+
+(defn mode-set? [(s (ptr Session)) (mode u16)] (-> bool)
+  (let [(mut query) (ModeQuery :mode mode :value false)]
+    (and (= (ghostty_terminal_get (.terminal s)
+                                  DATA-MODE
+                                  (p/cast (ptr i8) (mut query)))
+            (: 0 i32))
+         (.value query))))
+
+(defn append-number [(out (ptr i8)) (at i64) (value i64)] (-> i64)
+  (if (>= value 10)
+      (let [next (append-number out at (/ value 10))]
+        (put-byte! out next (p/cast u8 (+ 48 (% value 10))))
+        (+ next 1))
+      (do
+        (put-byte! out at (p/cast u8 (+ 48 value)))
+        (+ at 1))))
+
+;;; How keys and mouse events must be encoded can depend on a mode that was set in
+;;; trimmed history. The session's terminal core still knows, so a client replaying
+;;; a trimmed journal is told. This runs only after the replay, so it cannot be undone
+;;; by it, and it only sets modes: anything the kept frames turned off stays off.
+(defn prepare-modes [(s (ptr Session))] (-> i64)
+  (let [out (index (field s tx) 0)
+        modes [1 66 1000 1002 1003 1004 1005 1006 1015 1016 2004]
+        (mut at) 12
+        (mut flags) (zeroed u8)]
+    (for [i 0 11]
+      (let [mode (get modes i)]
+        (when (mode-set? s (p/cast u16 mode))
+          (put-byte! out (load at) (: 27 u8))
+          (put-byte! out (+ (load at) 1) (: 91 u8))
+          (put-byte! out (+ (load at) 2) (: 63 u8))
+          (set! at (append-number out (+ (load at) 3) mode))
+          (put-byte! out (load at) (: 104 u8))
+          (set! at (+ (load at) 1))
+          0)))
+    (when (and (= (ghostty_terminal_get (.terminal s)
+                                        DATA-KITTY-FLAGS
+                                        (p/cast (ptr i8) (mut flags)))
+                  (: 0 i32))
+               (!= flags (: 0 u8)))
+      ; CSI = FLAGS ; 1 u replaces the current flags without adding to the stack.
+      (put-byte! out (load at) (: 27 u8))
+      (put-byte! out (+ (load at) 1) (: 91 u8))
+      (put-byte! out (+ (load at) 2) (: 61 u8))
+      (set! at (append-number out (+ (load at) 3) (p/cast i64 flags)))
+      (put-byte! out (load at) (: 59 u8))
+      (put-byte! out (+ (load at) 1) (: 49 u8))
+      (put-byte! out (+ (load at) 2) (: 117 u8))
+      (set! at (+ (load at) 3))
+      0)
+    (when (> (load at) 12)
+      (write-header out (p/cast u32 transport/JIM-OUTPUT) (- (load at) 12))
+      (set! (.tx-len s) (load at))
+      0)
+    0))
+
+;;; Drop frames from the front of the journal until the newest HISTORY-LIMIT bytes
+;;; remain, and return their disk space. Offsets never move, so the client's cursor
+;;; stays valid: the only frames that may not go are ones it has yet to read.
+(defn trim-journal [(s (ptr Session))] (-> i64)
+  (if (<= (- (.end s) (.start s)) (+ HISTORY-LIMIT TRIM-STEP))
+      0
+      (do
+        (when (and (>= (.client s) 0)
+                   (> (- (.end s) (.cursor s)) STALLED-CLIENT-LIMIT))
+          (disconnect-client s c"stalled-past-history-limit")
+          0)
+        (let [wanted (- (.end s) HISTORY-LIMIT)
+              target
+                (if (and (>= (.client s) 0) (< (.cursor s) wanted))
+                    (.cursor s)
+                    wanted)
+              (mut header) (zeroed (array i8 12))
+              bytes (p/cast (ptr i8) (mut header))]
+          (loop (if (>= (.start s) target)
+                    (break)
+                    (do
+                      (journal-get s (.start s) bytes 12)
+                      (let [kind (u32-be bytes 4)
+                            length (p/cast i64 (u32-be bytes 8))]
+                        (keep-base s kind length)
+                        (set! (.start s) (+ (+ (.start s) length) 12))))))
+          (punch-journal s)
+          0))))
+
+(defn keep-base [(s (ptr Session)) (kind u32) (length i64)] (-> i64)
+  (let [payload (+ (.start s) 12)]
+    (cond (= kind (p/cast u32 transport/JIM-RESIZE))
+            (do
+              (journal-get s payload (index (field s base-size) 0) 8)
+              0)
+          (and (= kind (p/cast u32 transport/JIM-DIRECTORY)) (<= length 3136))
+            (do
+              (journal-get s payload (index (field s base-directory) 0) length)
+              (set! (.base-directory-length s) length)
+              0)
+          :else 0)
+    0))
+
+;;; Hand trimmed history's memory back: fresh anonymous pages replace the old ones. If
+;;; this fails, the history is still trimmed and the memory just stays resident.
+(defn journal-release [(s (ptr Session)) (at i64) (length i64)] (-> i64)
+  (when (> length 0)
+    (when (= (p/cast i64
+                     (mmap (index (.journal s) at)
+                           (p/cast u64 length)
+                           PROT-READ-WRITE
+                           MAP-FIXED-PRIVATE-ANON
+                           (: -1 i32)
+                           0))
+             -1)
+      (survived! c"journal-release")
+      0)
+    0)
+  0)
+
+(defn punch-journal [(s (ptr Session))] (-> i64)
+  (let [to (* (/ (.start s) TRIM-STEP) TRIM-STEP)]
+    (when (> to (.punched s))
+      (let [at (% (.punched s) JOURNAL-CAPACITY)
+            length (- to (.punched s))
+            first (min length (- JOURNAL-CAPACITY at))]
+        (journal-release s at first)
+        (journal-release s 0 (- length first))
+        (set! (.punched s) to)
+        0))
+    0))
+
+;;; ---- adopting an original Jim daemon --------------------------------------------
+
+(defn put-varint [(out (ptr i8)) (at i64) (value i64)] (-> i64)
+  (if (< value 251)
+      (do (put-byte! out at (p/cast u8 value)) (+ at 1))
+      (do
+        (put-byte! out at (: 251 u8))
+        (put-byte! out (+ at 1) (p/cast u8 (& value 255)))
+        (put-byte! out (+ at 2) (p/cast u8 (>> value 8)))
+        (+ at 3))))
+
+;;; The integer at AT, stored in VALUE, and the offset after it. -1 if malformed.
+(defn read-varint [(data (ptr i8)) (at i64) (limit i64) (value (ptr i64))]
+  (-> i64)
+  (if (>= at limit)
+      -1
+      (let [first (p/cast i64 (byte-at data at))
+            width
+              (cond (< first 251) 0 (= first 251) 2 (= first 252) 4 :else -1)]
+        (if (or (< width 0) (> (+ at (+ 1 width)) limit))
+            -1
+            (let [(mut result) (if (= width 0) first 0)]
+              (for [i 0 width]
+                (set! result
+                      (| (load result)
+                         (<< (p/cast i64 (byte-at data (+ at (+ 1 i))))
+                             (* 8 i)))))
+              (set! value (load result))
+              (+ at (+ 1 width)))))))
+
+;;; Finish a message begun at offset 4 of the transmit buffer.
+(defn finish-upstream-frame [(s (ptr Session)) (end i64)] (-> i64)
+  (put-u32-be! (index (field s upstream-tx) 0) 0 (p/cast u32 (- end 4)))
+  (set! (.upstream-tx-at s) 0)
+  (set! (.upstream-tx-len s) end)
+  0)
+
+(defn encode-size [(s (ptr Session)) (message i64) (cols u16) (rows u16)]
+  (-> i64)
+  (let [out (index (field s upstream-tx) 0)
+        after-variant (put-varint out 4 message)
+        after-cols (put-varint out after-variant (p/cast i64 cols))]
+    (finish-upstream-frame s (put-varint out after-cols (p/cast i64 rows)))))
+
+(defn encode-input [(s (ptr Session))] (-> i64)
+  (let [out (index (field s upstream-tx) 0)
+        waiting (- (.input-len s) (.input-at s))
+        length
+          (if (> waiting UPSTREAM-INPUT-CHUNK) UPSTREAM-INPUT-CHUNK waiting)
+        after-variant (put-varint out 4 MESSAGE-INPUT)
+        at (put-varint out after-variant length)]
+    (memcpy (index out at)
+            (index (field s input) (.input-at s))
+            (p/cast isize length))
+    (set! (.input-at s) (+ (.input-at s) length))
+    (when (= (.input-at s) (.input-len s))
+      (set! (.input-at s) 0)
+      (set! (.input-len s) 0)
+      0)
+    (finish-upstream-frame s (+ at length))))
+
+(defn upstream-pending? [(s (ptr Session))] (-> bool)
+  (or (< (.upstream-tx-at s) (.upstream-tx-len s))
+      (.size-owed s)
+      (< (.input-at s) (.input-len s))))
+
+(defn write-upstream [(s (ptr Session))] (-> i64)
+  (when (>= (.upstream-tx-at s) (.upstream-tx-len s))
+    (set! (.upstream-tx-at s) 0)
+    (set! (.upstream-tx-len s) 0)
+    (if (.size-owed s)
+        (do
+          (set! (.size-owed s) false)
+          (encode-size s MESSAGE-RESIZE (.owed-cols s) (.owed-rows s))
+          0)
+        (when (< (.input-at s) (.input-len s)) (encode-input s) 0))
+    0)
+  (when (< (.upstream-tx-at s) (.upstream-tx-len s))
+    (let [n
+            (write (.pty s)
+                   (index (field s upstream-tx) (.upstream-tx-at s))
+                   (p/cast isize (- (.upstream-tx-len s) (.upstream-tx-at s))))]
+      (if (> n 0)
+          (set! (.upstream-tx-at s) (+ (.upstream-tx-at s) (p/cast i64 n)))
+          (when (and (< n 0)
+                     (!= (os/errno) EAGAIN)
+                     (!= (os/errno) EINTR))
+            (close-upstream s)
+            0)))
+    0)
+  0)
+
+(defn deliver-output [(s (ptr Session)) (data (ptr i8)) (length i64)] (-> i64)
+  (let [(mut at) 0]
+    (loop (if (>= (load at) length)
+              (break)
+              (let [chunk
+                      (if (> (- length (load at)) transport/MAX-PAYLOAD)
+                          transport/MAX-PAYLOAD
+                          (- length (load at)))]
+                (append-frame s
+                              (p/cast u32 transport/JIM-OUTPUT)
+                              (index data (load at))
+                              chunk)
+                (ghostty_terminal_vt_write (.terminal s)
+                                           (index data (load at))
+                                           (p/cast u64 chunk))
+                (set! at (+ (load at) chunk)))))
+    0))
+
+;;; The shell has exited, and once the daemon's history is in the journal, so has
+;;; this session. Nothing more will come from the daemon.
+(defn finish-upstream-exit [(s (ptr Session))] (-> i64)
+  (when (and (!= (.upstream-exit s) NO-EXIT) (not (.exited s)))
+    (let [(mut encoded) (zeroed (array i8 4))
+          out (p/cast (ptr i8) (mut encoded))]
+      (set! (.exited s) true)
+      (put-u32-be! out 0 (p/cast u32 (.upstream-exit s)))
+      (append-frame s (p/cast u32 transport/JIM-EXITED) out 4)
+      (close (.pty s))
+      (set! (.pty s) (: -1 i32))
+      0))
+  0)
+
+;;; The connection ended. Without an exit message the shell is still running under
+;;; its daemon: original Jim took it back, or the daemon died. This service stops and
+;;; never reconnects, so it cannot fight original Jim for the terminal.
+(defn close-upstream [(s (ptr Session))] (-> i64)
+  (if (= (.upstream-exit s) NO-EXIT)
+      (fail! s c"upstream-closed")
+      (do (set! (.phase s) PHASE-LIVE) (finish-upstream-exit s) 0))
+  0)
+
+(defn handle-upstream-message [(s (ptr Session)) (data (ptr i8)) (length i64)]
+  (-> i64)
+  (let [(mut variant) 0
+        body (read-varint data 0 length (mut variant))
+        message (load variant)]
+    (cond (< body 0) (fail! s c"upstream-bad-varint")
+          (= message MESSAGE-ATTACHED)
+            (when (= (.phase s) PHASE-CONNECTING)
+              (set! (.phase s) PHASE-ATTACHED)
+              0)
+          (= message MESSAGE-REPLAY-START) (set! (.phase s) PHASE-REPLAYING)
+          (= message MESSAGE-REPLAY-END)
+            (do (set! (.phase s) PHASE-LIVE) (finish-upstream-exit s) 0)
+          (= message MESSAGE-OUTPUT)
+            (let [(mut count) 0
+                  bytes (read-varint data body length (mut count))]
+              (if (or (< bytes 0) (!= (+ bytes (load count)) length))
+                  (fail! s c"upstream-bad-output")
+                  (do
+                    ; Attach is followed at once by the start of any replay.
+                    (when (= (.phase s) PHASE-ATTACHED)
+                      (set! (.phase s) PHASE-LIVE)
+                      0)
+                    (deliver-output s (index data bytes) (load count))
+                    0)))
+          (= message MESSAGE-CHILD-EXITED)
+            (let [some (and (< body length) (= (byte-at data body) (: 1 u8)))
+                  (mut zigzag) 0
+                  known
+                    (and some
+                         (>= (read-varint data (+ body 1) length (mut zigzag))
+                             0))]
+              ; The code is zigzag encoded. A shell killed by a signal has none.
+              (set! (.upstream-exit s) (if known (>> (load zigzag) 1) 255))
+              (when (= (.phase s) PHASE-LIVE) (finish-upstream-exit s) 0)
+              0)
+          :else (fail! s c"upstream-unknown-message"))
+    0))
+
+(defn read-upstream [(s (ptr Session))] (-> i64)
+  (let [base (index (field s upstream-rx) 0)
+        n
+          (read (.pty s)
+                (index base (.upstream-rx-len s))
+                (p/cast isize (- UPSTREAM-RX-CAPACITY (.upstream-rx-len s))))]
+    (cond (> n 0)
+            (do
+              (set! (.patience s) 0)
+              (set! (.upstream-rx-len s)
+                    (+ (.upstream-rx-len s) (p/cast i64 n)))
+              (let [(mut at) 0]
+                (loop (if (or (> (+ (load at) 4) (.upstream-rx-len s))
+                              (.failed s)
+                              (.exited s))
+                          (break)
+                          (let [length (p/cast i64 (u32-be base (load at)))]
+                            (if (> (+ length 4) UPSTREAM-RX-CAPACITY)
+                                (fail! s c"upstream-frame-too-long")
+                                (if (> (+ (load at) (+ length 4))
+                                       (.upstream-rx-len s))
+                                    (break)
+                                    (do
+                                      (handle-upstream-message s
+                                                               (index base
+                                                                      (+ (load at)
+                                                                         4))
+                                                               length)
+                                      (set! at (+ (load at) (+ length 4)))))))))
+                (when (> (load at) 0)
+                  (memmove base
+                           (index base (load at))
+                           (p/cast isize (- (.upstream-rx-len s) (load at))))
+                  (set! (.upstream-rx-len s)
+                        (- (.upstream-rx-len s) (load at)))
+                  0))
+              0)
+          (or (= n 0)
+              (and (!= (os/errno) EAGAIN)
+                   (!= (os/errno) EINTR)))
+            (close-upstream s)
+          :else 0)
+    0))
+
+;;; A poll tick passed without a word from the daemon. A daemon with no history sends
+;;; no replay at all, and a silent one must not leave clients waiting forever.
+(defn upstream-idle [(s (ptr Session))] (-> i64)
+  (when (.upstream s)
+    (cond (= (.phase s) PHASE-ATTACHED)
+            (do (set! (.phase s) PHASE-LIVE) (finish-upstream-exit s) 0)
+          (< (.phase s) PHASE-LIVE)
+            (do
+              (set! (.patience s) (+ (.patience s) 1))
+              (when (>= (.patience s) UPSTREAM-PATIENCE)
+                (fail! s c"upstream-silent")
+                0)
+              0)
+          :else 0)
+    0)
+  0)
+
+;;; Explicit close ends the terminal in its daemon. It is sent after any partly
+;;; written message, with a time limit so that a wedged daemon cannot wedge this one.
+(defn kill-upstream [(s (ptr Session))] (-> i64)
+  (let [flags (fcntl (.pty s) F-GETFL)
+        (mut timeout)
+          (: (Timeval
+               :seconds 1
+               :microseconds 0
+               :padding 0)
+             Timeval)
+        (mut frame) (: (zeroed (array i8 5)) (array i8 5))
+        bytes (p/cast (ptr i8) (mut frame))]
+    (fcntl (.pty s) F-SETFL (& flags (p/inot (p/cast i32 O-NONBLOCK))))
+    (setsockopt (.pty s)
+                SOL-SOCKET
+                SO-SNDTIMEO
+                (p/cast (ptr i8) (mut timeout))
+                (: 16 u32))
+    (put-byte! bytes 3 (: 1 u8))
+    (put-byte! bytes 4 (p/cast u8 MESSAGE-KILL))
+    (if (and (>= (transport/transfer (.pty s)
+                                     (index (field s upstream-tx)
+                                            (.upstream-tx-at s))
+                                     (- (.upstream-tx-len s)
+                                        (.upstream-tx-at s))
+                                     true)
+                 (: 0 i32))
+             (>= (transport/transfer (.pty s) bytes 5 true) (: 0 i32)))
+        0
+        (fail! s c"upstream-write-input"))
+    0))
+
+;;; The shell a daemon runs, and the size of its terminal. Attaching with the same
+;;; size sends the shell no SIGWINCH, so a running TUI is not disturbed, and history
+;;; replays at the width it was written. Without one, the 80×24 default stands.
+(defn discover-shell [(s (ptr Session)) (daemon i32)] (-> i64)
+  (let [(mut pid) (zeroed i32)
+        (mut length) (: 4 u32)
+        (mut children) (zeroed (array i32 8))]
+    (when (and (>= (getsockopt daemon
+                               SOL-LOCAL
+                               LOCAL-PEERPID
+                               (p/cast (ptr i8) (mut pid))
+                               (mut length))
+                   (: 0 i32))
+               (> (proc_listchildpids (load pid)
+                                      (p/cast (ptr i8) (mut children))
+                                      (: 32 i32))
+                  (: 0 i32)))
+      (set! (.child s) (get (load children) 0))
+      (let [device (bsd-field (.child s) BSDINFO-TDEV)
+            name
+              (if (> device (: 0 i32))
+                  (devname device (: S-IFCHR u16))
+                  (p/cast (ptr i8) 0))]
+        (when (!= (p/cast i64 name) 0)
+          (let [(mut path) (zeroed (array i8 128))
+                out (p/cast (ptr i8) (mut path))
+                name-length (p/cast i64 (strlen name))]
+            (when (< name-length 120)
+              (memcpy out c"/dev/" (p/cast isize 5))
+              (memcpy (index out 5) name (p/cast isize (+ name-length 1)))
+              (let [tty (open out (p/cast i32 (| O-NOCTTY O-NONBLOCK)))]
+                (when (>= tty (: 0 i32))
+                  (let [(mut size) (zeroed Winsize)]
+                    (when (and (>= (ioctl tty
+                                          (p/cast u64 TIOCGWINSZ)
+                                          (p/cast (ptr i8) (mut size)))
+                                   (: 0 i32))
+                               (> (.cols size) (: 0 u16))
+                               (> (.rows size) (: 0 u16)))
+                      (set! (.initial-cols s) (.cols size))
+                      (set! (.initial-rows s) (.rows size))
+                      0))
+                  (close tty)
+                  0))
+              0))
+          0))
+      0)
+    0))
+
+;;; ---- signals that end the service ---------------------------------------------------
+;;; A signal's sender is known only to its handler, and formatting a log line in one is
+;;; not safe. So the handler notes it, and the loop records it and takes the signal's
+;;; default action. SA_SIGINFO is 64 and SA_RESETHAND is 4; SA_RESTART stays off, so
+;;; poll and waitpid return to where this is checked.
+(defn signal-cell [] (-> (ptr i32))
+  (p/alloc-static i32))
+
+(defn sender-cell [] (-> (ptr i32))
+  (p/alloc-static i32))
+
+(defn on-signal [(number i32) (info (ptr i8)) (context (ptr i8))] (-> void)
+  (set! (sender-cell) (load (index (p/cast (ptr i32) info) 3)))
+  (set! (signal-cell) number)
+  (do))
+
+(export-c [on-signal :as "jim_session_on_signal"])
+
+(defn watch-signals! [] (-> i64)
+  (let [(mut action)
+          (: (Sigaction
+               :handler (p/cast (ptr i8) (fnptr-of on-signal))
+               :mask (: 0 u32)
+               :flags (: 68 i32))
+             Sigaction)]
+    (for [i 0 4]
+      (sigaction (cond (= i 0) (: 15 i32)
+                       (= i 1) SIGHUP
+                       (= i 2) (: 2 i32)
+                       :else (: 3 i32))
+                 (mut action)
+                 (p/cast (ptr Sigaction) 0)))
+    0))
+
+(defn check-signals! [] (-> i64)
+  (let [number (load (signal-cell))]
+    (when (!= number (: 0 i32))
+      (let [sender (load (sender-cell))
+            (mut name) (zeroed (array i8 64))
+            out (p/cast (ptr i8) (mut name))]
+        (when (> sender (: 0 i32)) (proc_name sender out (: 64 u32)) 0)
+        (transport/log! c"signal number=%lld from_pid=%lld from=%s"
+                        (p/cast i64 number)
+                        (p/cast i64 sender)
+                        (p/cast i64 out)
+                        0)
+        (raise number)
+        0)
+      0)
+    0))
+
 (defn terminate-child [(s (ptr Session))] (-> i64)
-  (if (.exited s)
+  (if (or (.exited s) (.upstream s))
       0
       (let [foreground (tcgetpgrp (.pty s))]
+        (transport/log! c"ending-shell pid=%lld foreground_pgid=%lld failed=%lld stopping=%lld"
+                        (p/cast i64 (.child s))
+                        (p/cast i64 foreground)
+                        (if (.failed s) 1 0)
+                        (if (.stopping s) 1 0))
         (if (> foreground 0) (kill (- (: 0 i32) foreground) SIGHUP) 0)
         (kill (.child s) SIGHUP)
         (let [(mut attempts) 0
@@ -563,20 +1296,36 @@
                         (if (or (= result (.child s))
                                 (and (< result 0) (= (os/errno) ECHILD)))
                             (do
+                              (transport/log! c"shell-reaped after=hangup status=%lld"
+                                              (p/cast i64 (load status))
+                                              0
+                                              0
+                                              0)
                               (set! (.exited s) true)
                               (return-from :reaped 0))
                             (do
                               (nanosleep (mut delay) (p/cast (ptr Timespec) 0))
                               (set! attempts (+ (load attempts) 1)))))))
+            (transport/log! c"shell-ignored-hangup sending=SIGKILL" 0 0 0 0)
             (if (> foreground 0)
                 (kill (- (: 0 i32) foreground) SIGKILL)
                 0)
             (kill (- (: 0 i32) (.child s)) SIGKILL)
             (kill (.child s) SIGKILL)
+            ; An exiting shell can wait on its terminal draining, which needs the
+            ; master read or closed. Nothing reads it now, so close it, or this waits
+            ; forever.
+            (close (.pty s))
+            (set! (.pty s) (: -1 i32))
             (loop (if (or (>= (waitpid (.child s) (mut status) 0) 0)
                           (!= (os/errno) EINTR))
                       (break)
-                      0))
+                      (do (check-signals!) 0)))
+            (transport/log! c"shell-reaped after=SIGKILL status=%lld"
+                            (p/cast i64 (load status))
+                            0
+                            0
+                            0)
             (set! (.exited s) true)
             0)))))
 
@@ -624,27 +1373,37 @@
                                                          65536)]
                         (if (and (= length 0)
                                  (= kind (p/cast u32 transport/JIM-KILL)))
-                            (do (close fd) (set! (.stopping s) true) 0)
+                            (do
+                              (transport/log-peer! c"kill-requested" fd)
+                              (close fd)
+                              (set! (.stopping s) true)
+                              0)
                             (if (or (!= kind (p/cast u32 transport/JIM-ATTACH))
                                     (!= length (: 8 i32)))
                                 (do (close fd) 0)
                                 (do
-                                  (disconnect-client s)
+                                  (disconnect-client s
+                                                     c"replaced-by-new-attach")
+                                  (transport/log-peer! c"attach" fd)
                                   (set! (.client s) fd)
-                                  (set! (.cursor s) 0)
+                                  (set! (.cursor s) (.start s))
                                   (set! (.replay-end s) (.end s))
+                                  (set! (.base-owed s)
+                                        (if (> (.start s) 0) 2 0))
+                                  (set! (.modes-owed s) (> (.start s) 0))
                                   (set! (.microseconds timeout) 0)
                                   (setsockopt fd
                                               SOL-SOCKET
                                               SO-RCVTIMEO
                                               (p/cast (ptr i8) (mut timeout))
                                               (: 16 u32))
+                                  ; The attach size is a placeholder, and a running TUI
+                                  ; must not see it. The client reports its real
+                                  ; size once replay ends.
                                   (if (set-nonblocking fd)
-                                      (resize-session s
-                                                      (p/cast (ptr i8)
-                                                              (mut data))
-                                                      8)
-                                      (disconnect-client s))))))))))))))
+                                      0
+                                      (disconnect-client s
+                                                         c"set-nonblocking-failed"))))))))))))))
 
 (defn receive-input [(s (ptr Session))] (-> i64)
   (let [base (index (field s rx) 0)
@@ -656,7 +1415,7 @@
     (if (and (< n 0) (or (= (os/errno) EAGAIN) (= (os/errno) EINTR)))
         0
         (if (<= n 0)
-            (disconnect-client s)
+            (disconnect-client s (if (= n 0) c"client-closed" c"recv-failed"))
             (do
               (set! (.rx-len s) (+ (.rx-len s) (p/cast i64 n)))
               (block :frames
@@ -668,7 +1427,7 @@
                                         (p/cast u32 transport/MAGIC))
                                     (> length transport/MAX-PAYLOAD))
                                 (do
-                                  (disconnect-client s)
+                                  (disconnect-client s c"bad-frame-header")
                                   (return-from :frames 0))
                                 (if (< (.rx-len s) (+ length 12))
                                     (break)
@@ -693,7 +1452,8 @@
                                                                          12)
                                                                   length)
                                                   (do
-                                                    (disconnect-client s)
+                                                    (disconnect-client s
+                                                                       c"unknown-frame-kind")
                                                     (return-from :frames 0)))))
                                       (memmove base
                                                (index base (+ length 12))
@@ -744,11 +1504,9 @@
 (defn child-main [(argc i32)
                   (argv (ptr (ptr i8)))
                   (listener i32)
-                  (lock i32)
-                  (journal i32)] (-> void)
+                  (lock i32)] (-> void)
   (close listener)
   (close lock)
-  (close journal)
   (signal SIGPIPE (p/cast (ptr i8) 0))
   (if (< (chdir (load (index argv 2))) 0) (do (_exit 1) 0) 0)
   (setenv c"TERM" c"xterm-ghostty" 1)
@@ -777,6 +1535,14 @@
           (_exit 127)))))
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (if (and (>= argc 3) (= (strcmp (load (index argv 1)) c"--adopt") (: 0 i32)))
+      (serve (- argc (: 2 i32)) (index argv 2) (load (index argv 2)))
+      (serve argc argv (p/cast (ptr i8) 0))))
+
+;;; UPSTREAM, unless null, is the socket of the original Jim daemon to adopt. Its
+;;; connection stands where the PTY would be, opened before this process detaches so
+;;; that the launcher learns if the daemon is gone.
+(defn serve [(argc i32) (argv (ptr (ptr i8))) (upstream (ptr i8))] (-> i64)
   (if (< argc 4)
       2
       (let [socket-path (load (index argv 1))]
@@ -819,9 +1585,33 @@
                                               (p/cast i32 (| LOCK-EX LOCK-NB)))
                                        0))
                                 1
-                                (let [(mut detached) (fork)]
+                                (let [adopting (!= (p/cast i64 upstream) 0)
+                                      connected
+                                        (if adopting
+                                            (transport/session-connect upstream)
+                                            (: -1 i32))
+                                      ; Nothing is listening there. Any other failure
+                                      ; says nothing about whether the daemon lives.
+                                      gone
+                                        (and adopting
+                                             (< connected (: 0 i32))
+                                             (or (= (os/errno) transport/ENOENT)
+                                                 (= (os/errno)
+                                                    transport/ECONNREFUSED)))
+                                      ; Above the descriptors stdio will occupy.
+                                      daemon
+                                        (if (>= connected (: 0 i32))
+                                            (fcntl connected F-DUPFD-CLOEXEC 3)
+                                            (: -1 i32))
+                                      (mut detached)
+                                        (if (and adopting (< daemon (: 0 i32)))
+                                            (: -1 i32)
+                                            (fork))]
+                                  (when (>= connected (: 0 i32))
+                                    (close connected)
+                                    0)
                                   (if (< (load detached) 0)
-                                      1
+                                      (if gone transport/EXIT-UPSTREAM-GONE 1)
                                       (if (> (load detached) 0)
                                           0
                                           (do
@@ -871,11 +1661,19 @@
                                                                  FD-CLOEXEC)
                                                           (if (not (set-nonblocking listener))
                                                               1
-                                                              (let [journal-file
-                                                                      (tmpfile)]
-                                                                (if (= journal-file
-                                                                       (p/cast (ptr i8)
-                                                                               0))
+                                                              (let [journal
+                                                                      (mmap (p/cast (ptr i8)
+                                                                                    0)
+                                                                            (p/cast u64
+                                                                                    JOURNAL-CAPACITY)
+                                                                            PROT-READ-WRITE
+                                                                            MAP-PRIVATE-ANON
+                                                                            (: -1
+                                                                               i32)
+                                                                            0)]
+                                                                (if (= (p/cast i64
+                                                                               journal)
+                                                                       -1)
                                                                     1
                                                                     (let [s
                                                                             (p/alloc-static Session)]
@@ -888,13 +1686,16 @@
                                                                             (: -1
                                                                                i32))
                                                                       (set! (.journal s)
-                                                                            (fileno journal-file))
+                                                                            journal)
                                                                       (set! (.color-scheme s)
                                                                             (: 1
                                                                                i32))
-                                                                      (fcntl (.journal s)
-                                                                             F-SETFD
-                                                                             FD-CLOEXEC)
+                                                                      (set! (.initial-cols s)
+                                                                            (: 80
+                                                                               u16))
+                                                                      (set! (.initial-rows s)
+                                                                            (: 24
+                                                                               u16))
                                                                       (let [(mut scrollback)
                                                                               (: 10000
                                                                                  u64)]
@@ -930,72 +1731,123 @@
                                                                                                     7
                                                                                                     (p/cast (ptr i8)
                                                                                                             (fnptr-of terminal-color-scheme)))
-                                                                              (let [(mut initial-size)
-                                                                                      (: (Winsize
-                                                                                           :rows
-                                                                                             (: 24
-                                                                                                u16)
-                                                                                           :cols
-                                                                                             (: 80
-                                                                                                u16)
-                                                                                           :width
-                                                                                             (: 0
-                                                                                                u16)
-                                                                                           :height
-                                                                                             (: 0
-                                                                                                u16))
-                                                                                         Winsize)]
-                                                                                (set! (.child s)
-                                                                                      (forkpty (field s
-                                                                                                      pty)
-                                                                                               (p/cast (ptr i8)
-                                                                                                       0)
-                                                                                               (p/cast (ptr i8)
-                                                                                                       0)
-                                                                                               (mut initial-size)))
-                                                                                (if (< (.child s)
-                                                                                       0)
-                                                                                    1
-                                                                                    (if (= (.child s)
+                                                                              (if adopting
+                                                                                  (do
+                                                                                    (set! (.pty s)
+                                                                                          daemon)
+                                                                                    (set! (.upstream s)
+                                                                                          true)
+                                                                                    (set! (.upstream-exit s)
+                                                                                          NO-EXIT)
+                                                                                    (discover-shell s
+                                                                                                    daemon)
+                                                                                    (ghostty_terminal_resize (.terminal s)
+                                                                                                             (.initial-cols s)
+                                                                                                             (.initial-rows s)
+                                                                                                             (: 0
+                                                                                                                u32)
+                                                                                                             (: 0
+                                                                                                                u32))
+                                                                                    (run-session s
+                                                                                                 listener
+                                                                                                 socket-path
+                                                                                                 (load lock)))
+                                                                                  (let [(mut initial-size)
+                                                                                          (: (Winsize
+                                                                                               :rows
+                                                                                                 (: 24
+                                                                                                    u16)
+                                                                                               :cols
+                                                                                                 (: 80
+                                                                                                    u16)
+                                                                                               :width
+                                                                                                 (: 0
+                                                                                                    u16)
+                                                                                               :height
+                                                                                                 (: 0
+                                                                                                    u16))
+                                                                                             Winsize)]
+                                                                                    (set! (.child s)
+                                                                                          (forkpty (field s
+                                                                                                          pty)
+                                                                                                   (p/cast (ptr i8)
+                                                                                                           0)
+                                                                                                   (p/cast (ptr i8)
+                                                                                                           0)
+                                                                                                   (mut initial-size)))
+                                                                                    (if (< (.child s)
                                                                                            0)
-                                                                                        (do
-                                                                                          (child-main argc
-                                                                                                      argv
-                                                                                                      listener
-                                                                                                      (load lock)
-                                                                                                      (.journal s))
-                                                                                          1)
-                                                                                        (run-session s
-                                                                                                     listener
-                                                                                                     journal-file
-                                                                                                     socket-path
-                                                                                                     (load lock))))))))))))))))))))))))))))))))
+                                                                                        1
+                                                                                        (if (= (.child s)
+                                                                                               0)
+                                                                                            (do
+                                                                                              (child-main argc
+                                                                                                          argv
+                                                                                                          listener
+                                                                                                          (load lock))
+                                                                                              1)
+                                                                                            (run-session s
+                                                                                                         listener
+                                                                                                         socket-path
+                                                                                                         (load lock)))))))))))))))))))))))))))))))))
 
 (defn run-session [(s (ptr Session))
                    (listener i32)
-                   (journal-file (ptr i8))
                    (socket-path (ptr i8))
                    (lock i32)] (-> i64)
+  (let [(mut tag) (zeroed (array i8 40))
+        name (strrchr socket-path (: 47 i32))
+        out (p/cast (ptr i8) (mut tag))]
+    (snprintf out
+              (: 40 u64)
+              c"%.8s"
+              (if (= (p/cast i64 name) 0) socket-path (index name 1)))
+    (transport/log-open! socket-path out)
+    (transport/log! c"service-start shell_pid=%lld adopted=%lld journal_end=%lld"
+                    (p/cast i64 (.child s))
+                    (if (.upstream s) 1 0)
+                    (.end s)
+                    0)
+    (watch-signals!)
+    0)
   (if (not (set-nonblocking (.pty s)))
       1
       (let [(mut initial) (: (zeroed (array i8 8)) (array i8 8))
-            initial-bytes (p/cast (ptr i8) (mut initial))]
-        (put-byte! initial-bytes 1 (: 80 u8))
-        (put-byte! initial-bytes 3 (: 24 u8))
+            initial-bytes (p/cast (ptr i8) (mut initial))
+            ; Out here because stack cells last until the function returns: inside
+            ; the loop, each poll would grow the stack until the service crashed.
+            fds (p/alloc-stack (array PollFd 3))]
+        (put-byte! initial-bytes
+                   0
+                   (p/cast u8 (>> (.initial-cols s) (: 8 u16))))
+        (put-byte! initial-bytes 1 (p/cast u8 (.initial-cols s)))
+        (put-byte! initial-bytes
+                   2
+                   (p/cast u8 (>> (.initial-rows s) (: 8 u16))))
+        (put-byte! initial-bytes 3 (p/cast u8 (.initial-rows s)))
         (append-frame s (p/cast u32 transport/JIM-RESIZE) initial-bytes 8)
+        (when (.upstream s)
+          (encode-size s MESSAGE-ATTACH (.initial-cols s) (.initial-rows s))
+          0)
         (loop (if (or (.failed s) (.stopping s))
                   (break)
                   (do
+                    (check-signals!)
                     (update-directory s)
+                    (trim-journal s)
                     (prepare-output s)
-                    (let [fds (p/alloc-stack (array PollFd 3))
-                          listener-fd (index fds 0)
+                    (let [listener-fd (index fds 0)
                           pty-fd (index fds 1)
                           client-fd (index fds 2)]
                       (set! listener-fd
                             (PollFd
                               :fd listener
-                              :events (p/cast i16 POLLIN)
+                              :events
+                                (p/cast i16
+                                        (if (and (.upstream s)
+                                                 (< (.phase s) PHASE-LIVE))
+                                            0
+                                            POLLIN))
                               :revents (: 0 i16)))
                       (set! pty-fd
                             (PollFd
@@ -1005,8 +1857,10 @@
                                         (if (.exited s)
                                             0
                                             (| POLLIN
-                                               (if (< (.input-at s)
-                                                      (.input-len s))
+                                               (if (if (.upstream s)
+                                                       (upstream-pending? s)
+                                                       (< (.input-at s)
+                                                          (.input-len s)))
                                                    POLLOUT
                                                    0))))
                               :revents (: 0 i16)))
@@ -1032,23 +1886,32 @@
                         (if (< selected 0)
                             (if (= (os/errno) EINTR)
                                 0
-                                (set! (.failed s) true))
-                            (service-ready s
-                                           listener
-                                           listener-fd
-                                           pty-fd
-                                           client-fd)))))))
+                                (fail! s c"poll"))
+                            (do
+                              (when (= selected (: 0 i32)) (upstream-idle s) 0)
+                              (service-ready s
+                                             listener
+                                             listener-fd
+                                             pty-fd
+                                             client-fd))))))))
         (if (and (.failed s) (>= (.client s) 0))
             (transport/session-send (.client s)
                                     (p/cast u32 transport/JIM-ERROR)
-                                    c"Terminal service stopped: journal or I/O failure"
-                                    47)
+                                    (failure-reason)
+                                    (p/cast i64 (strlen (failure-reason))))
             0)
         (terminate-child s)
-        (disconnect-client s)
+        (when (and (.upstream s) (.stopping s) (not (.exited s)))
+          (kill-upstream s)
+          0)
+        (disconnect-client s c"service-stopping")
+        (transport/log! c"service-exit failed=%lld stopping=%lld shell_exited=%lld"
+                        (if (.failed s) 1 0)
+                        (if (.stopping s) 1 0)
+                        (if (.exited s) 1 0)
+                        0)
         (if (>= (.pty s) 0) (close (.pty s)) 0)
         (ghostty_terminal_free (.terminal s))
-        (fclose journal-file)
         (close listener)
         (unlink socket-path)
         (close lock)
@@ -1063,7 +1926,15 @@
           (: 0 i32))
       (accept-client s listener)
       0)
-  (if (and (not (.exited s))
+  (if (and (.upstream s)
+           (not (.exited s))
+           (!= (& (p/cast i32 (.revents pty-fd))
+                  (p/cast i32 (| POLLIN POLLHUP POLLERR)))
+               (: 0 i32)))
+      (read-upstream s)
+      0)
+  (if (and (not (.upstream s))
+           (not (.exited s))
            (!= (& (p/cast i32 (.revents pty-fd))
                   (p/cast i32 (| POLLIN POLLHUP)))
                (: 0 i32)))
@@ -1072,16 +1943,11 @@
             n (read (.pty s) input (p/cast isize 32768))]
         (if (> n 0)
             (do
-              (if (append-frame s
-                                (p/cast u32 transport/JIM-OUTPUT)
-                                input
-                                (p/cast i64 n))
-                  (do
-                    (ghostty_terminal_vt_write (.terminal s)
-                                               input
-                                               (p/cast u64 n))
-                    0)
-                  0)
+              (append-frame s
+                            (p/cast u32 transport/JIM-OUTPUT)
+                            input
+                            (p/cast i64 n))
+              (ghostty_terminal_vt_write (.terminal s) input (p/cast u64 n))
               0)
             (if (or (= n 0) (and (< n 0) (= (os/errno) EIO)))
                 (let [(mut status) (zeroed i32)
@@ -1094,6 +1960,11 @@
                                   (p/cast u32 (+ 128 (p/cast i64 (& raw 127)))))
                             (mut encoded) (zeroed (array i8 4))
                             out (p/cast (ptr i8) (mut encoded))]
+                        (transport/log! c"shell-exited-on-its-own pid=%lld code=%lld signal=%lld raw_status=%lld"
+                                        (p/cast i64 (.child s))
+                                        (p/cast i64 code)
+                                        (p/cast i64 (& raw 127))
+                                        (p/cast i64 raw))
                         (set! (.exited s) true)
                         (put-u32-be! out 0 code)
                         (append-frame s (p/cast u32 transport/JIM-EXITED) out 4)
@@ -1103,7 +1974,15 @@
                       0))
                 0)))
       0)
-  (if (and (not (.exited s))
+  (if (and (.upstream s)
+           (not (.exited s))
+           (not (.failed s))
+           (!= (& (p/cast i32 (.revents pty-fd)) (p/cast i32 POLLOUT))
+               (: 0 i32)))
+      (write-upstream s)
+      0)
+  (if (and (not (.upstream s))
+           (not (.exited s))
            (!= (& (p/cast i32 (.revents pty-fd)) (p/cast i32 POLLOUT))
                (: 0 i32)))
       (let [base (index (field s input) 0)
@@ -1137,7 +2016,7 @@
                   (if (and (< n 0)
                            (!= (os/errno) EAGAIN)
                            (!= (os/errno) EINTR))
-                      (disconnect-client s)
+                      (disconnect-client s c"send-failed")
                       0)))
             0))
       0)

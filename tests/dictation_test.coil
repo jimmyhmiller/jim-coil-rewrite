@@ -1,0 +1,265 @@
+(module jim.dictation-test)
+(import "jim.dictation-core" :as core)
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(extern strcmp :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern strstr :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern malloc :cc (cc/C) [u64] (-> (ptr i8)))
+
+(extern free :cc (cc/C) [(ptr i8)] (-> void))
+
+(extern memcpy :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (= (strcmp a b) (: 0 i32)))
+
+;;; COUNT samples at LEVEL, appended to BUFFER.
+(defn add-audio! [(buffer (ptr core/Samples)) (seconds f64) (level f32)]
+  (-> i64)
+  (let [count (p/cast i64 (* seconds 16000.0))
+        (mut sample) level]
+    (for [i 0 count]
+      (core/samples-push! buffer (mut sample) 1))
+    0))
+
+(defn push-all! [(seg (ptr core/Segmenter))
+                 (from (ptr core/Samples))
+                 (closed (ptr core/Phrases))
+                 (chunk i64)] (-> i64)
+  (let [(mut at) 0]
+    (loop (if (>= (load at) (.len from))
+              (break)
+              (let [n
+                      (if (> (+ (load at) chunk) (.len from))
+                          (- (.len from) (load at))
+                          chunk)]
+                (core/segmenter-push! seg
+                                      (index (.data from) (load at))
+                                      n
+                                      closed)
+                (set! at (+ (load at) n)))))
+    0))
+
+(deftest a-pause-closes-the-phrase-with-its-trailing-quiet
+  (let [(mut seg) (zeroed core/Segmenter)
+        (mut closed) (zeroed core/Phrases)
+        (mut audio) (zeroed core/Samples)]
+    (add-audio! (mut audio) 1.0 (: 0.3 f32))
+    (add-audio! (mut audio) 0.8 (: 0.0 f32))
+    (core/segmenter-push! (mut seg) (.data audio) (.len audio) (mut closed))
+    (assert (= (.len closed) 1))
+    ; 1 s of speech and 0.7 s of quiet, with 0.1 s left in flight.
+    (assert (= (.len (load (index (.items closed) 0))) 27200))
+    (assert (= (.len (.audio seg)) 1600))))
+
+(deftest a-short-breath-does-not-close-the-phrase
+  (let [(mut seg) (zeroed core/Segmenter)
+        (mut closed) (zeroed core/Phrases)
+        (mut audio) (zeroed core/Samples)]
+    (add-audio! (mut audio) 1.0 (: 0.3 f32))
+    (add-audio! (mut audio) 0.5 (: 0.0 f32))
+    (add-audio! (mut audio) 0.5 (: 0.3 f32))
+    (core/segmenter-push! (mut seg) (.data audio) (.len audio) (mut closed))
+    (assert (= (.len closed) 0))))
+
+(deftest closes-the-same-way-however-the-audio-is-chunked
+  (let [(mut seg) (zeroed core/Segmenter)
+        (mut closed) (zeroed core/Phrases)
+        (mut audio) (zeroed core/Samples)]
+    (add-audio! (mut audio) 1.0 (: 0.3 f32))
+    (add-audio! (mut audio) 0.8 (: 0.0 f32))
+    (push-all! (mut seg) (mut audio) (mut closed) 37)
+    (assert (= (.len closed) 1))
+    (assert (= (.len (load (index (.items closed) 0))) 27200))))
+
+(deftest a-monologue-is-capped-at-its-quietest-moment
+  (let [(mut seg) (zeroed core/Segmenter)
+        (mut closed) (zeroed core/Phrases)
+        (mut audio) (zeroed core/Samples)]
+    (add-audio! (mut audio) 12.0 (: 0.3 f32))
+    (add-audio! (mut audio) 0.2 (: 0.05 f32))
+    (add-audio! (mut audio) 3.0 (: 0.3 f32))
+    (core/segmenter-push! (mut seg) (.data audio) (.len audio) (mut closed))
+    (assert (= (.len closed) 1))
+    ; Cut at the first quiet block's end: 12 s and 50 ms.
+    (assert (= (.len (load (index (.items closed) 0))) 192800))))
+
+(deftest an-idle-microphone-keeps-only-the-last-second
+  (let [(mut seg) (zeroed core/Segmenter)
+        (mut closed) (zeroed core/Phrases)
+        (mut audio) (zeroed core/Samples)]
+    (add-audio! (mut audio) 16.0 (: 0.001 f32))
+    (core/segmenter-push! (mut seg) (.data audio) (.len audio) (mut closed))
+    (assert (= (.len closed) 0))
+    (assert (< (.len (.audio seg)) 32000))))
+
+(deftest flattening-keeps-one-line-and-tidies-punctuation
+  (assert (same? (core/flatten-text c"  one\n two  three ") c"one two three"))
+  (assert (same? (core/flatten-text c"the weekend . And so , on")
+                 c"the weekend. And so, on"))
+  (assert (same? (core/flatten-text c"a .5 inch") c"a .5 inch"))
+  (assert (same? (core/flatten-text c"") c"")))
+
+(deftest joining-keeps-exactly-one-space
+  (assert (same? (core/join-text c"a" c"b") c"a b"))
+  (assert (same? (core/join-text c"" c"b") c"b"))
+  (assert (same? (core/join-text c"a" c"") c"a"))
+  (assert (same? (core/join-text c"" c"") c"")))
+
+(deftest revisions-count-characters-not-bytes
+  (assert (= (core/char-count c"café") 4))
+  (assert (= (core/common-prefix c"config fill" c"config file") 10))
+  (assert (= (core/common-prefix c"same" c"same") 4))
+  ; Both start the same é's first byte, but neither may split it.
+  (assert (= (core/common-prefix c"café" c"cafè") 3)))
+
+(deftest the-tail-starts-on-a-character
+  (assert (= (core/tail-start c"café" 1) 5))
+  (assert (= (core/tail-start c"hello" 3) 2))
+  (assert (= (core/tail-start c"hi" 10) 0)))
+
+(deftest wav-header-describes-16-bit-mono-at-16-khz
+  (let [(mut samples) (zeroed core/Samples)
+        (mut one) (: 1.0 f32)
+        (mut over) (: 5.0 f32)]
+    (core/samples-push! (mut samples) (mut one) 1)
+    (core/samples-push! (mut samples) (mut over) 1)
+    (let [wav (core/encode-wav (.data samples) 2)]
+      (assert (= (core/byte-at wav 0) (: 82 u8)))
+      (assert (= (core/byte-at wav 22) (: 1 u8)))
+      (assert (= (core/byte-at wav 24) (: 128 u8)))
+      (assert (= (core/byte-at wav 25) (: 62 u8)))
+      (assert (= (core/byte-at wav 40) (: 4 u8)))
+      ; 32767 and a clamped 32767.
+      (assert (= (core/byte-at wav 44) (: 255 u8)))
+      (assert (= (core/byte-at wav 45) (: 127 u8)))
+      (assert (= (core/byte-at wav 47) (: 127 u8))))))
+
+(defn mutable-copy [(text (ptr i8))] (-> (ptr i8))
+  (let [n (core/strlen text)
+        out (malloc (+ n (: 1 u64)))]
+    (memcpy out text (+ n (: 1 u64)))
+    out))
+
+(deftest http-responses-yield-their-bodies
+  (let [(mut length) 0
+        plain
+          (mutable-copy c"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+        body
+          (core/http-body plain (p/cast i64 (core/strlen plain)) (mut length))]
+    (assert (= (load length) 5))
+    (assert (= (core/byte-at body 0) (: 104 u8))))
+  (let [(mut length) 0
+        chunked
+          (mutable-copy c"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+        body
+          (core/http-body chunked
+                          (p/cast i64 (core/strlen chunked))
+                          (mut length))]
+    (assert (= (load length) 11))
+    (assert (= (core/byte-at body 6) (: 119 u8))))
+  (let [(mut length) 0
+        failed (mutable-copy c"HTTP/1.1 500 Oops\r\n\r\nno")]
+    (assert (= (p/cast i64
+                       (core/http-body failed
+                                       (p/cast i64 (core/strlen failed))
+                                       (mut length)))
+               0)))
+  (let [(mut length) 0
+        cut
+          (mutable-copy c"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")]
+    (assert (= (p/cast i64
+                       (core/http-body cut
+                                       (p/cast i64 (core/strlen cut))
+                                       (mut length)))
+               0))))
+
+;;; ---- the real engine --------------------------------------------------------------
+
+(extern printf :cc (cc/C) [(ptr i8) ...] (-> i32))
+
+(extern system :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern fopen :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern fread :cc (cc/C) [(ptr i8) u64 u64 (ptr i8)] (-> u64))
+
+(extern fclose :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern strcasestr :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern memcmp :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> i32))
+
+;;; Spoken words as 16 kHz floats, by the system's speech synthesizer.
+(defn spoken [(out (ptr core/Samples))] (-> bool)
+  (if (!= (system c"say -o build/dictation-test.wav --file-format=WAVE --data-format=LEI16@16000 'The quick brown fox jumps over the lazy dog. Dictation works in the terminal now.'")
+          (: 0 i32))
+      false
+      (let [file (fopen c"build/dictation-test.wav" c"r")
+            capacity (: 4000000 u64)
+            bytes (malloc capacity)
+            n (p/cast i64 (fread bytes (: 1 u64) capacity file))
+            (mut at) 12]
+        (fclose file)
+        (loop (if (or (>= (+ (load at) 8) n)
+                      (= (memcmp (index bytes (load at)) c"data" (: 4 u64))
+                         (: 0 i32)))
+                  (break)
+                  (let [size
+                          (| (p/cast i64 (core/byte-at bytes (+ (load at) 4)))
+                             (<< (p/cast i64
+                                         (core/byte-at bytes (+ (load at) 5)))
+                                 8)
+                             (<< (p/cast i64
+                                         (core/byte-at bytes (+ (load at) 6)))
+                                 16))]
+                    (set! at (+ (load at) 8 size)))))
+        (let [from (+ (load at) 8)]
+          (loop (if (>= (+ (load at) 8 2) n)
+                    (break)
+                    (let [i (load at)]
+                      (set! at (+ i 2))
+                      (let [low (p/cast i64 (core/byte-at bytes (+ i 8)))
+                            high (p/cast i64 (core/byte-at bytes (+ i 9)))
+                            value (| low (<< high 8))
+                            signed (if (>= value 32768) (- value 65536) value)
+                            (mut sample) (/ (p/cast f32 signed) (: 32768.0 f32))]
+                        (core/samples-push! out (mut sample) 1)))))
+          (free bytes)
+          (> from 0)))))
+
+;;; Uses the real shared server when one is up, so it needs no install to pass elsewhere.
+(deftest real-speech-through-a-real-phonon-server
+  (if (< (core/recorded-port) (: 0 i32))
+      (println "skipped: no Phonon server is running")
+      (let [(mut audio) (zeroed core/Samples)
+            (mut session) (zeroed core/Session)
+            state (p/cast (ptr core/Session) (mut session))
+            (mut at) 0
+            (mut changes) 0]
+        (assert (spoken (mut audio)))
+        (assert (> (.len audio) 16000))
+        (core/session-init! state)
+        ; A tenth of a second at a time, as capture delivers it.
+        (loop (if (>= (load at) (.len audio))
+                  (break)
+                  (let [n
+                          (if (> (+ (load at) 1600) (.len audio))
+                              (- (.len audio) (load at))
+                              1600)]
+                    (core/session-push! state (index (.data audio) (load at)) n)
+                    (set! at (+ (load at) n))
+                    (let [step (core/session-step! state)]
+                      (assert (>= step 0))
+                      (when (> step 0) (set! changes (+ (load changes) 1)) 0)))))
+        (assert (core/session-finish! state))
+        (let [text (core/session-text state)]
+          (printf c"heard: %s (%lld live updates)\n" text (load changes))
+          (assert (> (load changes) 0))
+          (assert (!= (p/cast i64 (strcasestr text c"quick brown fox")) 0))
+          (assert (!= (p/cast i64 (strcasestr text c"terminal")) 0)))
+        (core/session-free! state)
+        (do))))

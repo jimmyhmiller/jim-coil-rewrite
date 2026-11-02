@@ -9,7 +9,7 @@
 
 ;;; Stable action IDs are shared by shortcuts and the searchable registry.
 ;;; Fixed actions come first; one action per project follows.
-(const FIRST-PROJECT 30)
+(const FIRST-PROJECT 32)
 
 (defn count [] (-> i64)
   (+ FIRST-PROJECT (storage/count (projects/list (load (model))))))
@@ -45,6 +45,8 @@
         (= id 27) c"Terminal: Reconnect focused terminal"
         (= id 28) c"Widget: Open widget"
         (= id 29) c"View: Toggle Exposé"
+        (= id 30) c"Project: Import from original Jim"
+        (= id 31) c"Dictation: Start or stop hands-free"
         :else
           (utf8 (msg (ptr i8)
                      (ns c"Project: ")
@@ -69,6 +71,7 @@
         (= id 13) c"⌘3"
         (= id 14) c"⌘4"
         (= id 29) c"⌘⇧E"
+        (= id 31) c"⌘⇧T"
         :else c""))
 
 (defn keywords [(id i64)] (-> (ptr i8))
@@ -80,6 +83,9 @@
         (= id 28) c" coil hot reload funct pane new"
         (= id 29)
           c" expose overview windows spread grid mission control tile arrange"
+        (= id 30) c" adopt migrate old daemon sessions running shells terminals"
+        (= id 31)
+          c" transcribe transcript live speech voice microphone phonon talk"
         :else c""))
 
 ;;; Original Jim's subsequence score: consecutive and word-start bonuses.
@@ -155,7 +161,8 @@
   (let [command (!= (& flags 1048576) (: 0 u64))
         shift (!= (& flags 131072) (: 0 u64))]
     (if command
-        (cond (or (= key (: 17 u16)) (= key (: 45 u16))) 0
+        (cond (and shift (= key (: 17 u16))) 31
+              (or (= key (: 17 u16)) (= key (: 45 u16))) 0
               (= key (: 13 u16)) 1
               (= key (: 29 u16)) (if shift 2 3)
               (= key (: 24 u16)) 5

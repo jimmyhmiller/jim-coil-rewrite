@@ -1,3 +1,11 @@
+# Restarting the app
+
+After making a change the user asked for, restart the app yourself so they can see
+it, without being asked or telling them to. Always use `./scripts/dev-restart.sh`. Do
+not substitute `coil run`, a direct binary launch, or a bare `open`: `open` forwards
+the caller's environment into the app and every new terminal. Wait for it to print
+`verified` before reporting success.
+
 # Coil development workflow
 
 Before writing Coil, read the relevant installed guide topics, especially
@@ -27,7 +35,9 @@ Terminal sessions belong to Jim's private service. Do not introduce tmux or
 another terminal multiplexer. App shutdown detaches; explicit pane/project
 closure terminates the corresponding sessions. Preserve stable session IDs.
 Run `python3 tests/session_test.py` after building the service for lifecycle or
-protocol changes. Verify real app quit/reopen for renderer integration changes.
+protocol changes. Its adoption tests run the real original `jim-daemon` in a private
+runtime directory. Never connect to a socket in `/tmp/.terminal-bevy-*` while testing:
+connecting drops original Jim's client for that live terminal. Verify real app quit/reopen for renderer integration changes.
 Format native Coil boundary code with `coil fmt` and the Ghostty extension with
 `zig fmt`. Export
 native callbacks with `export-c`; `fnptr-of` then selects their C ABI wrappers

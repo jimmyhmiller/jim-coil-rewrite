@@ -1,0 +1,210 @@
+;;; Reading what original Jim saved, to bring its running terminals across.
+(module jim.original)
+(import "jim.native" :use *)
+(import "jim.storage" :as storage)
+(import "jim.projects" :as projects)
+(import "jim.sessions" :as sessions)
+(import "coil.primitive" :as p)
+
+;;; Saved panes must stay within these for a layout to be restorable.
+(const MIN-WIDTH 320.0)
+
+(const MAX-WIDTH 4096.0)
+
+(const MIN-HEIGHT 180.0)
+
+(const MAX-HEIGHT 4096.0)
+
+(defn parse [(data (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       (class c"NSJSONSerialization")
+       (sel c"JSONObjectWithData:options:error:")
+       [(ptr i8) u64 (ptr i8)]
+       data
+       1
+       (nil)))
+
+;;; Original Jim's saved state, or nil if there is none it can read.
+(defn read-state [] (-> (ptr i8))
+  (let [data
+          (msg (ptr i8)
+               (class c"NSData")
+               (sel c"dataWithContentsOfFile:")
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (ns c"~/.jim/projects.json")
+                    (sel c"stringByExpandingTildeInPath")
+                    []))]
+    (if (= (p/cast i64 data) 0) (nil) (parse data))))
+
+(defn session-id [(pane (ptr i8))] (-> i64)
+  (p/cast i64 (storage/value (storage/get pane c"config") c"session_id")))
+
+(defn terminal? [(pane (ptr i8))] (-> bool)
+  (let [kind (storage/get pane c"kind")]
+    (and (storage/kind? kind c"NSString")
+         (!= (msg i8 kind (sel c"isEqualToString:") [(ptr i8)] (ns c"terminal"))
+             (: 0 i8))
+         (storage/numeric? (storage/get pane c"config") c"session_id")
+         (storage/numeric? pane c"project_id"))))
+
+;;; The saved panes that are terminals.
+(defn terminals [(state (ptr i8))] (-> (ptr i8))
+  (let [panes (storage/get state c"panes")
+        result (storage/array)]
+    (for [i 0 (storage/count panes)]
+      (when (terminal? (storage/at panes i))
+        (storage/add! result (storage/at panes i))
+        0))
+    result))
+
+;;; The project PANE belongs to, or nil.
+(defn project-of [(state (ptr i8)) (pane (ptr i8))] (-> (ptr i8))
+  (projects/find (storage/get state c"projects")
+                 (p/cast i64 (storage/value pane c"project_id"))))
+
+(defn name-of [(project (ptr i8))] (-> (ptr i8))
+  (storage/get project c"name"))
+
+;;; Where a project's new terminals start, from its saved default.
+(defn directory-of [(project (ptr i8))] (-> (ptr i8))
+  (let [saved (storage/get project c"default_cwd")]
+    (if (storage/kind? saved c"NSString")
+        saved
+        (msg (ptr i8) (ns c"~") (sel c"stringByExpandingTildeInPath") []))))
+
+(defn clamp [(value f64) (low f64) (high f64)] (-> f64)
+  (cond (< value low) low (> value high) high :else value))
+
+(defn component [(pane (ptr i8)) (key (ptr i8)) (i i64)] (-> f64)
+  (let [v (storage/at (storage/get pane key) i)]
+    (if (storage/kind? v c"NSNumber") (msg f64 v (sel c"doubleValue") []) 0.0)))
+
+;;; PANE's position in the same top-left, y-down world as this Jim's, moved right by
+;;; SHIFT, where the camera can pan to it, and sized so its layout stays restorable.
+(defn bounds [(pane (ptr i8)) (shift f64)] (-> Rect)
+  (rect (+ (clamp (component pane c"pos" 0) 0.0 1000000000.0) shift)
+        (clamp (component pane c"pos" 1) 0.0 1000000000.0)
+        (clamp (component pane c"size" 0) MIN-WIDTH MAX-WIDTH)
+        (clamp (component pane c"size" 1) MIN-HEIGHT MAX-HEIGHT)))
+
+;;; Whether a pane in a project of MODEL already holds original terminal ORIGINAL.
+;;; Reads the saved layouts, so save first.
+(defn imported? [(model (ptr i8)) (original i64)] (-> bool)
+  (let [records (projects/list model)
+        (mut found) false]
+    (for [i 0 (storage/count records)]
+      (let [panes
+              (storage/get (storage/get (storage/at records i) c"layout")
+                           c"panes")]
+        (for [k 0 (storage/count panes)]
+          (let [pane (storage/at panes k)]
+            (when (and (storage/numeric? pane c"original")
+                       (= (p/cast i64 (storage/value pane c"original"))
+                          original))
+              (set! found true)
+              0)))))
+    (load found)))
+
+(defn listed? [(seen (ptr i8)) (original i64)] (-> bool)
+  (!= (msg i8
+           seen
+           (sel c"containsObject:")
+           [(ptr i8)]
+           (storage/number (p/cast f64 original)))
+      (: 0 i8)))
+
+;;; The project of MODEL named NAME, or nil.
+(defn project-named [(model (ptr i8)) (name (ptr i8))] (-> (ptr i8))
+  (let [records (projects/list model)
+        (mut found) (nil)]
+    (for [i 0 (storage/count records)]
+      (when (!= (msg i8
+                     (storage/get (storage/at records i) c"name")
+                     (sel c"isEqualToString:")
+                     [(ptr i8)]
+                     name)
+                (: 0 i8))
+        (set! found (storage/at records i))
+        0))
+    (load found)))
+
+;;; Whether a saved project has what a project here must have.
+(defn project? [(project (ptr i8))] (-> bool)
+  (and (storage/numeric? project c"id")
+       (storage/kind? (storage/get project c"name") c"NSString")))
+
+;;; Add the saved project FROM to MODEL under its name and directory.
+(defn add-project! [(model (ptr i8)) (from (ptr i8))] (-> (ptr i8))
+  (let [created (projects/new-project! model (name-of from))]
+    (storage/put! created c"directory" (directory-of from))
+    created))
+
+;;; FROM's saved terminals that MODEL does not hold yet, each daemon once. With
+;;; CHECK-ALIVE, only those still running: connecting drops a daemon's client, so
+;;; pass it only when original Jim is closed.
+(defn pending-terminals [(model (ptr i8))
+                         (state (ptr i8))
+                         (from (ptr i8))
+                         (check-alive bool)] (-> (ptr i8))
+  (let [panes (terminals state)
+        wanted (projects/id from)
+        result (storage/array)
+        seen (storage/array)]
+    (for [i 0 (storage/count panes)]
+      (let [pane (storage/at panes i)
+            id (session-id pane)]
+        (when (and (= (p/cast i64 (storage/value pane c"project_id")) wanted)
+                   (not (listed? seen id))
+                   (not (imported? model id))
+                   (or (not check-alive) (sessions/original-alive? id)))
+          (storage/add! seen (storage/number (p/cast f64 id)))
+          (storage/add! result pane)
+          0)))
+    result))
+
+;;; Whether importing FROM would bring anything: the project, or terminals.
+(defn importable? [(model (ptr i8))
+                   (state (ptr i8))
+                   (from (ptr i8))
+                   (check-alive bool)] (-> bool)
+  (and (project? from)
+       (or (= (p/cast i64 (project-named model (name-of from))) 0)
+           (> (storage/count (pending-terminals model state from check-alive))
+              0))))
+
+;;; What the picker shows for FROM.
+(defn choice-title [(model (ptr i8))
+                    (state (ptr i8))
+                    (from (ptr i8))
+                    (check-alive bool)] (-> (ptr i8))
+  (let [waiting (storage/count (pending-terminals model state from check-alive))]
+    (if (= waiting 0)
+        (name-of from)
+        (msg (ptr i8)
+             (name-of from)
+             (sel c"stringByAppendingString:")
+             [(ptr i8)]
+             (indexed-string c"  ·  "
+                             waiting
+                             (if (= waiting 1) c" terminal" c" terminals"))))))
+
+;;; The ids of the saved projects there is something to import from, those with
+;;; terminals first, each group in original Jim's order.
+(defn choices [(model (ptr i8)) (state (ptr i8)) (check-alive bool)]
+  (-> (ptr i8))
+  (let [saved (storage/get state c"projects")
+        result (storage/array)]
+    (for [pass 0 2]
+      (for [i 0 (storage/count saved)]
+        (let [from (storage/at saved i)]
+          (when (and (importable? model state from check-alive)
+                     (= (> (storage/count (pending-terminals model
+                                                             state
+                                                             from
+                                                             check-alive))
+                           0)
+                        (= pass 0)))
+            (storage/add! result (storage/get from c"id"))
+            0))))
+    result))

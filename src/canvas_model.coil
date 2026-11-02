@@ -119,13 +119,31 @@
 
 (const EDGE-RIGHT 8)
 
+;;; A pane's header height. Its close button is the square at its right end.
+(const HEADER 28.0)
+
+(defn in-header? [(y f64)] (-> bool)
+  (< y HEADER))
+
+(defn on-close? [(w f64) (x f64) (y f64)] (-> bool)
+  (and (in-header? y) (> x (- w HEADER))))
+
 ;;; The edges within BAND of the pane-local point (X, Y) in a pane of size W×H;
-;;; two at a corner, 0 away from every edge.
+;;; two at a corner, 0 away from every edge. BAND grows as the canvas zooms out, so
+;;; the top edge stops at a third of the header, which must stay there to drag by.
 (defn edges-at [(w f64) (h f64) (x f64) (y f64) (band f64)] (-> i64)
-  (+ (if (< y band) EDGE-TOP 0)
+  (+ (if (< y (min band (/ HEADER 3.0))) EDGE-TOP 0)
      (if (> y (- h band)) EDGE-BOTTOM 0)
      (if (< x band) EDGE-LEFT 0)
      (if (> x (- w band)) EDGE-RIGHT 0)))
+
+;;; EDGES as an NSCursorFrameResizePosition, whose bits are not in the same order.
+(defn cursor-position [(edges i64)] (-> u64)
+  (p/cast u64
+          (+ (if (edge? edges EDGE-TOP) 1 0)
+             (if (edge? edges EDGE-LEFT) 2 0)
+             (if (edge? edges EDGE-BOTTOM) 4 0)
+             (if (edge? edges EDGE-RIGHT) 8 0))))
 
 (defn edge? [(edges i64) (edge i64)] (-> bool)
   (!= (& edges edge) 0))

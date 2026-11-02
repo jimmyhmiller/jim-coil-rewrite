@@ -10,7 +10,7 @@ exclude = ["src/session/server.coil"]
 jit = "tpde"
 
 [link]
-frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "IOSurface", "Security", "UniformTypeIdentifiers", "CoreServices"]
+frameworks = ["AppKit", "QuartzCore", "CoreGraphics", "CoreFoundation", "Metal", "CoreText", "Carbon", "IOKit", "AudioToolbox", "AVFoundation", "IOSurface", "Security", "UniformTypeIdentifiers", "CoreServices"]
 libs = ["objc", "c++"]
 
 [native-dependencies]

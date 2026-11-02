@@ -628,6 +628,17 @@
 (defn take-action! [] (-> i64)
   (let [value (.pending (state))] (do (set! (.pending (state)) -1) value)))
 
+;;; Whether PT is on the new profile button, as framed by layout!, in a sidebar W×H.
+(defn on-add-profile? [(pt Point) (w f64) (h f64)] (-> bool)
+  (and (>= (.x pt) (- w 32.0))
+       (< (.x pt) (- w 8.0))
+       (> (.y pt) (- h 36.0))
+       (<= (.y pt) (- h 8.0))))
+
+;;; Whether PT is on the hidden projects toggle in the footer's corner.
+(defn on-footer? [(pt Point)] (-> bool)
+  (and (>= (.x pt) 0.0) (< (.x pt) 40.0) (>= (.y pt) 0.0) (< (.y pt) 40.0)))
+
 ;;; Capture row gestures before NSButton starts its own tracking loop.
 (defn handle! [(event (ptr i8))] (-> bool)
   (let [st (state)
@@ -650,7 +661,11 @@
         from-top (- (.h bounds) (.y doc))
         row (p/cast i64 (/ from-top 28.0))
         in-band (and (>= (.y pt) 40.0) (< (.y pt) (- (.height st) 36.0)))
-        in-row (and in-band (>= row 0) (< row (s/count (.rows st))))
+        in-row
+          (and in-band
+               (>= from-top 0.0)
+               (>= row 0)
+               (< row (s/count (.rows st))))
         new-top (+ (* (p/cast f64 (s/count (.rows st))) 28.0) 1.0)
         in-new-row
           (and in-band (>= from-top new-top) (< from-top (+ new-top 28.0)))]
@@ -794,14 +809,12 @@
               true)
           (and (= kind 1) (>= (.x pt) 0.0) (< (.x pt) (.width st)))
             (do
-              (cond (> (.y pt) (- (.height st) 46.0))
+              (cond (on-add-profile? pt (.width st) (.height st))
                       (do (set! (.pending st) 20) (do))
-                    (< (.y pt) 46.0)
-                      (if (> (.x pt) (- (.width st) 40.0))
-                          (do (set! (.pending st) 15) (do))
-                          (do
-                            (set! (.show-hidden st) (not (.show-hidden st)))
-                            (refresh!)))
+                    (on-footer? pt)
+                      (do
+                        (set! (.show-hidden st) (not (.show-hidden st)))
+                        (refresh!))
                     in-new-row (do (set! (.pending st) 15) (do))
                     in-row
                       (cond (> (.x pt) (- (.width st) 23.0))

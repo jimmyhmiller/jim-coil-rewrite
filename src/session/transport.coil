@@ -45,6 +45,8 @@
 
 (const ENOENT 2)
 
+(const EIO 5)
+
 (const EACCES 13)
 
 (const EMSGSIZE 40)
@@ -185,6 +187,181 @@
                     (: -1 i32)
                     (p/cast i32 length))))))))
 
+;;; ---- event log ------------------------------------------------------------------
+;;; One line per lifecycle event, in events.log beside the session sockets. A terminal
+;;; service has no stdout, so without this a failure leaves no trace of its cause.
+;;; A full disk can lose a line, so a failure's reason also goes to the client's pane.
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+(extern gettimeofday :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern localtime_r :cc (cc/C) [(ptr i64) (ptr i8)] (-> (ptr i8)))
+
+(extern strftime :cc (cc/C) [(ptr i8) u64 (ptr i8) (ptr i8)] (-> u64))
+
+(extern getpid :cc (cc/C) [] (-> i32))
+
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
+
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+
+(extern rename :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern lseek :cc (cc/C) [i32 i64 i32] (-> i64))
+
+(extern strrchr :cc (cc/C) [(ptr i8) i32] (-> (ptr i8)))
+
+(extern strerror :cc (cc/C) [i32] (-> (ptr i8)))
+
+(extern proc_name :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
+
+(extern getsockopt :cc (cc/C) [i32 i32 i32 (ptr i8) (ptr u32)] (-> i32))
+
+(extern poll :cc (cc/C) [(ptr i8) u64 i32] (-> i32))
+
+(const O-WRONLY-APPEND-CREAT-CLOEXEC 16777737)
+
+(const SEEK-END 2)
+
+(const LOG-ROTATE-BYTES 16777216)
+
+(const SOL-LOCAL 0)
+
+(const LOCAL-PEERPID 2)
+
+(const POLLIN-EVENT 1)
+
+;;; The open log's descriptor plus one, so that zero means not open.
+(defn log-fd-cell [] (-> (ptr i32))
+  (p/alloc-static i32))
+
+(defn log-tag-cell [] (-> (ptr (array i8 40)))
+  (p/alloc-static (array i8 40)))
+
+(defn log-tag [] (-> (ptr i8))
+  (p/cast (ptr i8) (log-tag-cell)))
+
+;;; Open events.log in the directory holding SOCKET, naming this process's lines TAG.
+(defn log-open! [(socket (ptr i8)) (tag (ptr i8))] (-> i64)
+  (when (= (load (log-fd-cell)) (: 0 i32))
+    (snprintf (log-tag) (: 40 u64) c"%s" tag)
+    (let [(mut path) (zeroed (array i8 1200))
+          (mut old) (zeroed (array i8 1200))
+          out (p/cast (ptr i8) (mut path))
+          aged (p/cast (ptr i8) (mut old))]
+      (snprintf out (: 1200 u64) c"%s" socket)
+      (let [slash (strrchr out (: 47 i32))]
+        (when (!= (p/cast i64 slash) 0)
+          (set! (index slash 1) (: 0 i8))
+          (snprintf aged (: 1200 u64) c"%sevents.log" out)
+          (snprintf out (: 1200 u64) c"%s.1" aged)
+          (let [fd (open aged O-WRONLY-APPEND-CREAT-CLOEXEC (: 384 i32))]
+            (when (>= fd (: 0 i32))
+              (if (>= (lseek fd 0 SEEK-END) LOG-ROTATE-BYTES)
+                  (do
+                    (close fd)
+                    (rename aged out)
+                    (let [fresh
+                            (open aged
+                                  O-WRONLY-APPEND-CREAT-CLOEXEC
+                                  (: 384 i32))]
+                      (set! (log-fd-cell) (+ fresh (: 1 i32)))
+                      0))
+                  (do (set! (log-fd-cell) (+ fd (: 1 i32))) 0))
+              0)
+            0)
+          0)
+        0)
+      0)
+    0)
+  0)
+
+;;; Record MESSAGE. Leaves errno as it found it, so callers may still read it.
+(defn log-line! [(message (ptr i8))] (-> i64)
+  (let [saved (os/errno)
+        (mut clock) (zeroed (array i64 2))
+        (mut tm) (zeroed (array i8 64))
+        (mut stamp) (zeroed (array i8 48))
+        (mut line) (zeroed (array i8 2200))
+        stamp-out (p/cast (ptr i8) (mut stamp))
+        line-out (p/cast (ptr i8) (mut line))]
+    (gettimeofday (p/cast (ptr i8) (mut clock)) (p/cast (ptr i8) 0))
+    (localtime_r (p/cast (ptr i64) (mut clock)) (p/cast (ptr i8) (mut tm)))
+    (strftime stamp-out
+              (: 48 u64)
+              c"%Y-%m-%dT%H:%M:%S%z"
+              (p/cast (ptr i8) (mut tm)))
+    (let [written
+            (snprintf line-out
+                      (: 2200 u64)
+                      c"%s us=%06lld pid=%d %s %s\n"
+                      stamp-out
+                      (p/cast i64
+                              (load (index (p/cast (ptr i64) (mut clock)) 1)))
+                      (getpid)
+                      (log-tag)
+                      message)
+          length (if (> written (: 2199 i32)) (: 2199 i32) written)
+          fd (- (load (log-fd-cell)) (: 1 i32))]
+      (when (>= fd (: 0 i32))
+        (write fd line-out (p/cast isize length))
+        0)
+      (set-errno! (p/cast i32 saved))
+      0)))
+
+;;; Record FORMAT with up to four arguments. Pointers go in cast to i64.
+(defn log! [(format (ptr i8)) (a i64) (b i64) (c i64) (d i64)] (-> i64)
+  (let [saved (os/errno)
+        (mut message) (zeroed (array i8 2000))
+        out (p/cast (ptr i8) (mut message))]
+    (snprintf out (: 2000 u64) format a b c d)
+    (set-errno! (p/cast i32 saved))
+    (log-line! out)))
+
+(defn peer-pid [(fd i32)] (-> i32)
+  (let [(mut pid) (zeroed i32)
+        (mut length) (: 4 u32)]
+    (if (< (getsockopt fd
+                       SOL-LOCAL
+                       LOCAL-PEERPID
+                       (p/cast (ptr i8) (mut pid))
+                       (mut length))
+           (: 0 i32))
+        (: -1 i32)
+        (load pid))))
+
+;;; Record EVENT and who is on the other end of FD: what kicks a client, or kills a
+;;; session, is the first thing to want to know.
+(defn log-peer! [(event (ptr i8)) (fd i32)] (-> i64)
+  (let [pid (peer-pid fd)
+        (mut name) (zeroed (array i8 64))
+        out (p/cast (ptr i8) (mut name))]
+    (when (> pid (: 0 i32)) (proc_name pid out (: 64 u32)) 0)
+    (log! c"%s peer_pid=%lld peer=%s"
+          (p/cast i64 event)
+          (p/cast i64 pid)
+          (p/cast i64 out)
+          0)))
+
+;;; For the client's reader, in Ghostty's IO code: what ended this connection.
+(defn session-log-client [(fd i32) (event (ptr i8)) (detail (ptr i8))] (-> void)
+  (let [code (os/errno)]
+    (log! c"client fd=%lld %s detail=%s errno=%lld"
+          (p/cast i64 fd)
+          (p/cast i64 event)
+          (p/cast i64 (if (= (p/cast i64 detail) 0) c"-" detail))
+          (p/cast i64 code))
+    (do)))
+
+;;; Whether FD has something to read within MILLISECONDS.
+(defn session-readable [(fd i32) (milliseconds i32)] (-> i32)
+  (let [(mut entry) (zeroed (array i16 4))
+        bytes (p/cast (ptr i8) (mut entry))]
+    (set! (index (p/cast (ptr i32) bytes) 0) fd)
+    (set! (index (p/cast (ptr i16) bytes) 2) (: 1 i16))
+    (poll bytes (: 1 u64) milliseconds)))
+
 (defn session-connect [(path (ptr i8))] (-> i32)
   (let [address (p/alloc-stack SockaddrUn)
         path-length (p/cast i64 (strlen path))]
@@ -217,21 +394,42 @@
                             (do (close fd) (set-errno! EACCES) (: -1 i32))
                             fd))))))))))
 
+;;; Attach with no size. The client reports its real one after replay. Services older
+;;; than this applied the attach size to the terminal, but ignore a size of zero, so
+;;; shells they already run are not resized by a reattach either.
 (defn attach [(fd i32)] (-> i32)
   (let [(mut size) (: (zeroed (array i8 8)) (array i8 8))
         bytes (p/cast (ptr i8) (mut size))]
-    (put-byte! bytes 1 (: 80 u8))
-    (put-byte! bytes 3 (: 24 u8))
     (if (< (session-send fd (p/cast u32 JIM-ATTACH) bytes 8) 0)
         (do (close fd) (: -1 i32))
         fd)))
 
 (defstruct Timespec [(seconds i64) (nanoseconds i64)])
 
+;;; The launcher's exit status when the original Jim daemon it was asked to adopt
+;;; is gone. Reported as ENOENT, distinct from a service that failed to start.
+(const EXIT-UPSTREAM-GONE 3)
+
 (defn session-open [(executable (ptr i8))
                     (path (ptr i8))
                     (cwd (ptr i8))
                     (resources (ptr i8))] (-> i32)
+  (start-session executable path cwd resources (p/cast (ptr i8) 0)))
+
+;;; Like session-open, but the service fronts the original Jim daemon listening
+;;; at UPSTREAM instead of starting a shell.
+(defn session-adopt [(executable (ptr i8))
+                     (path (ptr i8))
+                     (cwd (ptr i8))
+                     (resources (ptr i8))
+                     (upstream (ptr i8))] (-> i32)
+  (start-session executable path cwd resources upstream))
+
+(defn start-session [(executable (ptr i8))
+                     (path (ptr i8))
+                     (cwd (ptr i8))
+                     (resources (ptr i8))
+                     (upstream (ptr i8))] (-> i32)
   (let [existing (session-connect path)]
     (if (>= existing 0)
         (attach existing)
@@ -241,12 +439,18 @@
                   (mut pid) (zeroed i32)]
               (if (!= (posix_spawnattr_init (mut attributes)) (: 0 i32))
                   (: -1 i32)
-                  (let [argv (p/alloc-stack (array (ptr i8) 5))]
+                  (let [argv (p/alloc-stack (array (ptr i8) 7))
+                        adopting (!= (p/cast i64 upstream) 0)
+                        first (if adopting 3 1)
+                        (mut status) (zeroed i32)]
                     (set! (index argv 0) executable)
-                    (set! (index argv 1) path)
-                    (set! (index argv 2) cwd)
-                    (set! (index argv 3) resources)
-                    (set! (index argv 4) (p/cast (ptr i8) 0))
+                    (when adopting
+                      (set! (index argv 1) c"--adopt")
+                      (set! (index argv 2) upstream))
+                    (set! (index argv first) path)
+                    (set! (index argv (+ first 1)) cwd)
+                    (set! (index argv (+ first 2)) resources)
+                    (set! (index argv (+ first 3)) (p/cast (ptr i8) 0))
                     (let [flags-error
                             (posix_spawnattr_setflags (mut attributes)
                                                       (p/cast i16
@@ -264,35 +468,40 @@
                       (if (!= spawn-error (: 0 i32))
                           (do (set-errno! spawn-error) (: -1 i32))
                           (do
-                            (loop (if (>= (waitpid pid (p/cast (ptr i32) 0) 0)
-                                          0)
+                            (loop (if (>= (waitpid pid (mut status) 0) 0)
                                       (break (: 0 i32))
                                       (if (!= (os/errno) EINTR)
                                           (break (: 0 i32))
                                           (: 0 i32))))
-                            (let [(mut attempts) 0
-                                  (mut delay)
-                                    (: (Timespec
-                                         :seconds 0
-                                         :nanoseconds 10000000)
-                                       Timespec)]
-                              (block
-                                :connected
-                                  (loop (if (>= (load attempts) 200)
-                                            (break (: 0 i32))
-                                            (let [fd (session-connect path)]
-                                              (if (>= fd 0)
-                                                  (return-from
-                                                    :connected (attach fd))
-                                                  (do
-                                                    (nanosleep (p/cast (ptr i8)
-                                                                       (mut delay))
-                                                               (p/cast (ptr i8)
-                                                                       0))
-                                                    (set! attempts
-                                                          (+ (load attempts)
-                                                             1))))))
-                                    (: -1 i32))))))))))))))
+                            (if (and adopting
+                                     (= (load status)
+                                        (p/cast i32 (<< EXIT-UPSTREAM-GONE 8))))
+                                (do (set-errno! ENOENT) (: -1 i32))
+                                (let [(mut attempts) 0
+                                      (mut delay)
+                                        (: (Timespec
+                                             :seconds 0
+                                             :nanoseconds 10000000)
+                                           Timespec)]
+                                  (block
+                                    :connected
+                                      (loop (if (>= (load attempts) 200)
+                                                (break (: 0 i32))
+                                                (let [fd (session-connect path)]
+                                                  (if (>= fd 0)
+                                                      (return-from
+                                                        :connected (attach fd))
+                                                      (do
+                                                        (nanosleep (p/cast (ptr i8)
+                                                                           (mut delay))
+                                                                   (p/cast (ptr i8)
+                                                                           0))
+                                                        (set! attempts
+                                                              (+ (load attempts)
+                                                                 1))))))
+                                        ; Not ENOENT, which means the daemon is gone.
+                                        (set-errno! EIO)
+                                        (: -1 i32)))))))))))))))
 
 (defn session-kill [(path (ptr i8))] (-> i32)
   (let [fd (session-connect path)]
@@ -300,8 +509,37 @@
         (if (= (os/errno) ENOENT) (: 0 i32) (: -1 i32))
         (let [result
                 (session-send fd (p/cast u32 JIM-KILL) (p/cast (ptr i8) 0) 0)]
+          ; Stay connected until the service has read this, or it can't tell who sent
+          ; it. A stuck service never will, so this only waits so long.
+          (session-readable fd (: 1000 i32))
           (close fd)
           result))))
+
+;;; Whether anything answers at PATH. Only for services that tolerate a connection
+;;; that sends nothing: an original Jim daemon would drop its attached client.
+(defn session-running? [(path (ptr i8))] (-> bool)
+  (let [fd (session-connect path)]
+    (if (>= fd 0) (do (close fd) true) false)))
+
+;;; Attach to the service at PATH if one is running, without starting one.
+(defn session-attach [(path (ptr i8))] (-> i32)
+  (let [fd (session-connect path)]
+    (if (>= fd 0) (attach fd) fd)))
+
+;;; The original daemon's Kill message: a big-endian length and bincode variant 4.
+(defn original-kill [(path (ptr i8))] (-> i32)
+  (let [fd (session-connect path)]
+    (if (< fd 0)
+        (if (or (= (os/errno) ENOENT) (= (os/errno) ECONNREFUSED))
+            (: 0 i32)
+            (: -1 i32))
+        (let [(mut frame) (: (zeroed (array i8 5)) (array i8 5))
+              bytes (p/cast (ptr i8) (mut frame))]
+          (put-byte! bytes 3 (: 1 u8))
+          (put-byte! bytes 4 (: 4 u8))
+          (let [result (transfer fd bytes 5 true)]
+            (close fd)
+            result)))))
 
 (defn session-shutdown [(fd i32)] (-> void)
   (shutdown fd SHUT-RDWR))
@@ -314,4 +552,6 @@
           [session-open :as "jim_session_open"]
           [session-kill :as "jim_session_kill"]
           [session-shutdown :as "jim_session_shutdown"]
-          [session-close :as "jim_session_close"])
+          [session-close :as "jim_session_close"]
+          [session-log-client :as "jim_session_log_client"]
+          [session-readable :as "jim_session_readable"])

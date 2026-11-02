@@ -3,8 +3,13 @@
 (import "jim.native" :use *)
 (import "jim.session.transport" :as transport)
 (import "coil.primitive" :as p)
+(import "coil.os" :as os)
 
 (extern chmod :cc (cc/C) [(ptr i8) u16] (-> i32))
+
+(extern getuid :cc (cc/C) [] (-> u32))
+
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (defn identifier [] (-> (ptr i8))
   (msg (ptr i8)
@@ -39,10 +44,87 @@
             [(ptr i8)]
             (ns c".sock"))))
 
-(defn open! [(id (ptr i8)) (cwd (ptr i8))] (-> i32)
+(defn in-base [(relative (ptr i8))] (-> (ptr i8))
+  (utf8 (msg (ptr i8)
+             (msg (ptr i8)
+                  (msg (ptr i8)
+                       (class c"NSFileManager")
+                       (sel c"defaultManager")
+                       [])
+                  (sel c"currentDirectoryPath")
+                  [])
+             (sel c"stringByAppendingPathComponent:")
+             [(ptr i8)]
+             (ns relative))))
+
+;;; ---- original Jim ---------------------------------------------------------------
+;;; Original Jim keeps each terminal in its own daemon, keyed by a number. A session
+;;; adopting one remembers that number, so it can adopt it again if its service stops.
+
+(const NOT-ORIGINAL -1)
+
+;;; Where original Jim's daemons keep their files, overridable as in original Jim.
+(defn original-file [(original i64) (suffix (ptr i8))] (-> (ptr i8))
+  (let [override (getenv c"TERMINAL_BEVY_RUNTIME_DIR")
+        directory
+          (if (= (p/cast i64 override) 0)
+              (utf8 (indexed-string c"/tmp/.terminal-bevy-"
+                                    (p/cast i64 (getuid))
+                                    c""))
+              override)]
+    (utf8 (indexed-string (utf8 (msg (ptr i8)
+                                     (ns directory)
+                                     (sel c"stringByAppendingString:")
+                                     [(ptr i8)]
+                                     (ns c"/")))
+                          original
+                          suffix))))
+
+(defn original-socket [(original i64)] (-> (ptr i8))
+  (original-file original c".sock"))
+
+;;; Whether original Jim is open. A daemon serves only its newest client and original
+;;; Jim reconnects when dropped, so the two apps must never share a daemon.
+(defn original-running? [] (-> bool)
+  (transport/session-running? (utf8 (msg (ptr i8)
+                                         (ns c"~/.jim/socket")
+                                         (sel c"stringByExpandingTildeInPath")
+                                         []))))
+
+;;; Whether original terminal ORIGINAL is alive: its daemon's pid file names a live
+;;; process and its socket exists. It never connects, which would drop the daemon's
+;;; client.
+(defn original-alive? [(original i64)] (-> bool)
+  (let [saved
+          (msg (ptr i8)
+               (class c"NSString")
+               (sel c"stringWithContentsOfFile:encoding:error:")
+               [(ptr i8) u64 (ptr i8)]
+               (ns (original-file original c".pid"))
+               (: 4 u64)
+               (nil))
+        pid
+          (if (= (p/cast i64 saved) 0)
+              (: 0 i32)
+              (msg i32 saved (sel c"intValue") []))]
+    (and (> pid (: 0 i32))
+         (= (os/kill pid (: 0 i32)) (: 0 i32))
+         (!= (msg i8
+                  (msg (ptr i8)
+                       (class c"NSFileManager")
+                       (sel c"defaultManager")
+                       [])
+                  (sel c"fileExistsAtPath:")
+                  [(ptr i8)]
+                  (ns (original-socket original)))
+             (: 0 i8)))))
+
+;;; Open session ID, starting its service if none is running. If ORIGINAL names a
+;;; daemon that no longer exists, it is cleared and the session starts a new shell,
+;;; as any session does after a restart.
+(defn open! [(id (ptr i8)) (cwd (ptr i8)) (original (ptr i64))] (-> i32)
   (let [manager
-          (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
-        base (msg (ptr i8) manager (sel c"currentDirectoryPath") [])]
+          (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])]
     (do
       (msg i8
            manager
@@ -53,21 +135,53 @@
            (nil)
            (nil))
       (chmod (utf8 (directory)) (: 448 u16))
-      (if (valid-id? id)
-          (transport/session-open (utf8 (msg (ptr i8)
-                                             base
-                                             (sel c"stringByAppendingPathComponent:")
-                                             [(ptr i8)]
-                                             (ns c"build/jim-session")))
-                                  (utf8 (path id))
-                                  cwd
-                                  (utf8 (msg (ptr i8)
-                                             base
-                                             (sel c"stringByAppendingPathComponent:")
-                                             [(ptr i8)]
-                                             (ns c"build/ghostty/share/ghostty"))))
-          (: -1 i32)))))
+      (if (not (valid-id? id))
+          (: -1 i32)
+          (let [socket (utf8 (path id))
+                ignored
+                  (do
+                    (transport/log-open! socket c"app")
+                    (transport/log! c"app-opens-session id=%s"
+                                    (p/cast i64 (utf8 id))
+                                    0
+                                    0
+                                    0))
+                executable (in-base c"build/jim-session")
+                resources (in-base c"build/ghostty/share/ghostty")]
+            (if (= (load original) NOT-ORIGINAL)
+                (transport/session-open executable socket cwd resources)
+                (let [existing (transport/session-attach socket)]
+                  (cond (>= existing (: 0 i32)) existing
+                        ; Taking the daemon would start a fight with original Jim.
+                        ; The pane says it is unavailable until Jim is quit.
+                        (original-running?) (: -1 i32)
+                        :else
+                          (let [adopted
+                                  (transport/session-adopt executable
+                                                           socket
+                                                           cwd
+                                                           resources
+                                                           (original-socket (load original)))]
+                            (if (and (< adopted (: 0 i32))
+                                     (= (os/errno) transport/ENOENT))
+                                (do
+                                  (set! original NOT-ORIGINAL)
+                                  (transport/session-open executable
+                                                          socket
+                                                          cwd
+                                                          resources))
+                                adopted))))))))))
 
-(defn kill! [(id (ptr i8))] (-> bool)
+;;; End session ID. A service adopting an original daemon ends it as well. If that
+;;; service has stopped, the daemon is ended directly, unless original Jim is open:
+;;; then the terminal is Jim's again, and closing this pane must not kill it.
+(defn kill! [(id (ptr i8)) (original i64)] (-> bool)
+  (transport/log! c"app-kills-session id=%s" (p/cast i64 (utf8 id)) 0 0 0)
   (and (valid-id? id)
-       (= (transport/session-kill (utf8 (path id))) (: 0 i32))))
+       (let [socket (utf8 (path id))]
+         (if (or (= original NOT-ORIGINAL)
+                 (transport/session-running? socket))
+             (= (transport/session-kill socket) (: 0 i32))
+             (or (original-running?)
+                 (= (transport/original-kill (original-socket original))
+                    (: 0 i32)))))))

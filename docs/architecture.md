@@ -54,7 +54,7 @@ experiment and are maintained in `src/` as Jim modules; see
 `src/session/transport.coil` owns the shared JIM1 framing and connection API. A same-user,
 mode-0700 socket directory and peer-UID checks protect its Unix connection. A file
 lock serializes creation of a session UUID. The service owns the PTY child,
-terminal query responses, foreground cwd discovery, and an anonymous disk journal.
+terminal query responses, foreground cwd discovery, and an in-memory journal.
 The launcher uses posix_spawn; the detached service forks the shell before adding
 any renderer threads. Closing the GUI does not signal the child. Explicit close
 sends a control frame, then the service terminates the shell/foreground process
@@ -66,8 +66,15 @@ ready, exit, error, and cwd records. A negotiated color-configuration message
 keeps the headless core’s default foreground/background/cursor/palette queries
 aligned with the renderer. Cwd is out-of-band metadata so it cannot split
 an unfinished escape sequence. Reads and writes handle partial frames. A bounded
-input queue applies backpressure; output is journaled to disk and streamed without
-holding the entire history in RAM. Slow/disconnected clients do not stop PTY reads.
+input queue applies backpressure; output is journaled in memory, never on disk, and streamed. Slow/disconnected clients do not stop PTY reads.
+
+The journal keeps the newest 64 MiB of frames, original Jim's limit. Trimmed frames
+leave from the front on a frame boundary and fresh pages replace theirs, returning the memory,
+so offsets never move and nothing is copied. Frames a client has yet to read are kept
+until it falls 256 MiB behind, when it loses its connection instead. Replay after a
+trim starts with the size and directory the trimmed frames established, and ends with
+the input modes and Kitty keyboard flags the session's core reports as set, so keys
+and mice keep working. It may begin mid-sequence, as original Jim's replay can.
 
 `GhosttySession.zig` adds a native Ghostty IO backend connected directly to this
 socket. It replays output and terminal-size changes in order, then processes live
@@ -77,8 +84,36 @@ operations, bells, and desktop notifications. A dedicated writer drains queued i
 block Ghostty’s IO thread. Input typed during replay is queued until attachment
 is ready. Renderer shutdown shuts down the socket, joins both transport threads,
 and frees pending writes; daemon shutdown is a separate explicit action.
-Replay is exact for the recorded stream, not a model snapshot. Journal compaction,
-reboot recovery, and graphics referencing vanished files require further work.
+The renderer holds its frames until replay ends, so history is not seen scrolling past.
+Attaching leaves the terminal's size alone: the client reports only its newest size,
+once replay ends, so a running TUI is not resized unless the size really changed.
+Replay is exact for the retained stream, not a model snapshot. Reboot recovery and
+graphics referencing vanished files require further work.
+
+## Adopting original Jim's daemons
+
+`jim-session --adopt UPSTREAM SOCKET CWD RESOURCES` serves the JIM1 protocol as usual,
+with a connection to an original Jim daemon where the PTY would be, so nothing above
+the service changes. It speaks that daemon's length-prefixed bincode protocol and owns
+the terminal core that answers queries, since the daemon has none. It connects before
+detaching, so the launcher's exit status can report a daemon that is gone.
+
+A daemon serves only its newest client and original Jim reconnects when dropped, so
+sharing one would have the two apps replaying history at each other forever. The app
+therefore refuses to adopt while `~/.jim/socket` answers, and a service that loses its
+connection stops and never reconnects. Connecting to a daemon drops its client, so
+nothing connects to one while original Jim is open.
+
+Clients are held off until the daemon's replay is journaled, so all of it reaches
+them as replay and its bells, notifications and clipboard writes stay suppressed.
+Queries in that history go unanswered. The shell's pid comes from the socket's peer
+and `proc_listchildpids`; its controlling terminal gives the current size, so attaching
+causes no SIGWINCH and history replays at its width, and its foreground group drives
+cwd reporting. The attach placeholder size is not applied to an adopted terminal.
+
+An adopted pane stores the daemon's number as `original` beside its session UUID, to
+adopt again if the service stops. Explicit close sends the daemon Kill, directly if
+the service has stopped, unless original Jim is open and so owns the terminal again.
 
 Coil exports AppKit and Ghostty callbacks with `export-c`; `fnptr-of` selects the
 generated C ABI entry point and marshals by-value native structures without a
@@ -93,3 +128,21 @@ VT library on demand, as the package's `ghostty` and `ghostty-vt` native
 dependencies; the session service is the `session` executable artifact and links only
 the VT library. The separately compiled configuration has its own Coil package so it
 cannot load another copy of Ghostty into the process.
+
+## When something fails
+
+Terminal history never touches the disk, so a full disk can't pause or end a terminal.
+Failures that cost only a resize or some input are logged and survived. What still ends a
+service: poll failing, an adopted daemon's connection failing, and being told to.
+
+`~/.jim-coil/sessions/events.log` records each lifecycle event with its time and reason.
+A service writes it from the binary it started with, so a running one logs nothing new.
+
+## Dictation
+
+⌘⇧T starts hands-free dictation into the focused terminal, and Escape or ⌘⇧T stops it.
+AudioQueue delivers 16 kHz floats to a worker thread (`src/dictation.coil`), which cuts
+them into phrases and decodes them on the Phonon server shared with original Jim
+(`src/dictation_core.coil`). A revision is DEL × n then a paste of what changed, sent only
+while `ghostty_surface_revisable` says the child is a line editor. Otherwise the transcript
+stays on the pill and lands as one paste at the end. Typing during dictation ends it.

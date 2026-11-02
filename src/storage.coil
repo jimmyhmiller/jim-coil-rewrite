@@ -1,6 +1,7 @@
 (module jim.storage)
 (import "jim.native" :use *)
 (import "coil.primitive" :as p)
+(import "jim.session.transport" :as transport)
 
 (defn dictionary [] (-> (ptr i8))
   (msg (ptr i8) (class c"NSMutableDictionary") (sel c"dictionary") []))
@@ -77,8 +78,22 @@
           ;; An unreadable JSON document must not look like a first launch.
           (if (= (p/cast i64 result) 0) (dictionary) result)))))
 
+(defn log-save-failure! [(step (ptr i8)) (failure (ptr i8))] (-> i64)
+  (transport/log! c"layout-save-failed step=%s reason=%s"
+                  (p/cast i64 step)
+                  (p/cast i64
+                          (if (= (p/cast i64 failure) 0)
+                              c"(no error given)"
+                              (utf8 (msg (ptr i8)
+                                         failure
+                                         (sel c"description")
+                                         []))))
+                  0
+                  0))
+
 (defn write! [(snapshot (ptr i8))] (-> bool)
-  (let [manager
+  (let [(mut failure) (nil)
+        manager
           (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
         file (path)
         data
@@ -88,7 +103,7 @@
                [(ptr i8) u64 (ptr i8)]
                snapshot
                1
-               (nil))]
+               (mut failure))]
     (do
       (msg i8
            manager
@@ -98,10 +113,17 @@
            (: 1 i8)
            (nil)
            (nil))
-      (!= (msg i8
-               data
-               (sel c"writeToFile:atomically:")
-               [(ptr i8) i8]
-               file
-               (: 1 i8))
-          (: 0 i8)))))
+      (if (= (p/cast i64 data) 0)
+          (do (log-save-failure! c"serialize" (load failure)) false)
+          (let [saved
+                  (msg i8
+                       data
+                       (sel c"writeToFile:options:error:")
+                       [(ptr i8) u64 (ptr i8)]
+                       file
+                       (: 1 u64)
+                       (mut failure))]
+            (when (= saved (: 0 i8))
+              (log-save-failure! c"write" (load failure))
+              0)
+            (!= saved (: 0 i8)))))))

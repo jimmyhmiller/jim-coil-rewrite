@@ -1,7 +1,8 @@
 (module jim.canvas-test)
 (import "jim.canvas-model" :as model)
-(import "jim.native" :use [Point Transform rect])
+(import "jim.native" :use [Point Transform rect fit-rect])
 (import "jim.canvas" :as canvas)
+(import "jim.sidebar" :as sidebar)
 (import "jim.workspace" :as workspace)
 
 (defn near? [(a f64) (b f64)] (-> bool)
@@ -325,3 +326,62 @@
     (assert (near? (+ (.y big) (* 0.5 (.h big))) 250.0))
     (assert (near? (.w small) 100.0))
     (assert (near? (.x small) 200.0))))
+
+(deftest the-close-button-is-the-square-at-the-end-of-the-header
+  (assert (model/on-close? 640.0 630.0 10.0))
+  (assert (not (model/on-close? 640.0 600.0 10.0)))
+  (assert (not (model/on-close? 640.0 630.0 30.0)))
+  (assert (model/in-header? 27.0))
+  (assert (not (model/in-header? 29.0))))
+
+(deftest a-zoomed-out-pane-can-still-be-dragged-by-its-header
+  ; At the furthest zoom the 6 point band is 30 canvas units, more than the header.
+  (assert (= (model/edges-at 640.0 430.0 320.0 3.0 30.0) model/EDGE-TOP))
+  (assert (= (model/edges-at 640.0 430.0 320.0 12.0 30.0) 0))
+  (assert (= (model/edges-at 640.0 430.0 320.0 415.0 30.0) model/EDGE-BOTTOM)))
+
+(defn on-profile-button? [(x f64) (y f64)] (-> bool)
+  (sidebar/on-add-profile? (Point :x x :y y) 224.0 860.0))
+
+(deftest only-the-button-itself-adds-a-profile
+  (assert (on-profile-button? 204.0 838.0))
+  ; The far left of the header, and the top of the first project row.
+  (assert (not (on-profile-button? 10.0 838.0)))
+  (assert (not (on-profile-button? 10.0 820.0)))
+  (assert (not (on-profile-button? 204.0 820.0)))
+  ; Past either end of the button.
+  (assert (not (on-profile-button? 220.0 838.0)))
+  (assert (not (on-profile-button? 204.0 856.0))))
+
+(deftest only-the-corner-of-the-footer-toggles-hidden-projects
+  (assert (sidebar/on-footer? (Point :x 20.0 :y 20.0)))
+  (assert (not (sidebar/on-footer? (Point :x 100.0 :y 20.0))))
+  ; A row sits above the footer.
+  (assert (not (sidebar/on-footer? (Point :x 20.0 :y 43.0)))))
+
+(deftest a-restored-window-moves-to-fit-and-keeps-its-size
+  (let [screen (rect 0.0 94.0 2056.0 1196.0)
+        flush (fit-rect (rect 191.0 95.0 1865.0 1195.0) screen)
+        off-right (fit-rect (rect 600.0 95.0 1865.0 1195.0) screen)
+        off-left (fit-rect (rect -300.0 0.0 1000.0 700.0) screen)
+        too-big (fit-rect (rect 50.0 95.0 3000.0 2000.0) screen)]
+    (assert (= (.x flush) 191.0))
+    (assert (= (.w flush) 1865.0))
+    (assert (= (.x off-right) 191.0))
+    (assert (= (.w off-right) 1865.0))
+    (assert (= (.x off-left) 0.0))
+    (assert (= (.y off-left) 94.0))
+    (assert (= (.w off-left) 1000.0))
+    (assert (= (.x too-big) 0.0))
+    (assert (= (.w too-big) 2056.0))
+    (assert (= (.h too-big) 1196.0))))
+
+(deftest resize-cursor-position-names-the-edges-under-the-pointer
+  (assert (= (model/cursor-position model/EDGE-TOP) (: 1 u64)))
+  (assert (= (model/cursor-position model/EDGE-LEFT) (: 2 u64)))
+  (assert (= (model/cursor-position model/EDGE-BOTTOM) (: 4 u64)))
+  (assert (= (model/cursor-position model/EDGE-RIGHT) (: 8 u64)))
+  (assert (= (model/cursor-position (+ model/EDGE-TOP model/EDGE-RIGHT))
+             (: 9 u64)))
+  (assert (= (model/cursor-position (+ model/EDGE-BOTTOM model/EDGE-LEFT))
+             (: 6 u64))))

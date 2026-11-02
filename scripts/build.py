@@ -14,7 +14,8 @@ subprocess.run(['coil', 'build', '-o', 'build/jim-next'], cwd=ROOT, check=True) 
 with (APP / 'Contents/Info.plist').open('wb') as f:
     plistlib.dump({'CFBundleIdentifier': 'dev.jim.coil', 'CFBundleName': 'Jim Coil',
         'CFBundleExecutable': 'jim-coil', 'CFBundlePackageType': 'APPL',
-        'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication'}, f)
+        'NSHighResolutionCapable': True,
+        'NSMicrophoneUsageDescription': 'Jim transcribes your speech into the focused terminal when you start dictation.', 'NSPrincipalClass': 'NSApplication'}, f)
 identity = os.environ.get('JIM_SIGN_IDENTITY', 'TerminalBevy Local Signing')
 identities = subprocess.check_output(['security', 'find-identity', '-p', 'codesigning'], text=True)
 if identity not in identities:

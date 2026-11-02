@@ -171,6 +171,8 @@
 
 (extern ghostty_surface_text :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> void))
 
+(extern ghostty_surface_revisable :cc (cc/C) [(ptr i8)] (-> bool))
+
 (extern ghostty_surface_preedit :cc (cc/C) [(ptr i8) (ptr i8) u64] (-> void))
 
 (extern ghostty_surface_mouse_pos :cc (cc/C) [(ptr i8) f64 f64 i32] (-> void))
@@ -218,7 +220,7 @@
 (extern ghostty_surface_new_session
         :cc
         (cc/C)
-        [(ptr i8) (ptr SurfaceConfig) i32]
+        [(ptr i8) (ptr SurfaceConfig) i32 u32 u32]
         (-> (ptr i8)))
 
 (defstruct TextPoint [(tag i32) (coord i32) (x u32) (y u32)])
