@@ -198,6 +198,10 @@ def main():
             if stray:
                 raise SystemExit(str(path) + ' links ' + ', '.join(stray))
 
+    # Modes are kept when the bundle is zipped, so the umask things were built
+    # under must not decide who on the Mac can run it.
+    run('chmod', '-R', 'go+rX', str(APP))
+
     # Only what this script changed is signed again; jim-session keeps the
     # signature it was built with.
     identity = os.environ.get('JIM_RELEASE_SIGN_IDENTITY', '-')
