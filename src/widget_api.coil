@@ -583,8 +583,38 @@
 
 (const EMIT 4)
 
+;;; Open a widget pane at X Y W H of the canvas, leaving the keyboard where it is.
+(const OPEN-WIDGET-AT 5)
+
+;;; Move and size the widget pane with this spec.
+(const MOVE-WIDGET 6)
+
+;;; Move and size the pane making the request.
+(const MOVE-SELF 7)
+
+;;; Close the widget pane with this spec.
+(const CLOSE-WIDGET 8)
+
+;;; Bring the camera to the widget pane with this spec, at full size, and focus it.
+(const REVEAL-WIDGET 9)
+
+;;; Fit the whole canvas in view, no larger than full size.
+(const FIT-CANVAS 10)
+
+;;; Put text on the system clipboard.
+(const COPY-TEXT 11)
+
 (defstruct Request
-  [(kind i64) (at i64) (len i64) (at2 i64) (len2 i64) (value f64)])
+  [(kind i64)
+   (at i64)
+   (len i64)
+   (at2 i64)
+   (len2 i64)
+   (value f64)
+   (x f64)
+   (y f64)
+   (w f64)
+   (h f64)])
 
 (defstruct Requests [(bytes (ArrayList u8)) (items (ArrayList Request))])
 
@@ -622,7 +652,27 @@
              :len (len text)
              :at2 (+ at (len text))
              :len2 (len text2)
-             :value value))
+             :value value
+             :x 0.0
+             :y 0.0
+             :w 0.0
+             :h 0.0))
+    (do)))
+
+;;; A request about a place on the canvas: the last pushed item gets X Y W H.
+(defn push-placed! [(r (ptr Requests))
+                    (kind i64)
+                    (text (slice u8))
+                    (x f64)
+                    (y f64)
+                    (w f64)
+                    (h f64)] (-> void)
+  (push-request! r kind text "" 0.0)
+  (let [item (elem (mut (.items r)) (- (len (.items r)) 1))]
+    (set! (.x item) x)
+    (set! (.y item) y)
+    (set! (.w item) w)
+    (set! (.h item) h)
     (do)))
 
 (const CLICK 1)
@@ -695,6 +745,46 @@
 ;;; Open another widget pane. SPEC is "NAME ARGS…", as typed in the palette.
 (defn open-widget! [(e (ptr Event)) (spec (slice u8))] (-> void)
   (push-request! (.requests e) OPEN-WIDGET spec "" 0.0))
+
+;;; Open another widget pane at a place on this canvas, without taking the
+;;; keyboard. Sizes are limited as for a saved layout: at least 320 by 180.
+(defn open-widget-at! [(e (ptr Event))
+                       (spec (slice u8))
+                       (x f64)
+                       (y f64)
+                       (w f64)
+                       (h f64)] (-> void)
+  (push-placed! (.requests e) OPEN-WIDGET-AT spec x y w h))
+
+;;; Move and size the pane on this canvas whose spec is SPEC, if there is one.
+(defn move-widget! [(e (ptr Event))
+                    (spec (slice u8))
+                    (x f64)
+                    (y f64)
+                    (w f64)
+                    (h f64)] (-> void)
+  (push-placed! (.requests e) MOVE-WIDGET spec x y w h))
+
+;;; Move and size this widget's own pane.
+(defn move-self! [(e (ptr Event)) (x f64) (y f64) (w f64) (h f64)] (-> void)
+  (push-placed! (.requests e) MOVE-SELF "" x y w h))
+
+;;; Close the pane on this canvas whose spec is SPEC, if there is one. It cannot
+;;; be the widget's own: a widget does not end itself.
+(defn close-widget! [(e (ptr Event)) (spec (slice u8))] (-> void)
+  (push-request! (.requests e) CLOSE-WIDGET spec "" 0.0))
+
+;;; Bring the camera to the pane on this canvas whose spec is SPEC, and focus it.
+(defn reveal-widget! [(e (ptr Event)) (spec (slice u8))] (-> void)
+  (push-request! (.requests e) REVEAL-WIDGET spec "" 0.0))
+
+;;; Fit every pane on this canvas in view, no larger than full size.
+(defn fit-canvas! [(e (ptr Event))] (-> void)
+  (push-request! (.requests e) FIT-CANVAS "" "" 0.0))
+
+;;; Put TEXT on the system clipboard.
+(defn copy-text! [(e (ptr Event)) (text (slice u8))] (-> void)
+  (push-request! (.requests e) COPY-TEXT text "" 0.0))
 
 ;;; Open a terminal pane in DIRECTORY.
 (defn open-terminal! [(e (ptr Event)) (directory (slice u8))] (-> void)

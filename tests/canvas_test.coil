@@ -4,6 +4,9 @@
 (import "jim.canvas" :as canvas)
 (import "jim.sidebar" :as sidebar)
 (import "jim.workspace" :as workspace)
+(import "jim.pane-menu" :as pane-menu)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 
 (defn near? [(a f64) (b f64)] (-> bool)
   (and (< (- a b) 0.00001) (> (- a b) -0.00001)))
@@ -385,3 +388,34 @@
              (: 9 u64)))
   (assert (= (model/cursor-position (+ model/EDGE-BOTTOM model/EDGE-LEFT))
              (: 6 u64))))
+
+(deftest secondary-clicks-open-a-pane-menu-on-its-chrome
+  ; 640×400 at 1×: the header and the 6-point band open it; the content doesn't.
+  (assert (model/opens-pane-menu? false 640.0 400.0 300.0 10.0 6.0))
+  (assert (model/opens-pane-menu? false 640.0 400.0 630.0 10.0 6.0))
+  (assert (model/opens-pane-menu? false 640.0 400.0 2.0 200.0 6.0))
+  (assert (model/opens-pane-menu? false 640.0 400.0 300.0 397.0 6.0))
+  (assert (not (model/opens-pane-menu? false 640.0 400.0 300.0 200.0 6.0)))
+  ; A pinned pane has no chrome, so anywhere on it does.
+  (assert (model/opens-pane-menu? true 640.0 400.0 300.0 200.0 6.0)))
+
+(deftest pane-menu-tags-name-their-choice
+  (let [(mut offered) (ArrayList::new [i64] (alloc/malloc-allocator))
+        _ (push! (mut offered) 7)
+        _ (push! (mut offered) 3)
+        moved (pane-menu/tag-choice (+ pane-menu/MOVE-TAG 1) (slice offered))]
+    (assert (= (.action moved) pane-menu/MOVE))
+    (assert (= (.destination moved) 3))
+    (assert (= (.action (pane-menu/tag-choice pane-menu/PIN (slice offered)))
+               pane-menu/PIN))
+    (assert (= (.action (pane-menu/tag-choice pane-menu/UNPIN (slice offered)))
+               pane-menu/UNPIN))
+    (assert (= (.action (pane-menu/tag-choice pane-menu/CLOSE (slice offered)))
+               pane-menu/CLOSE))
+    ; A destination the menu didn't offer, and the submenu's own row, pick nothing.
+    (assert (= (.action (pane-menu/tag-choice (+ pane-menu/MOVE-TAG 2)
+                                              (slice offered)))
+               pane-menu/NONE))
+    (assert (= (.action (pane-menu/tag-choice pane-menu/NONE (slice offered)))
+               pane-menu/NONE))
+    (free! (mut offered))))

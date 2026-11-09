@@ -9,7 +9,7 @@ with neither (see src/runtime.coil):
                                JIT links no LLVM
   Contents/Frameworks/         any libraries the app links that macOS lacks
                                (none today, so it is left out)
-  Contents/Resources/root/     Coil.toml, src/, widgets/, config/, build/jim-session
+  Contents/Resources/root/     Coil.toml, src/, widgets/, config/, build/jimc
                                and Ghostty's resources: copied to Application
                                Support on first launch, where Jim works
   Contents/Resources/coil/     lib/coil, the standard library of the toolchain
@@ -38,7 +38,7 @@ RUNTIME_MANIFEST = '''[package]
 name = "jim"
 entry = "src/main.coil"
 source-roots = ["src"]
-exclude = ["src/session/server.coil"]
+exclude = ["src/session/server.coil", "src/jimc/main.coil"]
 '''
 
 # The parts of an installed toolchain a running Jim uses. Widgets import only
@@ -149,6 +149,8 @@ def main():
     (contents / 'MacOS').mkdir(parents=True)
     app_binary = contents / 'MacOS/jim-coil'
     shutil.copy2(ROOT / 'build/JimCoil.app/Contents/MacOS/jim-coil', app_binary)
+    service_binary = contents / 'MacOS/jim-session'
+    shutil.copy2(ROOT / 'build/jim-session', service_binary)
 
     root = contents / 'Resources/root'
     root.mkdir(parents=True)
@@ -157,7 +159,7 @@ def main():
     for name in ['src', 'widgets', 'config']:
         shutil.copytree(ROOT / name, root / name)
     (root / 'build/ghostty').mkdir(parents=True)
-    shutil.copy2(ROOT / 'build/jim-session', root / 'build/jim-session')
+    shutil.copy2(ROOT / 'build/jimc', root / 'build/jimc')
     shutil.copytree(ROOT / 'build/ghostty/share', root / 'build/ghostty/share', symlinks=True)
 
     bundled = contents / 'Resources/coil'
@@ -186,9 +188,9 @@ def main():
             'NSHighResolutionCapable': True,
             'NSMicrophoneUsageDescription': 'Jim transcribes your speech into the focused terminal when you start dictation.', 'NSPrincipalClass': 'NSApplication'}, f)
 
-    # The app, its libraries and the code in Resources (jim-session) may reach
-    # only into the bundle and macOS.
-    for path in [app_binary] + libraries:
+    # The app, the service, their libraries and the code in Resources may reach only
+    # into the bundle and macOS.
+    for path in [app_binary, service_binary] + libraries:
         stray = dependencies(path)
         if stray:
             raise SystemExit(str(path) + ' still links ' + ', '.join(stray))
@@ -198,11 +200,14 @@ def main():
             if stray:
                 raise SystemExit(str(path) + ' links ' + ', '.join(stray))
 
-    # Only what this script changed is signed again; jim-session keeps the
-    # signature it was built with.
+    # Only what this script changed is signed again; jimc keeps the signature it was
+    # built with. The service shares the app's identity: macOS applies the app's privacy
+    # permissions to what the service's shells do.
     identity = os.environ.get('JIM_RELEASE_SIGN_IDENTITY', '-')
     for path in libraries:
         run('codesign', '--force', '--sign', identity, '--timestamp=none', str(path))
+    run('codesign', '--force', '--sign', identity, '--timestamp=none',
+        '--identifier', 'dev.jim.coil.release', str(service_binary))
     run('codesign', '--force', '--sign', identity, '--timestamp=none',
         '--identifier', 'dev.jim.coil.release', str(APP))
     run('codesign', '--verify', '--strict', '--deep', str(APP))

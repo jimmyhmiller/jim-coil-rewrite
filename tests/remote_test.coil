@@ -1,0 +1,302 @@
+(module jim.remote-test)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.cc" :as cc)
+(import "coil.os" :as os)
+(import "coil.primitive" :as p)
+(import "coil.slice" :use *)
+(import "jim.native" :use [ns])
+(import "jim.remote" :as remote)
+(import "jim.remote-wire" :as wire)
+(import "jim.session.transport" :as transport)
+
+(extern mkdtemp :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern rmdir :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern unlink :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern socket :cc (cc/C) [i32 i32 i32] (-> i32))
+
+(extern bind :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
+
+(extern CFRunLoopRunInMode :cc (cc/C) [(ptr i8) f64 i8] (-> i32))
+
+(defstruct Place [(directory (array i8 64)) (path (array i8 96))])
+
+;;; A private directory, and the path of a socket inside it, like the app's own.
+(defn place! [(p (ptr Place))] (-> void)
+  (let [dir (p/cast (ptr i8) (field p directory))
+        path (p/cast (ptr i8) (field p path))
+        template "/tmp/jim-remote-XXXXXX\x00;"
+        suffix "/socket\x00;"
+        stem (- (len template) 1)]
+    (remote/memcpy dir
+                   (p/cast (ptr i8) (data template))
+                   (p/cast u64 (len template)))
+    (mkdtemp dir)
+    (remote/memcpy path dir (p/cast u64 stem))
+    (remote/memcpy (index path stem)
+                   (p/cast (ptr i8) (data suffix))
+                   (p/cast u64 (len suffix)))
+    (do)))
+
+(defn place-path [(p (ptr Place))] (-> (ptr i8))
+  (p/cast (ptr i8) (field p path)))
+
+(defn unplace! [(p (ptr Place))] (-> void)
+  (unlink (place-path p))
+  (rmdir (p/cast (ptr i8) (field p directory)))
+  (do))
+
+(defn send! [(fd i32) (bytes (slice u8))] (-> void)
+  (transport/send fd
+                  (p/cast (ptr i8) (data bytes))
+                  (p/cast isize (len bytes))
+                  (: 0 i32))
+  (do))
+
+(defn pumped-request [(s (ptr remote/Server))] (-> (ptr remote/Connection))
+  (remote/pump! s 1.0)
+  (remote/take-request! s))
+
+;;; Everything the server sends C's other end until it closes, pumping as it goes.
+(defn reply-of [(s (ptr remote/Server)) (client i32)] (-> (ArrayList u8))
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
+        (mut buffer) (zeroed (array u8 65536))
+        (mut more) true
+        (mut tries) 0]
+    (while (and (load more) (< (load tries) 2000))
+      (remote/pump! s 1.0)
+      (set! tries (+ (load tries) 1))
+      (when (> (transport/session-readable client (: 5 i32)) (: 0 i32))
+        (let [got
+                (transport/recv client
+                                (p/cast (ptr i8) (mut buffer))
+                                (: 65536 isize)
+                                (: 0 i32))]
+          (if (> got (: 0 isize))
+              (extend! (mut out)
+                       (p/cast (ptr u8) (mut buffer))
+                       (p/cast i64 got))
+              (set! more false)))))
+    out))
+
+(deftest json-is-written-the-way-it-reads
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wire/open-object! (mut out) "")
+    (wire/field-string! (mut out) "text" "a\"b\\c\n\t\x01;é")
+    (wire/field-i64! (mut out) "low" -120)
+    (wire/field-i64! (mut out) "zero" 0)
+    (wire/field-bool! (mut out) "on" true)
+    (wire/open-array! (mut out) "list")
+    (wire/open-object! (mut out) "")
+    (wire/field-i64! (mut out) "a" 1)
+    (wire/close-object! (mut out))
+    (wire/open-object! (mut out) "")
+    (wire/close-object! (mut out))
+    (wire/close-array! (mut out))
+    (wire/open-object! (mut out) "inner")
+    (wire/close-object! (mut out))
+    (wire/close-object! (mut out))
+    (assert (= (slice out)
+               "{\"text\":\"a\\\"b\\\\c\\n\\t\\u0001é\",\"low\":-120,\"zero\":0,\"on\":true,\"list\":[{\"a\":1},{}],\"inner\":{}}"))
+    (ArrayList::free! (mut out))))
+
+(deftest replies-say-whether-a-request-worked
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wire/push-success! (mut out) "")
+    (assert (= (slice out) "{\"ok\":true}"))
+    (set! (.len out) 0)
+    (wire/push-success! (mut out) "\"id\":3")
+    (assert (= (slice out) "{\"ok\":true,\"id\":3}"))
+    (set! (.len out) 0)
+    (wire/push-failure! (mut out) "No such \"pane\"")
+    (assert (= (slice out) "{\"ok\":false,\"error\":\"No such \\\"pane\\\"\"}"))
+    (ArrayList::free! (mut out))))
+
+(deftest a-request-gets-one-reply-and-the-connection-ends
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          client (transport/session-connect (place-path (mut place)))]
+      (assert (>= client (: 0 i32)))
+      (send! client "{\"action\":\"x\"}\n")
+      (let [c (pumped-request s)]
+        (assert (= (remote/request c) "{\"action\":\"x\"}"))
+        (assert (= (p/cast i64 (remote/take-request! s)) 0))
+        (remote/answer! s c "{\"ok\":true}"))
+      (let [(mut reply) (reply-of s client)]
+        (assert (= (slice reply) "{\"ok\":true}\n"))
+        (ArrayList::free! (mut reply)))
+      (assert (= (len (.connections s)) 0))
+      (transport/close client)
+      (remote/close! s))
+    (unplace! (mut place))))
+
+(deftest a-request-may-arrive-in-pieces-and-end-with-end-of-file
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          piecemeal (transport/session-connect (place-path (mut place)))
+          ended (transport/session-connect (place-path (mut place)))]
+      (send! piecemeal "{\"act")
+      (assert (= (p/cast i64 (pumped-request s)) 0))
+      (send! piecemeal "ion\":1}\n")
+      (let [c (pumped-request s)]
+        (assert (= (remote/request c) "{\"action\":1}"))
+        (remote/answer! s c "{}"))
+      (send! ended "whole")
+      (transport/shutdown ended (: 1 i32))
+      (let [c (pumped-request s)]
+        (assert (= (remote/request c) "whole"))
+        (remote/answer! s c "{}"))
+      (transport/close piecemeal)
+      (transport/close ended)
+      (remote/close! s))
+    (unplace! (mut place))))
+
+(deftest a-client-that-says-nothing-is-dropped-and-holds-nobody-up
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          silent (transport/session-connect (place-path (mut place)))
+          next (transport/session-connect (place-path (mut place)))]
+      (send! next "{}\n")
+      (let [c (pumped-request s)]
+        (assert (= (remote/request c) "{}"))
+        (remote/answer! s c "{}"))
+      (remote/pump! s 2.0)
+      (assert (= (len (.connections s)) 1))
+      (remote/pump! s (+ 1.0 (+ remote/REQUEST-SECONDS 0.5)))
+      (assert (= (len (.connections s)) 0))
+      (transport/close silent)
+      (transport/close next)
+      (remote/close! s))
+    (unplace! (mut place))))
+
+(deftest a-request-too-long-is-refused
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          client (transport/session-connect (place-path (mut place)))
+          (mut big) (ArrayList::new [u8] (alloc/malloc-allocator))]
+      (for [i 0 (+ wire/MAX-REQUEST 2)] (push! (mut big) (: 120 u8)))
+      ;; The server hangs up mid-send, once it has seen enough to refuse, and this
+      ;; thread must keep pumping it while the socket is full.
+      (remote/nonblocking! client)
+      (let [(mut at) 0
+            (mut open) true]
+        (while (and (load open) (< (load at) (len big)))
+          (let [sent
+                  (transport/send client
+                                  (p/cast (ptr i8)
+                                          (index (data (slice big)) (load at)))
+                                  (p/cast isize (- (len big) (load at)))
+                                  (: 0 i32))]
+            (cond (> sent (: 0 isize)) (set! at (+ (load at) (p/cast i64 sent)))
+                  (!= (os/errno) remote/EAGAIN) (set! open false)
+                  :else (do))
+            (remote/pump! s 1.0))))
+      (let [(mut reply) (reply-of s client)]
+        (assert (= (slice reply)
+                   "{\"ok\":false,\"error\":\"Request is too long\"}\n"))
+        (ArrayList::free! (mut reply)))
+      (assert (= (p/cast i64 (remote/take-request! s)) 0))
+      (ArrayList::free! (mut big))
+      (transport/close client)
+      (remote/close! s))
+    (unplace! (mut place))))
+
+(deftest a-reply-bigger-than-the-socket-holds-still-arrives-whole
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          client (transport/session-connect (place-path (mut place)))
+          (mut big) (ArrayList::new [u8] (alloc/malloc-allocator))]
+      (for [i 0 3000000] (push! (mut big) (: 121 u8)))
+      (send! client "{}\n")
+      (remote/answer! s (pumped-request s) (slice big))
+      (let [(mut reply) (reply-of s client)]
+        (assert (= (len reply) 3000001))
+        (assert (= (get reply 2999999) (: 121 u8)))
+        (assert (= (get reply 3000000) (: 10 u8)))
+        (ArrayList::free! (mut reply)))
+      (ArrayList::free! (mut big))
+      (transport/close client)
+      (remote/close! s))
+    (unplace! (mut place))))
+
+(deftest a-client-gone-before-its-reply-costs-nothing
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          client (transport/session-connect (place-path (mut place)))]
+      (send! client "{}\n")
+      (let [c (pumped-request s)]
+        (transport/close client)
+        (remote/answer! s c "{\"ok\":true}"))
+      (remote/pump! s 1.0)
+      (assert (= (len (.connections s)) 0))
+      (remote/close! s))
+    (unplace! (mut place))))
+
+(deftest only-one-app-serves-and-a-crash-leaves-nothing-in-the-way
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [path (place-path (mut place))
+          first (remote/listen! path)]
+      (assert (!= (p/cast i64 first) 0))
+      ;; Something answers, so the socket isn't this server's to take.
+      (assert (= (p/cast i64 (remote/listen! path)) 0))
+      (let [answering (transport/session-connect path)]
+        (assert (>= answering (: 0 i32)))
+        (transport/close answering))
+      (remote/close! first)
+      ;; A socket file nobody listens on, as a killed app leaves.
+      (let [stale (socket transport/AF-UNIX transport/SOCK-STREAM (: 0 i32))
+            address (p/alloc-stack transport/SockaddrUn)
+            path-bytes (remote/path-bytes path)]
+        (set! address (zeroed transport/SockaddrUn))
+        (set! (.length address) (: 106 u8))
+        (set! (.family address) (p/cast u8 transport/AF-UNIX))
+        (remote/memcpy (p/cast (ptr i8) (index (field address path) 0))
+                       path
+                       (p/cast u64 (len path-bytes)))
+        (assert (>= (bind stale (p/cast (ptr i8) address) (: 106 u32))
+                    (: 0 i32)))
+        (transport/close stale))
+      (let [second (remote/listen! path)]
+        (assert (!= (p/cast i64 second) 0))
+        (remote/close! second)))
+    (unplace! (mut place))))
+
+(deftest the-socket-is-refused-a-directory-others-can-reach
+  (assert (= (p/cast i64 (remote/listen! c"/tmp/jim-remote-socket")) 0)))
+
+(deftest the-run-loop-says-when-a-client-is-waiting
+  (let [(mut place) (zeroed Place)]
+    (place! (mut place))
+    (let [s (remote/listen! (place-path (mut place)))
+          mode (ns c"kCFRunLoopDefaultMode")]
+      (remote/watch! s (p/cast (ptr i8) 0))
+      (assert (not (remote/due? s)))
+      (CFRunLoopRunInMode mode 0.01 (: 1 i8))
+      (assert (not (remote/due? s)))
+      (let [client (transport/session-connect (place-path (mut place)))]
+        (CFRunLoopRunInMode mode 1.0 (: 1 i8))
+        (assert (.ready s))
+        (remote/pump! s 1.0)
+        (assert (not (.ready s)))
+        (send! client "{}\n")
+        (CFRunLoopRunInMode mode 1.0 (: 1 i8))
+        (assert (.ready s))
+        (let [c (pumped-request s)]
+          (assert (= (remote/request c) "{}"))
+          (remote/answer! s c "{\"ok\":true}"))
+        (let [(mut reply) (reply-of s client)]
+          (assert (= (slice reply) "{\"ok\":true}\n"))
+          (ArrayList::free! (mut reply)))
+        (transport/close client))
+      (remote/close! s))
+    (unplace! (mut place))))

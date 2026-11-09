@@ -1,0 +1,941 @@
+(module widgets.diffwall)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.fs" :as fs)
+(import "coil.time" :as time)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.proc" :as proc)
+(import "jim.widget-kit.json" :as json)
+(import "jim.widget-kit.git-view" :as gv)
+(import "jim.widget-kit.live" :as live)
+(import "jim.widget-kit.wall" :as wall)
+
+;;; A diff wall: a whole diff laid out across a project's canvas, one `diff` tile
+;;; per file or hunk, so a change can be read at once and in place. Port of
+;;; original Jim's `jimctl git diff-wall`. The palette's "Diff: Open diff wall"
+;;; makes a project and opens this widget in it.
+;;;
+;;; This pane is the wall's index and its only link to the world. It runs one git
+;;; diff and one `jimctl review list` for every tile, leaves each tile's diff and
+;;; the threads in files, and tells the tiles which changed, so a hundred tiles
+;;; never mean a hundred git processes. Unlike the original's fixed snapshot it stays
+;;; current: changed files update in place, new ones get a tile in the shortest
+;;; column, and tiles of files with nothing left to review close.
+(extern mkdir :cc (cc/C) [(ptr i8) u16] (-> i32))
+
+;;; One tile: what it shows, its file's numbers, and where the wall last put it.
+;;; Someone may have moved it since; a live update leaves it where it is.
+(defstruct Slot
+  [(key (ArrayList u8))
+   (title (ArrayList u8))
+   (number i64)
+   (hunk bool)
+   (rows i64)
+   (cols i64)
+   (adds i64)
+   (dels i64)
+   (x f64)
+   (y f64)
+   (w f64)
+   (h f64)])
+
+(defn slot-free! [(s (ptr Slot))] (-> void)
+  (free! (mut (.key s)))
+  (free! (mut (.title s)))
+  (do))
+
+;;; What survives reloads and restarts. TILES holds one Slot a line, see
+;;; tiles-text.
+(defstruct State
+  [(id i64)
+   (per-hunk bool)
+   (next-slot i64)
+   (columns i64)
+   (width f64)
+   (laid-out bool)
+   (tiles (ArrayList u8))])
+
+(derive (Serialize (field tiles (with text-ser text-de)))
+        (Deserialize (field tiles (with text-ser text-de)))
+        State)
+
+;;; Worker: turn a diff into tiles and write the files that changed. It owns all
+;;; of this until it is adopted.
+(defstruct Build
+  [(spec wall/Spec)
+   (raw (ArrayList u8))
+   ;; NUL-separated paths from `git ls-files -o`.
+   (untracked (ArrayList u8))
+   (root (ArrayList u8))
+   (id i64)
+   ;; In: the slots already handed out. Out: every tile's, by index.
+   (known-keys (ArrayList (ArrayList u8)))
+   (known-numbers (ArrayList i64))
+   (next-slot i64)
+   (tiles (ArrayList wall/Tile))
+   (numbers (ArrayList i64))
+   (changed (ArrayList i64))
+   (filtered i64)
+   (skipped i64)
+   (problem (ArrayList u8))])
+
+(defn c-path [(path (slice u8))] (-> (ArrayList u8))
+  (let [(mut out) (text/owned path)]
+    (push! (mut out) (: 0 u8))
+    (load out)))
+
+(defn make-dir! [(path (slice u8))] (-> void)
+  (let [(mut c) (c-path path)]
+    (mkdir (p/cast (ptr i8) (data (slice c))) (: 448 u16))
+    (free! (mut c))
+    (do)))
+
+;;; Add the untracked files SPEC selects to RAW, as diffs of new files.
+(defn add-untracked! [(b (ptr Build))] (-> void)
+  (let [list (slice (.untracked b))
+        (mut start) 0]
+    (for [i 0 (len list)]
+      (when (= (get list i) (: 0 u8))
+        (let [rel (subslice list (load start) i)
+              (mut path) (text/owned (slice (.root b)))]
+          (set! start (+ i 1))
+          (text/push-str! (mut path) "/")
+          (text/push-str! (mut path) rel)
+          ; Filtered here too: it spares reading a file nobody will see.
+          (when (wall/selected? (mut (.spec b)) rel)
+            (try (let [content
+                         (try-or! (fs/read-file (alloc/malloc-allocator)
+                                                (slice path))
+                                  0)]
+                   (do
+                     (wall/push-new-file! (mut (.raw b)) rel content)
+                     (alloc/free [u8] (alloc/malloc-allocator) content)
+                     0)))
+            0)
+          (free! (mut path))
+          0)))
+    (do)))
+
+;;; The slot of KEY, handing out a new number the first time it is seen.
+(defn number-of! [(b (ptr Build)) (key (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (len (.known-keys b))]
+      (when (= (slice (get (.known-keys b) i)) key)
+        (set! found (get (.known-numbers b) i))
+        0))
+    (if (>= (load found) 0)
+        (load found)
+        (let [n (.next-slot b)]
+          (set! (.next-slot b) (+ n 1))
+          n))))
+
+;;; Write CONTENT to PATH unless it already holds exactly that. True if written.
+(defn write-changed! [(b (ptr Build)) (path (slice u8)) (content (slice u8))]
+  (-> bool)
+  (let [same
+          (try (let [old
+                       (try-or! (fs/read-file (alloc/malloc-allocator) path)
+                                false)]
+                 (let [equal (= old content)]
+                   (alloc/free [u8] (alloc/malloc-allocator) old)
+                   equal)))]
+    (if same
+        false
+        (try (let [_
+                     (try-or! (fs/write-file (alloc/malloc-allocator)
+                                             path
+                                             content)
+                              (do
+                                (text/set-str! (mut (.problem b))
+                                               "cannot write ")
+                                (text/push-str! (mut (.problem b)) path)
+                                false))]
+               true)))))
+
+(impl Task Build
+  (run [(self (ptr Build))]
+    (-> void)
+    (add-untracked! self)
+    (wall/split! (slice (.raw self))
+                 (mut (.spec self))
+                 (mut (.tiles self))
+                 (mut (.filtered self)))
+    (let [limit (.max (.spec self))
+          count (len (.tiles self))]
+      (when (> count limit)
+        (set! (.skipped self) (- count limit))
+        (for [i limit count] (wall/tile-free! (elem (mut (.tiles self)) i)))
+        (set! (.len (.tiles self)) limit)
+        0)
+      (do))
+    (let [(mut dir) (ArrayList::new [u8] (alloc/malloc-allocator))
+          (mut parent) (ArrayList::new [u8] (alloc/malloc-allocator))]
+      (wall/push-dir! (mut dir) (.id self))
+      (text/push-str! (mut parent) (text/dirname (slice dir)))
+      (make-dir! (slice parent))
+      (make-dir! (slice dir))
+      (free! (mut dir))
+      (free! (mut parent)))
+    (for [i 0 (len (.tiles self))]
+      (let [t (elem (mut (.tiles self)) i)
+            n (number-of! self (slice (.key t)))
+            (mut path) (ArrayList::new [u8] (alloc/malloc-allocator))]
+        (push! (mut (.numbers self)) n)
+        (wall/push-patch-path! (mut path) (.id self) n)
+        (when (write-changed! self (slice path) (slice (.patch t)))
+          (push! (mut (.changed self)) n)
+          0)
+        (free! (mut path))
+        0))
+    (do)))
+
+(defn build-free! [(b (ptr Build))] (-> void)
+  (wall/spec-free! (mut (.spec b)))
+  (free! (mut (.raw b)))
+  (free! (mut (.untracked b)))
+  (free! (mut (.root b)))
+  (wall/free-globs! (mut (.known-keys b)))
+  (free! (mut (.known-numbers b)))
+  (wall/tiles-clear! (mut (.tiles b)))
+  (free! (mut (.tiles b)))
+  (free! (mut (.numbers b)))
+  (free! (mut (.changed b)))
+  (free! (mut (.problem b)))
+  (alloc/destroy [Build] (alloc/malloc-allocator) b)
+  (do))
+
+(defstruct Wall
+  [(state State)
+   (spec wall/Spec)
+   (args (ArrayList u8))
+   (dir (ArrayList u8))
+   (root (ArrayList u8))
+   (slots (ArrayList Slot))
+   (status (ArrayList u8))
+   (error (ArrayList u8))
+   (reviews (ArrayList u8))
+   (reviews-dir (ArrayList u8))
+   (open-threads i64)
+   (filtered i64)
+   (skipped i64)
+   (root-job proc/Job)
+   (diff-job proc/Job)
+   (untracked-job proc/Job)
+   (review-job proc/Job)
+   (build (ptr Build))
+   (build-handle i64)
+   (host (dyn Host))
+   ;; The next adopted build lays the whole wall out again.
+   (rearrange bool)
+   (diff-refresh live/Refresher)
+   (review-refresh live/Refresher)])
+
+(defn building? [(s (ptr Wall))] (-> bool)
+  (!= (p/cast i64 (.build s)) 0))
+
+(defn refreshing? [(s (ptr Wall))] (-> bool)
+  (or (proc/running? (mut (.root-job s)))
+      (proc/running? (mut (.diff-job s)))
+      (proc/running? (mut (.untracked-job s)))
+      (building? s)))
+
+;;; ---- the saved list of tiles ---------------------------------------------------
+
+;;; A line per Slot: numbers, then key and title, tab-separated. Coordinates are
+;;; whole points.
+(defn push-field! [(out (ptr (ArrayList u8))) (value i64)] (-> void)
+  (text/push-i64! out value)
+  (text/push-str! out "\t"))
+
+(defn tiles-text! [(s (ptr Wall))] (-> void)
+  (let [out (field (field s state) tiles)]
+    (clear! (mut out))
+    (for [i 0 (len (.slots s))]
+      (let [t (elem (mut (.slots s)) i)]
+        (push-field! out (.number t))
+        (push-field! out (if (.hunk t) 1 0))
+        (push-field! out (.rows t))
+        (push-field! out (.cols t))
+        (push-field! out (.adds t))
+        (push-field! out (.dels t))
+        (push-field! out (p/cast i64 (.x t)))
+        (push-field! out (p/cast i64 (.y t)))
+        (push-field! out (p/cast i64 (.w t)))
+        (push-field! out (p/cast i64 (.h t)))
+        (text/push-str! out (slice (.key t)))
+        (text/push-str! out "\t")
+        (text/push-str! out (slice (.title t)))
+        (text/push-str! out "\n")))
+    (do)))
+
+(defn field-i64 [(fields (slice (slice u8))) (i i64)] (-> i64)
+  (text/parse-i64 (get fields i) 0))
+
+(defn read-tiles! [(s (ptr Wall))] (-> void)
+  (let [saved (slice (.tiles (.state s)))
+        (mut lines) (ArrayList::new [text/Span] (alloc/malloc-allocator))
+        (mut fields) (ArrayList::new [(slice u8)] (alloc/malloc-allocator))]
+    (text/lines! saved (mut lines))
+    (for [k 0 (len lines)]
+      (let [line (text/span-text saved (get lines k))
+            (mut start) 0]
+        (clear! (mut fields))
+        (for [i 0 (+ (len line) 1)]
+          (when (or (= i (len line)) (= (get line i) (: 9 u8)))
+            (push! (mut fields) (subslice line (load start) i))
+            (set! start (+ i 1))
+            0))
+        (when (= (len fields) 12)
+          (let [f (slice fields)]
+            (push! (mut (.slots s))
+                   (Slot
+                     :number (field-i64 f 0)
+                     :hunk (= (field-i64 f 1) 1)
+                     :rows (field-i64 f 2)
+                     :cols (field-i64 f 3)
+                     :adds (field-i64 f 4)
+                     :dels (field-i64 f 5)
+                     :x (p/cast f64 (field-i64 f 6))
+                     :y (p/cast f64 (field-i64 f 7))
+                     :w (p/cast f64 (field-i64 f 8))
+                     :h (p/cast f64 (field-i64 f 9))
+                     :key (text/owned (get f 10))
+                     :title (text/owned (get f 11))))
+            0)
+          0)))
+    (free! (mut lines))
+    (free! (mut fields))
+    (do)))
+
+;;; ---- refreshing -----------------------------------------------------------------
+(defn start-root! [(s (ptr Wall))] (-> void)
+  (proc/start! (mut (.root-job s))
+               ["git" "rev-parse" "--show-toplevel"]
+               (slice (.dir s))
+               0))
+
+;;; Run the diff, or first find the repository's top: `git diff` names files from
+;;; there, and `git ls-files` from where it runs.
+(defn refresh! [(s (ptr Wall))] (-> void)
+  (live/started! (mut (.diff-refresh s)))
+  (cond (> (len (.problem (.spec s))) 0) (do)
+        (= (len (.root s)) 0) (start-root! s)
+        :else
+          (let [(mut argv)
+                  (ArrayList::new [(slice u8)]
+                                  (alloc/malloc-allocator))]
+            (wall/diff-argv! (mut (.spec s)) (mut argv))
+            (proc/start! (mut (.diff-job s)) (slice argv) (slice (.root s)) 0)
+            (free! (mut argv))
+            (do))))
+
+(defn start-reviews! [(s (ptr Wall))] (-> void)
+  (live/started! (mut (.review-refresh s)))
+  (when (and (> (len (.root s)) 0) (not (proc/running? (mut (.review-job s)))))
+    (proc/start! (mut (.review-job s))
+                 ["jimctl"
+                  "review"
+                  "list"
+                  "--repo"
+                  (slice (.root s))
+                  "--status"
+                  "all"]
+                 (slice (.root s))
+                 0)
+    0)
+  (do))
+
+(defn fail! [(s (ptr Wall)) (job (ptr proc/Job)) (what (slice u8))] (-> void)
+  (clear! (mut (.error s)))
+  (text/push-str! (mut (.error s)) what)
+  (text/push-str! (mut (.error s)) ": ")
+  (if (> (len (text/trim (proc/output job))) 0)
+      (text/push-truncated! (mut (.error s)) (text/trim (proc/output job)) 300)
+      (do
+        (text/push-str! (mut (.error s)) "exit ")
+        (text/push-i64! (mut (.error s)) (.code job))))
+  (do))
+
+(defn start-build! [(s (ptr Wall))] (-> void)
+  (let [a (alloc/malloc-allocator)
+        (mut spec) (wall/parse-spec (slice (.args s)))
+        (mut keys) (ArrayList::new [(ArrayList u8)] a)
+        (mut numbers) (ArrayList::new [i64] a)]
+    (set! (.per-hunk spec) (.per-hunk (.state s)))
+    (for [i 0 (len (.slots s))]
+      (let [t (elem (mut (.slots s)) i)]
+        (push! (mut keys) (text/owned (slice (.key t))))
+        (push! (mut numbers) (.number t))
+        0))
+    (let [b
+            (alloc/box! a
+                        Build
+                        (Build
+                          :spec (load spec)
+                          :raw (text/owned (proc/output (mut (.diff-job s))))
+                          :untracked
+                            (text/owned (if (proc/done? (mut (.untracked-job s)))
+                                            (proc/output (mut (.untracked-job s)))
+                                            ""))
+                          :root (text/owned (slice (.root s)))
+                          :id (.id (.state s))
+                          :known-keys (load keys)
+                          :known-numbers (load numbers)
+                          :next-slot (.next-slot (.state s))
+                          :tiles (ArrayList::new [wall/Tile] a)
+                          :numbers (ArrayList::new [i64] a)
+                          :changed (ArrayList::new [i64] a)
+                          :filtered 0
+                          :skipped 0
+                          :problem (ArrayList::new [u8] a)))]
+      (set! (.build s) b)
+      (set! (.build-handle s) (start-task (.host s) b))
+      (do))))
+
+;;; ---- laying out ------------------------------------------------------------------
+(defn tile-spec! [(s (ptr Wall)) (t (ptr Slot)) (out (ptr (ArrayList u8)))]
+  (-> void)
+  (clear! (mut out))
+  (wall/push-tile-spec! out
+                        (.id (.state s))
+                        (.number t)
+                        (.hunk t)
+                        (mut (.spec s))))
+
+(defn slot-of [(s (ptr Wall)) (number i64)] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (len (.slots s))]
+      (when (= (.number (elem (mut (.slots s)) i)) number)
+        (set! found i)
+        0))
+    (load found)))
+
+;;; Lay every tile out afresh: column width from the widest line, columns from the
+;;; total height, tiles in diff order into the shortest column. Tiles that exist
+;;; move; the camera then frames the wall.
+(defn arrange! [(s (ptr Wall)) (e (ptr Event)) (opened (ptr (ArrayList i64)))]
+  (-> void)
+  (let [count (len (.slots s))
+        (mut widest) 0
+        (mut stacked) 0.0
+        control-h (wall/control-height count)]
+    (for [i 0 count]
+      (let [t (elem (mut (.slots s)) i)]
+        (when (> (.cols t) (load widest)) (set! widest (.cols t)))
+        (set! stacked (+ (load stacked) (wall/tile-height (.rows t)) wall/GAP))))
+    (let [width (wall/column-width (load widest))
+          columns
+            (wall/column-count (+ (load stacked) control-h wall/GAP)
+                               width
+                               count)
+          (mut w) (wall/wall-new width columns control-h)
+          (mut spec) (ArrayList::new [u8] (alloc/malloc-allocator))]
+      (set! (.width (.state s)) width)
+      (set! (.columns (.state s)) columns)
+      (set! (.laid-out (.state s)) true)
+      (move-self! e wall/ORIGIN wall/ORIGIN width control-h)
+      (for [i 0 count]
+        (let [t (elem (mut (.slots s)) i)
+              b (wall/place! (mut w) (wall/tile-height (.rows t)))
+              (mut fresh) false]
+          (for [k 0 (len (load opened))]
+            (when (= (get (load opened) k) (.number t)) (set! fresh true)))
+          (set! (.x t) (.x b))
+          (set! (.y t) (.y b))
+          (set! (.w t) (.w b))
+          (set! (.h t) (.h b))
+          (tile-spec! s t (mut spec))
+          (if (load fresh)
+              (open-widget-at! e (slice spec) (.x b) (.y b) (.w b) (.h b))
+              (move-widget! e (slice spec) (.x b) (.y b) (.w b) (.h b)))))
+      (fit-canvas! e)
+      (wall/wall-free! (mut w))
+      (free! (mut spec))
+      (do))))
+
+;;; Tiles that appeared since the wall was laid out go in the shortest column,
+;;; around what is already there.
+(defn place-new! [(s (ptr Wall)) (e (ptr Event)) (opened (ptr (ArrayList i64)))]
+  (-> void)
+  (let [width (.width (.state s))
+        (mut w)
+          (wall/wall-new width
+                         (.columns (.state s))
+                         (wall/control-height (len (.slots s))))
+        (mut spec) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (for [i 0 (len (.slots s))]
+      (let [t (elem (mut (.slots s)) i)]
+        (when (> (.w t) 0.0)
+          (wall/wall-note! (mut w)
+                           (wall/Box
+                             :x (.x t)
+                             :y (.y t)
+                             :w (.w t)
+                             :h (.h t)))
+          0)))
+    (for [k 0 (len (load opened))]
+      (let [at (slot-of s (get (load opened) k))]
+        (when (>= at 0)
+          (let [t (elem (mut (.slots s)) at)
+                b (wall/place! (mut w) (wall/tile-height (.rows t)))]
+            (set! (.x t) (.x b))
+            (set! (.y t) (.y b))
+            (set! (.w t) (.w b))
+            (set! (.h t) (.h b))
+            (tile-spec! s t (mut spec))
+            (open-widget-at! e (slice spec) (.x b) (.y b) (.w b) (.h b)))
+          0)))
+    (wall/wall-free! (mut w))
+    (free! (mut spec))
+    (do)))
+
+;;; ---- adopting a finished build ----------------------------------------------------
+(defn adopt! [(s (ptr Wall)) (e (ptr Event))] (-> void)
+  (let [b (.build s)
+        a (alloc/malloc-allocator)
+        hunk (.per-hunk (.spec b))
+        (mut next) (ArrayList::new [Slot] a)
+        (mut opened) (ArrayList::new [i64] a)
+        (mut spec) (ArrayList::new [u8] a)]
+    (release-task (.host s) (.build-handle s))
+    (set! (.filtered s) (.filtered b))
+    (set! (.skipped s) (.skipped b))
+    (set! (.next-slot (.state s)) (.next-slot b))
+    (if (> (len (.problem b)) 0)
+        (text/set-str! (mut (.error s)) (slice (.problem b)))
+        (clear! (mut (.error s))))
+    (for [i 0 (len (.tiles b))]
+      (let [t (elem (mut (.tiles b)) i)
+            n (get (.numbers b) i)
+            at (slot-of s n)]
+        (if (>= at 0)
+            (let [old (elem (mut (.slots s)) at)]
+              (push! (mut next)
+                     (Slot
+                       :key (text/owned (slice (.key t)))
+                       :title (text/owned (slice (.title t)))
+                       :number n
+                       :hunk (.hunk old)
+                       :rows (.rows t)
+                       :cols (.cols t)
+                       :adds (.adds t)
+                       :dels (.dels t)
+                       :x (.x old)
+                       :y (.y old)
+                       :w (.w old)
+                       :h (.h old)))
+              0)
+            (do
+              (push! (mut opened) n)
+              (push! (mut next)
+                     (Slot
+                       :key (text/owned (slice (.key t)))
+                       :title (text/owned (slice (.title t)))
+                       :number n
+                       :hunk hunk
+                       :rows (.rows t)
+                       :cols (.cols t)
+                       :adds (.adds t)
+                       :dels (.dels t)
+                       :x 0.0
+                       :y 0.0
+                       :w 0.0
+                       :h 0.0))
+              0))))
+    ; Tiles of what is no longer in the diff close.
+    (for [i 0 (len (.slots s))]
+      (let [old (elem (mut (.slots s)) i)
+            (mut kept) false]
+        (for [k 0 (len (.numbers b))]
+          (when (= (get (.numbers b) k) (.number old)) (set! kept true)))
+        (when (not (load kept))
+          (tile-spec! s old (mut spec))
+          (close-widget! e (slice spec))
+          0)
+        (slot-free! old)))
+    (free! (mut (.slots s)))
+    (set! (.slots s) (load next))
+    (cond (or (.rearrange s) (not (.laid-out (.state s))))
+            (do
+              (set! (.rearrange s) false)
+              (when (> (len (.slots s)) 0) (arrange! s e (mut opened)) 0)
+              (do))
+          (> (len opened) 0) (place-new! s e (mut opened))
+          :else (do))
+    ; Only tiles that were already open need telling: new ones read the file as
+    ; they boot.
+    (when (> (len (.changed b)) 0)
+      (let [(mut notice) (ArrayList::new [u8] a)]
+        (text/push-i64! (mut notice) (.id (.state s)))
+        (for [i 0 (len (.changed b))]
+          (text/push-str! (mut notice) " ")
+          (text/push-i64! (mut notice) (get (.changed b) i)))
+        (emit! e (wall/changed-topic) (slice notice))
+        (free! (mut notice))
+        0))
+    (free! (mut opened))
+    (free! (mut spec))
+    (build-free! b)
+    (set! (.build s) (p/cast (ptr Build) 0))
+    (tiles-text! s)
+    (do)))
+
+;;; The threads arrived: remember them, leave them for the tiles if they changed,
+;;; and say so.
+(defn reviews-done! [(s (ptr Wall)) (e (ptr Event))] (-> void)
+  (let [reply (proc/output (mut (.review-job s)))
+        (mut r) (json/parse reply)]
+    (if (json/ok? (mut r))
+        (let [(mut path) (ArrayList::new [u8] (alloc/malloc-allocator))
+              (mut scratch) (ArrayList::new [u8] (alloc/malloc-allocator))
+              (mut count) 0]
+          (when (!= (slice (.reviews s)) reply)
+            (text/set-str! (mut (.reviews s)) reply)
+            (wall/push-comments! reply
+                                 (slice (.root s))
+                                 (mut scratch)
+                                 (mut count))
+            (set! (.open-threads s) (load count))
+            (wall/push-reviews-path! (mut path) (.id (.state s)))
+            (try (let [_
+                         (try-or! (fs/write-file (alloc/malloc-allocator)
+                                                 (slice path)
+                                                 reply)
+                                  0)]
+                   0))
+            (let [(mut notice) (ArrayList::new [u8] (alloc/malloc-allocator))]
+              (text/push-i64! (mut notice) (.id (.state s)))
+              (text/push-str! (mut notice) " reviews")
+              (emit! e (wall/changed-topic) (slice notice))
+              (free! (mut notice)))
+            0)
+          (free! (mut path))
+          (free! (mut scratch))
+          (do))
+        (do
+          (text/set-str! (mut (.status s)) "reviews: ")
+          (json/error-into! (mut r) (mut (.status s)))))
+    (json/free! (mut r))
+    (do)))
+
+(defn poll-jobs! [(s (ptr Wall)) (e (ptr Event))] (-> void)
+  (when (and (building? s) (task-done? (.host s) (.build-handle s)))
+    (adopt! s e)
+    (start-reviews! s)
+    0)
+  (when (and (proc/running? (mut (.root-job s)))
+             (proc/poll! (mut (.root-job s))))
+    (if (= (.code (.root-job s)) 0)
+        (do
+          (text/set-str! (mut (.root s))
+                         (text/trim (proc/output (mut (.root-job s)))))
+          (refresh! s))
+        (fail! s (mut (.root-job s)) "not a git repository"))
+    0)
+  (when (and (proc/running? (mut (.diff-job s)))
+             (proc/poll! (mut (.diff-job s))))
+    (cond (!= (.code (.diff-job s)) 0)
+            (fail! s (mut (.diff-job s)) "diff failed")
+          (wall/wants-untracked? (mut (.spec s)))
+            (proc/start! (mut (.untracked-job s))
+                         ["git"
+                          "-c"
+                          "core.quotepath=off"
+                          "ls-files"
+                          "--others"
+                          "--exclude-standard"
+                          "-z"]
+                         (slice (.root s))
+                         0)
+          :else (do (proc/reset! (mut (.untracked-job s))) (start-build! s)))
+    0)
+  (when (and (proc/running? (mut (.untracked-job s)))
+             (proc/poll! (mut (.untracked-job s))))
+    (if (= (.code (.untracked-job s)) 0)
+        (start-build! s)
+        (fail! s (mut (.untracked-job s)) "listing untracked files failed"))
+    0)
+  (when (and (proc/running? (mut (.review-job s)))
+             (proc/poll! (mut (.review-job s))))
+    (reviews-done! s e)
+    0)
+  (when (live/due? (mut (.diff-refresh s)) (refreshing? s)) (refresh! s) 0)
+  (when (live/due? (mut (.review-refresh s))
+                   (proc/running? (mut (.review-job s))))
+    (start-reviews! s)
+    0)
+  (do))
+
+(defn files-changed! [(s (ptr Wall)) (e (ptr Event))] (-> void)
+  (if (live/any-under? (.text e) (slice (.reviews-dir s)))
+      (live/note! (mut (.review-refresh s)))
+      (live/note! (mut (.diff-refresh s)))))
+
+;;; ---- the index -------------------------------------------------------------------
+(defn tally! [(s (ptr Wall)) (ui (ptr Ui))] (-> void)
+  (let [(mut adds) 0
+        (mut dels) 0]
+    (for [i 0 (len (.slots s))]
+      (let [t (elem (mut (.slots s)) i)]
+        (set! adds (+ (load adds) (.adds t)))
+        (set! dels (+ (load dels) (.dels t)))))
+    (text! ui "" 12.0 gv/MUTED false)
+    (append-i64! ui (len (.slots s)))
+    (append! ui (if (= (len (.slots s)) 1) " tile" " tiles"))
+    (gv/stat! ui (load adds) (load dels) 12.0)
+    (when (> (.open-threads s) 0)
+      (text! ui "" 12.0 gv/WARN false)
+      (append-i64! ui (.open-threads s))
+      (append! ui (if (= (.open-threads s) 1) " open comment" " open comments"))
+      0)
+    (do)))
+
+(defn note-line! [(s (ptr Wall)) (ui (ptr Ui))] (-> void)
+  (when (> (.filtered s) 0)
+    (text! ui "" 11.0 gv/MUTED false)
+    (append-i64! ui (.filtered s))
+    (append! ui " files filtered out")
+    0)
+  (when (> (.skipped s) 0)
+    (text! ui "" 11.0 gv/WARN false)
+    (append-i64! ui (.skipped s))
+    (append! ui " tiles over the limit not shown; raise it with max=N")
+    0)
+  (do))
+
+(defn index-row! [(s (ptr Wall)) (ui (ptr Ui)) (i i64)] (-> void)
+  (let [t (elem (mut (.slots s)) i)
+        (mut id) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (text/push-str! (mut id) "tile:")
+    (text/push-i64! (mut id) (.number t))
+    (hstack! ui 8.0 0.0)
+    (height! ui wall/INDEX-ROW-H)
+    (pad! ui 3.0 6.0 3.0 6.0)
+    (radius! ui 5.0)
+    (clip! ui)
+    (clickable! ui (slice id) false)
+    (text! ui (slice (.title t)) 12.0 gv/INK false)
+    (mono! ui)
+    (grow! ui 1.0)
+    (gv/stat! ui (.adds t) (.dels t) 11.0)
+    (end! ui)
+    (free! (mut id))
+    (do)))
+
+(defn title-text! [(s (ptr Wall)) (ui (ptr Ui))] (-> void)
+  (let [(mut t) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wall/push-name! (mut (.spec s))
+                     (if (> (len (.root s)) 0)
+                         (slice (.root s))
+                         (slice (.dir s)))
+                     (mut t))
+    (title! ui (slice t))
+    (free! (mut t))
+    (do)))
+
+(impl Widget Wall
+  (render [(self (ptr Wall)) (ui (ptr Ui))]
+    (-> void)
+    (title-text! self ui)
+    (when (> (len (.root self)) 0)
+      (when (wall/local? (mut (.spec self)))
+        (watch! ui (slice (.root self)))
+        0)
+      (watch! ui (slice (.reviews-dir self)))
+      0)
+    (vstack! ui 6.0 10.0)
+    (cond (> (len (.problem (.spec self))) 0)
+            (do
+              (text! ui (slice (.problem (.spec self))) 13.0 gv/ERR false)
+              (wrap! ui)
+              (text! ui
+                     "Open it as: [repo=PATH] [working|staged|unstaged|range BASE [HEAD]|pr N] [per=file|hunk] [path=GLOB] [exclude=GLOB] [max=N]"
+                     12.0
+                     gv/MUTED
+                     false)
+              (wrap! ui))
+          :else
+            (do
+              (hstack! ui 6.0 0.0)
+              (button! ui "refresh" "↻")
+              (button! ui
+                       "granularity"
+                       (if (.per-hunk (.state self)) "By file" "By hunk"))
+              (button! ui "arrange" "Arrange")
+              (button! ui "fit" "Fit")
+              (button! ui "copy" "Copy comments")
+              (end! ui)
+              (hstack! ui 10.0 0.0)
+              (tally! self ui)
+              (when (refreshing? self)
+                (text! ui "refreshing…" 11.0 gv/MUTED false)
+                0)
+              (end! ui)
+              (note-line! self ui)
+              (when (> (len (.error self)) 0)
+                (text! ui (slice (.error self)) 12.0 gv/ERR false)
+                (wrap! ui)
+                0)
+              (when (> (len (.status self)) 0)
+                (text! ui (slice (.status self)) 11.0 gv/MUTED false)
+                (wrap! ui)
+                0)
+              (when (and (= (len (.slots self)) 0)
+                         (not (refreshing? self))
+                         (= (len (.error self)) 0))
+                (text! ui "No changes to show." 13.0 gv/MUTED false)
+                0)
+              (divider! ui)
+              (vstack! ui 0.0 0.0)
+              (for [i 0 (len (.slots self))] (index-row! self ui i))
+              (end! ui)))
+    (end! ui))
+  (event [(self (ptr Wall)) (e (ptr Event))]
+    (-> void)
+    (cond (tick? e) (poll-jobs! self e)
+          (files-changed? e) (files-changed! self e)
+          (message? e "git.changed") (live/note! (mut (.diff-refresh self)))
+          (message? e "review.changed")
+            (live/note! (mut (.review-refresh self)))
+          (clicked? e "refresh")
+            (do
+              (when (not (refreshing? self)) (refresh! self) 0)
+              (start-reviews! self))
+          (clicked? e "granularity")
+            (do
+              (set! (.per-hunk (.state self)) (not (.per-hunk (.state self))))
+              (set! (.rearrange self) true)
+              (live/note! (mut (.diff-refresh self))))
+          (clicked? e "arrange")
+            (let [(mut none) (ArrayList::new [i64] (alloc/malloc-allocator))]
+              (arrange! self e (mut none))
+              (free! (mut none))
+              (tiles-text! self)
+              (do))
+          (clicked? e "fit") (fit-canvas! e)
+          (clicked? e "copy")
+            (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
+                  (mut count) 0]
+              (wall/push-comments! (slice (.reviews self))
+                                   (slice (.root self))
+                                   (mut out)
+                                   (mut count))
+              (clear! (mut (.status self)))
+              (if (> (load count) 0)
+                  (do
+                    (copy-text! e (slice out))
+                    (text/push-str! (mut (.status self)) "Copied ")
+                    (text/push-i64! (mut (.status self)) (load count))
+                    (text/push-str! (mut (.status self))
+                                    (if (= (load count) 1)
+                                        " comment"
+                                        " comments")))
+                  (text/push-str! (mut (.status self))
+                                  "No open comments to copy"))
+              (free! (mut out))
+              (do))
+          (id-prefix? e "tile:")
+            (let [at (slot-of self (id-number e "tile:"))]
+              (when (>= at 0)
+                (let [(mut spec) (ArrayList::new [u8] (alloc/malloc-allocator))]
+                  (tile-spec! self (elem (mut (.slots self)) at) (mut spec))
+                  (reveal-widget! e (slice spec))
+                  (free! (mut spec)))
+                0)
+              (do))
+          :else (do)))
+  (save [(self (ptr Wall)) (s (ptr Snapshot))]
+    (-> void)
+    (tiles-text! self)
+    (save-state! s (.state self)))
+  (animating? [(self (ptr Wall))]
+    (-> bool)
+    (or (refreshing? self)
+        (proc/running? (mut (.review-job self)))
+        (live/waiting? (mut (.diff-refresh self)))
+        (live/waiting? (mut (.review-refresh self)))))
+  (destroy! [(self (ptr Wall))]
+    (-> void)
+    (free! (mut (.tiles (.state self))))
+    (wall/spec-free! (mut (.spec self)))
+    (free! (mut (.args self)))
+    (free! (mut (.dir self)))
+    (free! (mut (.root self)))
+    (for [i 0 (len (.slots self))] (slot-free! (elem (mut (.slots self)) i)))
+    (free! (mut (.slots self)))
+    (free! (mut (.status self)))
+    (free! (mut (.error self)))
+    (free! (mut (.reviews self)))
+    (free! (mut (.reviews-dir self)))
+    (proc/free! (mut (.root-job self)))
+    (proc/free! (mut (.diff-job self)))
+    (proc/free! (mut (.untracked-job self)))
+    (proc/free! (mut (.review-job self)))
+    ; Jim destroys a generation only after its tasks finished.
+    (when (building? self)
+      (release-task (.host self) (.build-handle self))
+      (build-free! (.build self))
+      0)
+    (alloc/destroy [Wall] (alloc/malloc-allocator) self)
+    (do)))
+
+(defn now-ms [] (-> i64)
+  (try (let [v (try-or! (time/wall-now-ms) 0)] v)))
+
+(defn fresh-state [(spec (ptr wall/Spec))] (-> State)
+  (State
+    :id (now-ms)
+    :per-hunk (.per-hunk spec)
+    :next-slot 0
+    :columns 1
+    :width 0.0
+    :laid-out false
+    :tiles (ArrayList::new [u8] (alloc/malloc-allocator))))
+
+(defn open [(saved (ptr Snapshot)) (state State) (spec wall/Spec)]
+  (-> (ptr Wall))
+  (let [a (alloc/malloc-allocator)
+        s
+          (alloc/box! a
+                      Wall
+                      (Wall
+                        :state state
+                        :spec spec
+                        :args (text/owned (get-text saved "jim.args" ""))
+                        :dir (text/owned (get-text saved "jim.dir" "."))
+                        :root (ArrayList::new [u8] a)
+                        :slots (ArrayList::new [Slot] a)
+                        :status (ArrayList::new [u8] a)
+                        :error (ArrayList::new [u8] a)
+                        :reviews (ArrayList::new [u8] a)
+                        :reviews-dir (ArrayList::new [u8] a)
+                        :open-threads 0
+                        :filtered 0
+                        :skipped 0
+                        :root-job (proc/job-new (host saved))
+                        :diff-job (proc/job-new (host saved))
+                        :untracked-job (proc/job-new (host saved))
+                        :review-job (proc/job-new (host saved))
+                        :build (p/cast (ptr Build) 0)
+                        :build-handle 0
+                        :host (host saved)
+                        :rearrange false
+                        :diff-refresh (live/refresher)
+                        :review-refresh (live/refresher)))]
+    (live/home-path! "/.jim/reviews" (mut (.reviews-dir s)))
+    (read-tiles! s)
+    (refresh! s)
+    s))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [(mut spec) (wall/parse-spec (get-text saved "jim.args" ""))]
+    (match (load-state [State] saved)
+      (Fresh [] (set! out (open saved (fresh-state (mut spec)) (load spec))))
+      (Loaded [state] (set! out (open saved state (load spec))))
+      (Refused [] (wall/spec-free! (mut spec))))))

@@ -104,7 +104,8 @@
   (let [(mut template) (zeroed (array i8 64))
         directory (p/cast (ptr i8) (mut template))
         (mut socket) (zeroed (array i8 96))
-        (mut missing) (zeroed (array i8 96))]
+        (mut missing) (zeroed (array i8 96))
+        (mut executable) (zeroed (array i8 96))]
     (snprintf directory (: 64 u64) c"/tmp/jim-original-test-XXXXXX")
     (assert (!= (p/cast i64 (mkdtemp directory)) 0))
     (snprintf (p/cast (ptr i8) (mut socket)) (: 96 u64) c"%s/s.sock" directory)
@@ -112,11 +113,28 @@
               (: 96 u64)
               c"%s/gone.sock"
               directory)
+    ; A copy: launchd runs the service, and one run from build/, under ~/Documents, would
+    ; wait on a privacy prompt.
+    (snprintf (p/cast (ptr i8) (mut executable))
+              (: 96 u64)
+              c"%s/jim-session"
+              directory)
+    (assert (= (msg i8
+                    (msg (ptr i8)
+                         (class c"NSFileManager")
+                         (sel c"defaultManager")
+                         [])
+                    (sel c"copyItemAtPath:toPath:error:")
+                    [(ptr i8) (ptr i8) (ptr i8)]
+                    (ns (sessions/in-base c"build/jim-session"))
+                    (ns (p/cast (ptr i8) (mut executable)))
+                    (nil))
+               (: 1 i8)))
     (let [fd
-            (transport/session-adopt (sessions/in-base c"build/jim-session")
+            (transport/session-adopt (p/cast (ptr i8) (mut executable))
                                      (p/cast (ptr i8) (mut socket))
                                      directory
-                                     (sessions/in-base c"build/ghostty/share/ghostty")
+                                     directory
                                      (p/cast (ptr i8) (mut missing)))]
       (assert (= fd (: -1 i32)))
       (assert (= (os/errno) transport/ENOENT))

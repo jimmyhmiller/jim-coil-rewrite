@@ -112,7 +112,11 @@
 ;;; ghostty_target_tag_e, ghostty_action_tag_e
 (const TARGET-SURFACE (: 1 i32))
 
+(const ACTION-DESKTOP-NOTIFICATION (: 32 i32))
+
 (const ACTION-PWD (: 37 i32))
+
+(const ACTION-RING-BELL (: 52 i32))
 
 ;;; ghostty_clipboard_e
 (const CLIPBOARD-STANDARD (: 0 i32))

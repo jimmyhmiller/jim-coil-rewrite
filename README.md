@@ -44,8 +44,8 @@ does at run time needs a compiler.
   Jim, which widgets compile against. The rest of the installed toolchain is
   left out; `scripts/release.py` says why.
 - `Contents/Resources/root` holds what Jim reads at run time: a manifest for
-  widget imports, `src/`, `widgets/`, `config/`, `jim-session`, and Ghostty's
-  resources.
+  widget imports, `src/`, `widgets/`, `config/`, `jimc`, and
+  Ghostty's resources. `Contents/MacOS` holds `jim-session` beside the app.
 
 The release never writes into its bundle. On first launch, and whenever the
 release changes, it copies its root to
@@ -79,6 +79,8 @@ Canvas controls follow the original Jim handler:
 | ⌘T / ⌘N / New terminal | Add a terminal pane |
 | ⌘⇧P | Search actions; arrows or pointer select, Return or click runs |
 | ⌘W / pane × | Close focused / selected pane |
+| Right-click (or Control-click) a pane header | Pane menu: Pin to background, Move to project, Close |
+| Right-click a pinned pane anywhere | Pane menu: Unpin, Move to project, Close |
 | ⌘1–4 | Switch among the first four visible projects |
 | ⌘⇧\ / All workspaces | Toggle cube; drag spins and tilts, scroll zooms, click or Return enters, Esc returns |
 | ⌘⇧E | Toggle Exposé; click a pane to focus it, Esc returns |
@@ -102,6 +104,13 @@ corner on the floor, as Compiz's cube reflection did by default. Every face is d
 shows. The sky and floor are views beside the cube's stage rather than
 inside it: Core Animation depth-tests layers under one perspective, and an
 opaque sky at depth 0 would hide the ring behind it.
+
+**Pinned panes.** As in Jim, a pane pinned to the background sits behind every
+other pane, loses its header and background, and never takes the keyboard. Clicks,
+scrolling and drops pass through it, except onto a widget's buttons, links and text
+fields. Exposé leaves it where it is, and the cube lays it flat on its face. Pinning is
+saved with the layout. "Move to project" lists the projects the profile shows; the
+pane keeps its place on the canvas, its pin and its shell.
 
 **Exposé.** ⌘⇧E spreads every pane of the project into a grid, after Jim's
 (`jim-app/src/expose.rs`): each goes to the cell nearest where it lies, shrunk
@@ -147,6 +156,45 @@ The display link pauses when the overlay is hidden.
 Pane dragging and resizing use the current camera, so a held pane continues
 to follow the pointer during Command-scroll, even without mouse movement.
 
+## Controlling Jim from a shell
+
+`jimc` is to this app what `jimctl` is to original Jim: scripts and agents use it to
+drive a running Jim. Building links it as `~/.local/bin/jimc`. `jimc help` lists
+everything:
+
+```sh
+jimc diff-wall 'exclude=**/tests/**'        # this directory's working diff, on a new project
+jimc diff-wall range main --background      # the same, without switching to it
+jimc project list
+jimc pane list --project Recursion
+jimc term new --dir . --at 100,100,800,500  # prints the new pane, and its id
+jimc term send 3 'cargo test' --enter
+jimc term read 3
+jimc widget open markdown README.md
+jimc action run 'Canvas: Fit all panes'     # anything the palette does
+jimc action run 'Project: Set directory' --answer ~/code/x
+```
+
+Every reply is one line of JSON with `ok` and, when that is false, `error`; the exit
+code is 1 then, and 2 for a command line `jimc` can't make sense of. A project is its
+name or id, and defaults to the selected one. A pane's id lasts until Jim restarts; a
+terminal's `session` lasts as long as the terminal.
+
+`jimc` never brings the app to the front, and panes it opens leave the keyboard where it
+is. Only `project activate`, `pane focus` and `action run` move the keyboard, as do
+`project new` and `diff-wall`, which switch to what they make unless given
+`--background`.
+
+The protocol is one JSON object per line on `~/.jim-coil/control/socket`, or the path in
+`$JIM_COIL_SOCKET`, so anything can speak it directly with `jimc raw` or `nc -U`. Only
+your own user can connect. The first app running owns the socket, so with the
+development app and a release both open, `jimc` reaches whichever started first and
+`jimc status` says which. A release ships `jimc` in its root; link it yourself with
+`ln -s ~/Library/Application\ Support/JimCoil/root/build/jimc ~/.local/bin/jimc`.
+
+`jimctl git …` and `jimctl review …` read the repository and need no app, so they are
+still how you do those things. Everything else in `jimctl` talks to original Jim.
+
 ## Widgets
 
 A widget is a Coil source file, `widgets/NAME.coil`, that Jim compiles in-process
@@ -156,11 +204,39 @@ with Coil's JIT and hot-reloads on save. Open one with the palette action
 | Widget | Port of | Open with |
 |---|---|---|
 | `diff` | `diff.ft` | `diff`, `diff range main HEAD`, `diff pr 123`, `diff file x.patch`; a leading `repo=PATH` picks another repository |
+| `diffwall` | `jimctl git diff-wall` | `jimc diff-wall`, or the palette's **Diff: Open diff wall**, below |
 | `stage` | `stage.ft` | `stage [REPO]` — stage/unstage hunks or files, commit |
 | `branches` | `branches.ft` | `branches [REPO]` — checkout, new branch, worktrees, diffs |
 | `markdown` | `markdown.ft` | `markdown [PATH]` |
 | `counter` | `controls_demo.ft` | `counter` |
 | `git` | — | `git` — status and recent commits |
+
+**Diff: Open diff wall** lays a whole diff out across a new project's canvas, one
+pane per file, for reading a change at once and in place. Its prompt takes:
+
+```text
+[repo=PATH] [working|staged|unstaged|range BASE [HEAD]|pr N]
+[per=file|hunk] [path=GLOB]… [exclude=GLOB]… [max=N]
+```
+
+The default is everything that differs from `HEAD`, untracked files included. Globs
+are relative to the repository and match files or directories, as in
+`exclude=**/tests/**`; exclusions win. Whitespace-only changes are left out. A word
+can't hold a space, so give a path with spaces through **Project: Set directory**
+on the current project rather than `repo=`.
+
+The first pane is the wall's index: click a file to go to its tile, or use **Fit**
+to see the wall again. **By hunk** gives each hunk its own tile, **Arrange** tidies
+tiles you've moved, and **Copy comments** puts the open review threads on the
+clipboard to paste to whoever will act on them. Click a line in a tile to comment,
+as in `diff`.
+
+The wall stays current while its index pane is open: tiles update in place, a file
+that starts differing gets a tile in the shortest column, and the tile of a file with
+nothing left to review closes. Tiles stay where you put them; only **Arrange** moves
+them. Closing the index leaves its tiles as they last were. A tile you close stays
+closed until its file leaves the diff and comes back. A pull request's wall refreshes
+only when you press ↻.
 
 A widget declares `(module widgets.NAME)`, imports `jim.widget-api`, implements
 its `Widget` trait (`render`, `event`, `save`, `animating?`, `destroy!`), and
@@ -172,13 +248,15 @@ and setters for padding, margin, size, grow, alignment, colors, borders, clippin
 monospace, wrapping and clickable rows. Jim lays it out, draws it, scrolls the
 pane (passing the offset so widgets can build only visible rows), and routes
 clicks, edits and timer ticks back as events. Events can ask Jim to open another
-widget or a terminal. Jim calls widgets only through the trait's vtable. There is
-no C interface between them.
+widget or a terminal, place, move, close or reveal widget panes on its canvas, fit
+the canvas, or copy text. Jim calls widgets only through the trait's vtable. There
+is no C interface between them.
 
 `src/widget_kit/` holds widget-side helpers compiled into each widget: text
 utilities, non-blocking child processes (`proc`), JSON replies (`json`), a
 unified-diff model and parser (`diff`), a lexical syntax highlighter
-(`highlight`), and the shared diff row primitives (`git-view`). The git widgets
+(`highlight`), the shared diff row primitives (`git-view`), and the diff wall's
+specs, tiles and layout (`wall`). The git widgets
 talk to git through `jimctl git …` and `jimctl review …`. Jim adopts the login
 shell's `PATH` at startup so those tools are found when launched from Finder.
 
@@ -243,11 +321,15 @@ boots from that state.
 Editing `src/widget_api.coil` requires rebuilding Jim, and widgets refuse to
 load until then.
 
-Each open widget holds two JIT sessions, used alternately so the next version
-can compile while the current one runs. Closed widgets return their sessions to
-a pool for reuse. The first compile in a process allocates large short-lived
-compiler buffers, which raises the process footprint once; later widgets and
-reloads reuse that memory.
+All panes of a widget share its compiled code, so a second pane opens at once and
+costs only its own state, and a save compiles once however many panes show it. The
+next version compiles into a second JIT session while the current one runs, which
+is then reset and kept for the next save. Sharing code means sharing module-level
+mutable state, so a widget keeps per-pane state in its own struct. A pane whose
+state a new version refuses stays on the old version, which stays mapped until it
+moves on. Closing a widget's last pane frees its sessions. The first compile in a
+process allocates large short-lived compiler buffers, which raises the process
+footprint once; later widgets and reloads reuse that memory.
 
 ## Checks and scope
 
@@ -283,8 +365,8 @@ Pane focus changes only the titlebar color.
 
 Jim’s own `jim-session` process owns each terminal’s PTY and a headless Ghostty VT
 core. It uses a private, same-user Unix socket; there is no tmux dependency or
-terminal multiplexer. Closing the app detaches all renderers. Opening it reconnects
-the same shells; explicitly closing a pane terminates its session. “Terminal:
+terminal multiplexer. Closing the app detaches all renderers, and force quitting it leaves
+terminals opened by this build running. Opening it reconnects the same shells; explicitly closing a pane terminates its session. “Terminal:
 Reconnect focused terminal” retries an unavailable connection without discarding
 its saved identity. An exited shell remains readable until its pane is closed.
 

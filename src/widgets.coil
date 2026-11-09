@@ -15,18 +15,25 @@
 ;;; Hot-reloaded Coil widgets.
 ;;;
 ;;; A widget is `widgets/NAME.coil`, declaring `(module widgets.NAME)`, a type
-;;; implementing api/Widget, and `boot`. Each Runtime owns two JIT sessions and
-;;; alternates between them: a new version compiles into the idle session while
-;;; the live one keeps running.
+;;; implementing api/Widget, and `boot`. Every pane running a source shares its
+;;; compiled code, so a JIT session (hundreds of megabytes) is paid per source,
+;;; not per pane, and a save compiles once however many panes show it. A new pane
+;;; of a source that is already compiled boots at once.
 ;;;
-;;; Compiling never happens on the main thread. One worker thread makes every
-;;; coil.jit call (sessions, compiles, symbol lookup, resets), one job at a time
-;;; in submission order. When a compile succeeds the main thread picks up the
-;;; result on its next pass (`service-poll!`), saves the live widget's state,
-;;; and boots the new generation by calling its boot shim directly, which takes
-;;; microseconds. Only then is the old widget destroyed, with its own code, and
-;;; its session queued for reset, which unmaps that code. Any failure resets the
-;;; candidate alone and keeps the live widget.
+;;; A Source compiles into a Generation it is not running: its idle one, or a new one,
+;;; while the live panes keep running. Compiling never happens on the main thread.
+;;; One worker thread makes every coil.jit call (sessions, compiles, symbol lookup,
+;;; resets), one job at a time in submission order. When a compile succeeds the
+;;; main thread picks up the result on its next pass (`service-poll!`) and, for
+;;; each pane, saves the live widget's state and boots the new generation by
+;;; calling its boot shim directly, which takes microseconds. Only then is the old
+;;; widget destroyed, with its own code. A Generation is reset, which unmaps its code,
+;;; once nothing uses it. Any failure resets the candidate alone and keeps the
+;;; live widgets. A pane whose state the new generation refuses stays on the old
+;;; generation, which stays mapped until that pane moves on.
+;;;
+;;; Compiled code is shared, so a widget's module-level mutable state is shared by
+;;; its panes. Keep per-pane state in the widget's own struct.
 ;;;
 ;;; Jim calls widgets only through the api/Widget vtable, from the main thread,
 ;;; between events, so no widget code is running when a generation retires.
@@ -115,18 +122,44 @@
 
 (extern stat :cc (cc/C) [(ptr i8) (ptr Stat)] (-> i32))
 
+;;; One compiled generation of a Source: a JIT session and the code in it.
+(defstruct Generation
+  ;; Owned by the compile worker: the main thread never touches these.
+  [(session jit/JitSession)
+   (started bool)
+   ;; A generation lease token held while this generation may run, so a reset of
+   ;; live code fails instead of unmapping it.
+   (lease i64)
+   (leased bool)
+   ;; Owned by the main thread.
+   (shim (ptr i8))
+   ;; Widgets running this generation, retiring ones included, plus one while it
+   ;; is its Source's current generation.
+   (users i64)
+   (source (ptr Source))])
+
+;;; A widget source file and the compiled generations of it, shared by every pane
+;;; showing it. Owned by the main thread.
+(defstruct Source
+  [(path (ArrayList u8))
+   ;; Panes showing this source that are not closing.
+   (runtimes (ArrayList (ptr Runtime)))
+   ;; Runtimes not yet freed, closing ones included.
+   (holders i64)
+   ;; Jobs submitted for this source's generations and not yet finished.
+   (pending i64)
+   (current (ptr Generation))
+   (idle (ArrayList (ptr Generation)))
+   (compiling bool)
+   (again bool)
+   (stamp i64)
+   ;; Its last pane closed: it is out of the registry and goes when it is quiet.
+   (detached bool)])
+
 (defstruct Runtime
   [(name (ArrayList u8))
-   (path (ArrayList u8))
-   ;; Owned by the compile worker: the main thread never touches these.
-   (sessions (array jit/JitSession 2))
-   (started (array bool 2))
-   ;; Generation lease tokens held while a slot's widget is live, so a reset
-   ;; of live code fails instead of unmapping it. Written by the worker.
-   (leases (array i64 2))
-   (leased (array bool 2))
-   ;; Owned by the main thread.
-   (live i64)
+   (source (ptr Source))
+   (code (ptr Generation))
    (widget (dyn api/Widget))
    (ui api/Ui)
    (diagnostic (ArrayList u8))
@@ -134,23 +167,19 @@
    (directory (ArrayList u8))
    (args (ArrayList u8))
    (restored (ptr api/Snapshot))
-   ;; Each live generation's services (its api/Host), by slot.
-   (services (array (ptr services/Services) 2))
+   ;; The live generation's services (its api/Host).
+   (services (ptr services/Services))
    ;; Replaced generations waiting for their tasks to finish before their code
    ;; can be destroyed and unmapped.
    (retiring (ArrayList Retiree))
    (released bool)
-   (compiling bool)
-   (again bool)
    (closing bool)
-   (update i64)
-   (generation i64)
-   (stamp i64)])
+   (update i64)])
 
 (defstruct Retiree
   [(widget (dyn api/Widget))
    (present bool)
-   (slot i64)
+   (code (ptr Generation))
    (services (ptr services/Services))])
 
 (defn valid-name? [(name (slice u8))] (-> bool)
@@ -180,19 +209,23 @@
 
 (const JOB-RESET 2)
 
-(const JOB-RELEASE 3)
+;;; Free a generation's session and the generation.
+(const JOB-FREE-CODE 3)
+
+;;; Nothing for the worker to do: it only orders a closing runtime's memory after
+;;; every job submitted before it.
+(const JOB-RELEASE 4)
 
 (defstruct Job
   [(kind i64)
+   (code (ptr Generation))
    (runtime (ptr Runtime))
-   (slot i64)
-   (source (ArrayList u8))
-   (module (ArrayList u8))])
+   (text (ArrayList u8))])
 
 (defstruct Done
   [(kind i64)
+   (code (ptr Generation))
    (runtime (ptr Runtime))
-   (slot i64)
    (ok bool)
    (shim (ptr i8))
    (message (ArrayList u8))])
@@ -295,13 +328,13 @@
       0)
     (load session)))
 
-;;; Slot I's session, started on first use.
-(defn session [(r (ptr Runtime)) (i i64)] (-> (ptr jit/JitSession))
-  (when (not (load (index (field r started) i)))
-    (set! (index (field r sessions) i) (acquire))
-    (set! (index (field r started) i) true)
+;;; C's session, started on first use. Worker only.
+(defn session [(c (ptr Generation))] (-> (ptr jit/JitSession))
+  (when (not (.started c))
+    (set! (.session c) (acquire))
+    (set! (.started c) true)
     0)
-  (index (field r sessions) i))
+  (field c session))
 
 ;;; Imports resolve from disk, never from earlier submissions. So after the
 ;;; widget compiles, this shim joins its module under private aliases and is
@@ -342,13 +375,13 @@
 
 ;;; Worker: compile JOB's source and shim, and find the shim.
 (defn run-compile [(job (ptr Job))] (-> Done)
-  (let [r (.runtime job)
-        s (session r (.slot job))
+  (let [c (.code job)
+        s (session c)
         (mut message) (ArrayList::new [u8] (alloc/malloc-allocator))
         (mut shim-name) (ArrayList::new [u8] (alloc/malloc-allocator))
         compiled
           (and (api-current? (mut message))
-               (compile-into! s (slice (.source job)) (mut message))
+               (compile-into! s (slice (.text job)) (mut message))
                (compile-into! s (shim-source) (mut message)))]
     (push-str! (mut shim-name) "jim_shim_boot")
     (let [shim
@@ -362,58 +395,49 @@
         0)
       (if ok
           (let [token (jit/jit-generation-retain-current! s)]
-            (set! (index (field r leases) (.slot job)) token)
-            (set! (index (field r leased) (.slot job)) (!= token -1))
+            (set! (.lease c) token)
+            (set! (.leased c) (!= token -1))
             0)
           (do (jit/jit-reset! s) 0))
       (ArrayList::free! (mut shim-name))
       (Done
         :kind JOB-COMPILE
-        :runtime r
-        :slot (.slot job)
+        :code c
+        :runtime (.runtime job)
         :ok ok
         :shim shim
         :message (load message)))))
 
-(defn release-lease! [(r (ptr Runtime)) (slot i64)] (-> void)
-  (when (load (index (field r leased) slot))
-    (jit/jit-generation-release-token! (index (field r sessions) slot)
-                                       (load (index (field r leases) slot)))
-    (set! (index (field r leased) slot) false)
+(defn release-lease! [(c (ptr Generation))] (-> void)
+  (when (.leased c)
+    (jit/jit-generation-release-token! (field c session) (.lease c))
+    (set! (.leased c) false)
     0)
   (do))
 
 (defn run-job [(job (ptr Job))] (-> Done)
-  (let [r (.runtime job)]
-    (cond (= (.kind job) JOB-COMPILE) (run-compile job)
-          (= (.kind job) JOB-RESET)
-            (do
-              (when (load (index (field r started) (.slot job)))
-                (release-lease! r (.slot job))
-                (jit/jit-reset! (index (field r sessions) (.slot job)))
-                0)
-              (Done
-                :kind JOB-RESET
-                :runtime r
-                :slot (.slot job)
-                :ok true
-                :shim (p/cast (ptr i8) 0)
-                :message (ArrayList::new [u8] (alloc/malloc-allocator))))
-          :else
-            (do
-              (for [i 0 2]
-                (when (load (index (field r started) i))
-                  (release-lease! r i)
-                  (jit/jit-session-free! (index (field r sessions) i))
-                  (set! (index (field r started) i) false)
-                  0))
-              (Done
-                :kind JOB-RELEASE
-                :runtime r
-                :slot 0
-                :ok true
-                :shim (p/cast (ptr i8) 0)
-                :message (ArrayList::new [u8] (alloc/malloc-allocator)))))))
+  (if (= (.kind job) JOB-COMPILE)
+      (run-compile job)
+      (let [c (.code job)]
+        (cond (= (.kind job) JOB-RESET)
+                (when (.started c)
+                  (release-lease! c)
+                  (jit/jit-reset! (field c session))
+                  0)
+              (= (.kind job) JOB-FREE-CODE)
+                (when (.started c)
+                  (release-lease! c)
+                  (jit/jit-session-free! (field c session))
+                  (set! (.started c) false)
+                  0)
+              :else 0)
+        (Done
+          :kind (.kind job)
+          :code c
+          :runtime (.runtime job)
+          :ok true
+          :shim (p/cast (ptr i8) 0)
+          :message (ArrayList::new [u8] (alloc/malloc-allocator))))))
 
 (extern pthread_set_qos_class_self_np :cc (cc/C) [u32 i32] (-> i32))
 
@@ -439,8 +463,7 @@
         (set! (.len (field s jobs)) (- (len (.jobs s)) 1))
         (unlock! s)
         (let [d (run-job (mut job))]
-          (ArrayList::free! (mut (.source job)))
-          (ArrayList::free! (mut (.module job)))
+          (ArrayList::free! (mut (.text job)))
           (lock! s)
           (push! (mut (.done s)) d)
           (unlock! s)
@@ -473,30 +496,56 @@
   (do))
 
 (defn submit! [(kind i64)
+               (c (ptr Generation))
                (r (ptr Runtime))
-               (slot i64)
-               (source (slice u8))] (-> void)
+               (text (slice u8))] (-> void)
   (let [s (service)
-        a (alloc/malloc-allocator)
-        (mut src) (ArrayList::new [u8] a)
-        (mut module) (ArrayList::new [u8] a)]
-    (push-str! (mut src) source)
-    (push-str! (mut module) "widgets.")
-    (push-str! (mut module) (slice (.name r)))
+        (mut owned) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (push-str! (mut owned) text)
+    (when (!= (p/cast i64 c) 0)
+      (set! (.pending (.source c)) (+ (.pending (.source c)) 1))
+      0)
     (lock! s)
     (push! (mut (.jobs s))
            (Job
              :kind kind
+             :code c
              :runtime r
-             :slot slot
-             :source (load src)
-             :module (load module)))
+             :text (load owned)))
     (set! (.outstanding s) (+ (.outstanding s) 1))
     (try (let [_ (try-or! (notify-one! (field s wake)) 0)] 0))
     (unlock! s)
     (do)))
 
 ;;; ---- runtimes ----------------------------------------------------------------
+
+;;; The sources with open panes.
+(defn sources [] (-> (ptr (ArrayList (ptr Source))))
+  (let [cell (p/alloc-static (ArrayList (ptr Source)))]
+    (when (= (p/cast i64 (.data cell)) 0)
+      (set! cell (ArrayList::new [(ptr Source)] (alloc/malloc-allocator)))
+      0)
+    cell))
+
+;;; The Source of file PATH (NUL-terminated), created on first use.
+(defn source-of [(path (slice u8))] (-> (ptr Source))
+  (let [all (sources)
+        (mut found) (p/cast (ptr Source) 0)]
+    (for [i 0 (len (load all))]
+      (when (= (slice (.path (get (load all) i))) path)
+        (set! found (get (load all) i))
+        0))
+    (when (= (p/cast i64 (load found)) 0)
+      (let [a (alloc/malloc-allocator)
+            src (alloc/box! a Source (zeroed Source))]
+        (set! (.path src) (ArrayList::new [u8] a))
+        (push-str! (field src path) path)
+        (set! (.runtimes src) (ArrayList::new [(ptr Runtime)] a))
+        (set! (.idle src) (ArrayList::new [(ptr Generation)] a))
+        (push! (mut all) src)
+        (set! found src)
+        0))
+    (load found)))
 
 ;;; A runtime for DIR/NAME.coil. Nothing loads until reload!. Every boot sees
 ;;; PROJECT (the project directory) and ARGS (the text after the widget name).
@@ -505,16 +554,22 @@
                  (project (slice u8))
                  (args (slice u8))] (-> (ptr Runtime))
   (let [a (alloc/malloc-allocator)
-        r (alloc/box! a Runtime (zeroed Runtime))]
+        r (alloc/box! a Runtime (zeroed Runtime))
+        (mut path) (ArrayList::new [u8] a)]
     (set! (.name r) (ArrayList::new [u8] a))
     (push-str! (field r name) name)
     ; NUL-terminated: the path is also handed to stat.
-    (set! (.path r) (ArrayList::new [u8] a))
-    (push-str! (field r path) dir)
-    (push-str! (field r path) "/")
-    (push-str! (field r path) name)
-    (push-str! (field r path) ".coil")
-    (push! (mut (.path r)) (: 0 u8))
+    (push-str! (mut path) dir)
+    (push-str! (mut path) "/")
+    (push-str! (mut path) name)
+    (push-str! (mut path) ".coil")
+    (push! (mut path) (: 0 u8))
+    (let [src (source-of (slice path))]
+      (set! (.source r) src)
+      (push! (mut (.runtimes src)) r)
+      (set! (.holders src) (+ (.holders src) 1))
+      0)
+    (ArrayList::free! (mut path))
     (set! (.ui r) (api/ui-new a))
     (set! (.diagnostic r) (ArrayList::new [u8] a))
     (set! (.requests r) (api/requests-new a))
@@ -524,7 +579,6 @@
     (push-str! (field r args) args)
     (set! (.restored r) (p/cast (ptr api/Snapshot) 0))
     (set! (.retiring r) (ArrayList::new [Retiree] a))
-    (set! (.live r) -1)
     r))
 
 ;;; A runtime for widgets/NAME.coil, relative to Jim's working directory.
@@ -537,27 +591,90 @@
   (set! (.restored r) (alloc/box! (alloc/malloc-allocator) api/Snapshot state))
   (do))
 
-(defn source-path [(r (ptr Runtime))] (-> (slice u8))
-  (subslice (slice (.path r)) 0 (- (len (.path r)) 1)))
+(defn source-path [(src (ptr Source))] (-> (slice u8))
+  (subslice (slice (.path src)) 0 (- (len (.path src)) 1)))
 
 (defn live? [(r (ptr Runtime))] (-> bool)
-  (>= (.live r) 0))
+  (!= (p/cast i64 (.code r)) 0))
 
 ;;; True while the first generation is still compiling.
 (defn loading? [(r (ptr Runtime))] (-> bool)
-  (and (.compiling r) (not (live? r))))
+  (and (.compiling (.source r)) (not (live? r))))
 
 ;;; Modification time of the source in nanoseconds, or -1 when missing.
-(defn source-stamp [(r (ptr Runtime))] (-> i64)
+(defn source-stamp [(src (ptr Source))] (-> i64)
   (let [(mut st) (zeroed Stat)]
-    (if (= (stat (p/cast (ptr i8) (data (slice (.path r)))) (mut st))
+    (if (= (stat (p/cast (ptr i8) (data (slice (.path src)))) (mut st))
            (: 0 i32))
         (+ (* (.mtime-sec st) 1000000000) (.mtime-nsec st))
         -1)))
 
 (defn changed? [(r (ptr Runtime))] (-> bool)
-  (let [stamp (source-stamp r)]
-    (and (>= stamp 0) (!= stamp (.stamp r)))))
+  (let [src (.source r)
+        stamp (source-stamp src)]
+    (and (>= stamp 0) (!= stamp (.stamp src)))))
+
+;;; ---- compiled generations ----------------------------------------------------
+
+;;; C is unused now and reset: keep one for the next compile, free the rest.
+(defn code-idle! [(c (ptr Generation))] (-> void)
+  (let [src (.source c)]
+    (if (or (.detached src) (> (len (.idle src)) 0))
+        (submit! JOB-FREE-CODE c (p/cast (ptr Runtime) 0) "")
+        (do (push! (mut (.idle src)) c) (do)))))
+
+(defn code-release! [(c (ptr Generation))] (-> void)
+  (set! (.users c) (- (.users c) 1))
+  (when (= (.users c) 0)
+    (submit! JOB-RESET c (p/cast (ptr Runtime) 0) "")
+    0)
+  (do))
+
+;;; Once a detached source is quiet, give back everything it holds and then
+;;; itself, which the jobs this submits come back through.
+(defn source-settle! [(src (ptr Source))] (-> void)
+  (when (and (.detached src) (= (.holders src) 0) (not (.compiling src)))
+    (let [c (.current src)]
+      (when (!= (p/cast i64 c) 0)
+        (set! (.current src) (p/cast (ptr Generation) 0))
+        (code-release! c)
+        0))
+    (for [i 0 (len (.idle src))]
+      (submit! JOB-FREE-CODE (get (.idle src) i) (p/cast (ptr Runtime) 0) ""))
+    (clear! (mut (.idle src)))
+    (when (= (.pending src) 0)
+      (ArrayList::free! (mut (.path src)))
+      (ArrayList::free! (mut (.runtimes src)))
+      (ArrayList::free! (mut (.idle src)))
+      (alloc/destroy [Source] (alloc/malloc-allocator) src)
+      0)
+    0)
+  (do))
+
+;;; R no longer shows its source; with no panes left the source is detached, so
+;;; the next pane of this widget starts from a fresh compile.
+(defn source-leave! [(src (ptr Source)) (r (ptr Runtime))] (-> void)
+  (let [(mut k) 0]
+    (for [i 0 (len (.runtimes src))]
+      (let [other (get (.runtimes src) i)]
+        (when (!= (p/cast i64 other) (p/cast i64 r))
+          (set! (elem (field src runtimes) (load k)) other)
+          (set! k (+ (load k) 1))
+          0)))
+    (set! (.len (field src runtimes)) (load k)))
+  (when (= (len (.runtimes src)) 0)
+    (set! (.detached src) true)
+    (let [all (sources)
+          (mut k) 0]
+      (for [i 0 (len (load all))]
+        (let [other (get (load all) i)]
+          (when (!= (p/cast i64 other) (p/cast i64 src))
+            (set! (elem all (load k)) other)
+            (set! k (+ (load k) 1))
+            0)))
+      (set! (.len all) (load k)))
+    0)
+  (do))
 
 ;;; ---- retiring generations ----------------------------------------------------
 (defn retiring-runtimes [] (-> (ptr (ArrayList (ptr Runtime))))
@@ -567,14 +684,8 @@
       0)
     cell))
 
-(defn slot-retiring? [(r (ptr Runtime)) (slot i64)] (-> bool)
-  (let [(mut found) false]
-    (for [i 0 (len (.retiring r))]
-      (when (= (.slot (elem (field r retiring) i)) slot) (set! found true) 0))
-    (load found)))
-
-;;; Destroy retired generations whose tasks have finished and queue their
-;;; sessions for reset; release a closing runtime once nothing is left.
+;;; Destroy retired generations whose tasks have finished and drop their claim on
+;;; their code; release a closing runtime once nothing is left.
 (defn drain-retiring! [(r (ptr Runtime))] (-> void)
   (let [(mut k) 0]
     (for [i 0 (len (.retiring r))]
@@ -587,34 +698,25 @@
             (do
               (when (.present e) (api/destroy! (.widget e)) 0)
               (services/free! (.services e))
-              (when (not (.closing r))
-                (submit! JOB-RESET r (.slot e) "")
-                0)
+              (code-release! (.code e))
               0))))
     (set! (.len (field r retiring)) (load k)))
   (when (and (.closing r) (= (len (.retiring r)) 0) (not (.released r)))
     (set! (.released r) true)
-    (submit! JOB-RELEASE r 0 "")
-    0)
-  (when (and (.again r)
-             (not (.closing r))
-             (= (len (.retiring r)) 0)
-             (not (.compiling r)))
-    (set! (.again r) false)
-    (reload! r)
+    (submit! JOB-RELEASE (p/cast (ptr Generation) 0) r "")
     0)
   (do))
 
 (defn retire! [(r (ptr Runtime))
                (widget (dyn api/Widget))
                (present bool)
-               (slot i64)
+               (c (ptr Generation))
                (s (ptr services/Services))] (-> void)
   (push! (mut (.retiring r))
          (Retiree
            :widget widget
            :present present
-           :slot slot
+           :code c
            :services s))
   (let [all (retiring-runtimes)
         (mut listed) false]
@@ -625,32 +727,74 @@
     (when (not (load listed)) (push! (mut all) r) 0))
   (drain-retiring! r))
 
-;;; Start compiling the current source; returns at once. A save arriving while a
-;;; compile runs is compiled after it, once. The result arrives through
-;;; service-poll! and take-update!.
-(defn reload! [(r (ptr Runtime))] (-> void)
-  (set! (.stamp r) (source-stamp r))
-  (cond (.closing r) (do)
-        (not (valid-name? (slice (.name r))))
-          (say! r "Widget names may use only a-z, 0-9, - and _.")
-        (.compiling r) (do (set! (.again r) true) (do))
-        ; The idle slot's previous generation still has tasks running.
-        (slot-retiring? r (if (= (.live r) 0) 1 0))
-          (do (set! (.again r) true) (do))
-        :else
-          (try (let [source
+;;; Tell every pane of SRC why its source did not load.
+(defn say-all! [(src (ptr Source)) (message (slice u8))] (-> void)
+  (for [i 0 (len (.runtimes src))]
+    (let [r (get (.runtimes src) i)]
+      (say! r message)
+      (set! (.update r) -1)))
+  (do))
+
+;;; Start compiling SRC's file; returns at once. A save arriving while a compile
+;;; runs is compiled after it, once.
+(defn compile! [(src (ptr Source))] (-> void)
+  (let [stamp (source-stamp src)]
+    (if (.compiling src)
+        (when (!= stamp (.stamp src))
+          (set! (.stamp src) stamp)
+          (set! (.again src) true)
+          0)
+        (do
+          (set! (.stamp src) stamp)
+          (try (let [text
                        (try-or! (fs/read-file (alloc/malloc-allocator)
-                                              (source-path r))
-                                (do
-                                  (say! r "Cannot read ")
-                                  (push-str! (field r diagnostic)
-                                             (source-path r))
+                                              (source-path src))
+                                (let [(mut message)
+                                        (ArrayList::new [u8]
+                                                        (alloc/malloc-allocator))]
+                                  (push-str! (mut message) "Cannot read ")
+                                  (push-str! (mut message) (source-path src))
+                                  (say-all! src (slice message))
+                                  (ArrayList::free! (mut message))
                                   (do)))]
-                 (do
-                   (set! (.compiling r) true)
-                   (submit! JOB-COMPILE r (if (= (.live r) 0) 1 0) source)
-                   (alloc/free [u8] (alloc/malloc-allocator) source)
+                 (let [spare (> (len (.idle src)) 0)
+                       c
+                         (if spare
+                             (pop-idle! src)
+                             (let [fresh
+                                     (alloc/box! (alloc/malloc-allocator)
+                                                 Generation
+                                                 (zeroed Generation))]
+                               (set! (.source fresh) src)
+                               fresh))]
+                   (set! (.compiling src) true)
+                   (submit! JOB-COMPILE c (p/cast (ptr Runtime) 0) text)
+                   (alloc/free [u8] (alloc/malloc-allocator) text)
                    (do))))))
+    (do)))
+
+(defn pop-idle! [(src (ptr Source))] (-> (ptr Generation))
+  (let [last (- (len (.idle src)) 1)
+        c (get (.idle src) last)]
+    (set! (.len (field src idle)) last)
+    c))
+
+;;; Bring R up to date; returns at once. A new pane joins the generation already
+;;; compiled from the file on disk. Anything else asks for a compile, whose result
+;;; arrives through service-poll! and take-update!.
+(defn reload! [(r (ptr Runtime))] (-> void)
+  (let [src (.source r)]
+    (cond (.closing r) (do)
+          (not (valid-name? (slice (.name r))))
+            (say! r "Widget names may use only a-z, 0-9, - and _.")
+          (and (not (live? r))
+               (not (.compiling src))
+               (!= (p/cast i64 (.current src)) 0)
+               (= (source-stamp src) (.stamp src)))
+            (do
+              (set! (.update r) (if (boot! r (.current src)) 1 -1))
+              (do))
+          :else (compile! src))))
 
 (defn copy-entries! [(from (ptr api/Snapshot)) (to (ptr api/Snapshot))]
   (-> void)
@@ -661,9 +805,9 @@
                       (.value e)
                       (api/snapshot-slice from (.text-at e) (.text-len e))))))
 
-;;; Main thread: boot the generation compiled into SLOT from the live widget's
-;;; state (or the state restored from disk), then retire the old generation.
-(defn boot! [(r (ptr Runtime)) (slot i64) (shim (ptr i8))] (-> bool)
+;;; Main thread: boot generation C from the live widget's state (or the state
+;;; restored from disk), then retire the old generation.
+(defn boot! [(r (ptr Runtime)) (c (ptr Generation))] (-> bool)
   (let [a (alloc/malloc-allocator)
         saved (alloc/box! a api/Snapshot (api/snapshot-new a))
         out (alloc/box! a (dyn api/Widget) (zeroed (dyn api/Widget)))
@@ -676,10 +820,11 @@
     ; Later entries win, so Jim's context overrides anything saved under it.
     (api/put-text! saved "jim.dir" (slice (.directory r)))
     (api/put-text! saved "jim.args" (slice (.args r)))
+    (set! (.users c) (+ (.users c) 1))
     ; A live widget whose state cannot be saved keeps running; the candidate
     ; never boots.
     (when (= (len (api/problem saved)) 0)
-      (call-ptr (p/cast (fnptr (cc/C) [i64 i64] void) shim)
+      (call-ptr (p/cast (fnptr (cc/C) [i64 i64] void) (.shim c))
                 (p/cast i64 saved)
                 (p/cast i64 out))
       0)
@@ -694,17 +839,13 @@
           (do
             (let [had (live? r)
                   old-widget (.widget r)
-                  old-slot (.live r)
-                  old-services
-                    (if had (load (index (field r services) old-slot)) fresh)]
-              ; Switch to the new generation before retiring the old one:
-              ; retiring can start the next reload, which must see the new slot
-              ; as live.
+                  old-code (.code r)
+                  old-services (.services r)]
+              ; Switch to the new generation before retiring the old one.
               (set! (.widget r) (load out))
-              (set! (.live r) slot)
-              (set! (index (field r services) slot) fresh)
-              (when had (retire! r old-widget true old-slot old-services) 0))
-            (set! (.generation r) (+ (.generation r) 1))
+              (set! (.code r) c)
+              (set! (.services r) fresh)
+              (when had (retire! r old-widget true old-code old-services) 0))
             (clear! (mut (.diagnostic r)))
             (when (!= (p/cast i64 (.restored r)) 0)
               (api/snapshot-free! (.restored r))
@@ -715,8 +856,8 @@
           (do
             (say! r
                   (if refused (api/problem saved) "boot did not store a widget"))
-            ; Boot may have started tasks; the slot resets once they end.
-            (retire! r (zeroed (dyn api/Widget)) false slot fresh)
+            ; Boot may have started tasks; the code is released once they end.
+            (retire! r (zeroed (dyn api/Widget)) false c fresh)
             0))
       (alloc/destroy [(dyn api/Widget)] a out)
       (api/snapshot-free! saved)
@@ -724,7 +865,8 @@
       ok)))
 
 (defn final-free! [(r (ptr Runtime))] (-> void)
-  (let [a (alloc/malloc-allocator)]
+  (let [a (alloc/malloc-allocator)
+        src (.source r)]
     (api/ui-free! (field r ui))
     (api/requests-free! (field r requests))
     (when (!= (p/cast i64 (.restored r)) 0)
@@ -735,27 +877,52 @@
     (ArrayList::free! (mut (.args r)))
     (ArrayList::free! (mut (.diagnostic r)))
     (ArrayList::free! (mut (.name r)))
-    (ArrayList::free! (mut (.path r)))
     (ArrayList::free! (mut (.retiring r)))
     (alloc/destroy [Runtime] a r)
+    (set! (.holders src) (- (.holders src) 1))
+    (source-settle! src)
+    (do)))
+
+;;; A compile finished: every pane moves to the new generation, or, if it failed,
+;;; keeps what it runs and hears why.
+(defn compile-finished! [(d (ptr Done))] (-> void)
+  (let [c (.code d)
+        src (.source c)]
+    (set! (.compiling src) false)
+    (cond (not (.ok d))
+            (do (say-all! src (slice (.message d))) (code-idle! c) (do))
+          (.detached src)
+            (do (submit! JOB-RESET c (p/cast (ptr Runtime) 0) "") (do))
+          :else
+            (let [old (.current src)]
+              (set! (.shim c) (.shim d))
+              (set! (.users c) 1)
+              (set! (.current src) c)
+              (for [i 0 (len (.runtimes src))]
+                (let [r (get (.runtimes src) i)]
+                  (set! (.update r) (if (boot! r c) 1 -1))
+                  (do)))
+              (when (!= (p/cast i64 old) 0) (code-release! old) 0)
+              (do)))
+    (when (and (.again src) (not (.detached src)))
+      (set! (.again src) false)
+      (compile! src)
+      0)
     (do)))
 
 (defn finish! [(d (ptr Done))] (-> void)
-  (let [r (.runtime d)]
-    (cond (= (.kind d) JOB-RELEASE) (final-free! r)
-          (= (.kind d) JOB-RESET) (do)
-          (.closing r) (do (set! (.compiling r) false) (do))
-          :else
-            (do
-              (set! (.compiling r) false)
-              (if (and (.ok d) (boot! r (.slot d) (.shim d)))
-                  (set! (.update r) 1)
-                  (do
-                    (when (not (.ok d)) (say! r (slice (.message d))) 0)
-                    (set! (.update r) -1)))
-              (when (.again r) (set! (.again r) false) (reload! r) 0)
-              (do)))
+  (let [c (.code d)
+        src (if (= (p/cast i64 c) 0) (p/cast (ptr Source) 0) (.source c))]
+    (when (!= (p/cast i64 src) 0)
+      (set! (.pending src) (- (.pending src) 1))
+      0)
+    (cond (= (.kind d) JOB-RELEASE) (final-free! (.runtime d))
+          (= (.kind d) JOB-RESET) (code-idle! c)
+          (= (.kind d) JOB-FREE-CODE)
+            (do (alloc/destroy [Generation] (alloc/malloc-allocator) c) (do))
+          :else (compile-finished! d))
     (ArrayList::free! (mut (.message d)))
+    (when (!= (p/cast i64 src) 0) (source-settle! src) 0)
     (do)))
 
 ;;; Main thread: apply every finished job. Cheap when nothing finished.
@@ -794,7 +961,7 @@
 ;;; Wait, polling, until R has no compile in flight. For tests and tools; Jim
 ;;; itself never blocks on the compiler.
 (defn settle! [(r (ptr Runtime))] (-> bool)
-  (while (.compiling r)
+  (while (.compiling (.source r))
     (usleep (: 2000 u32))
     (service-poll!))
   (live? r))
@@ -911,6 +1078,10 @@
           (do (copy-entries! (.restored r) out) true)
         :else false))
 
+;;; The last render, for tools and tests.
+(defn ui-of [(r (ptr Runtime))] (-> (ptr api/Ui))
+  (field r ui))
+
 ;;; Requests the widget made during the events delivered since the last clear.
 (defn requests [(r (ptr Runtime))] (-> (ptr api/Requests))
   (field r requests))
@@ -918,16 +1089,14 @@
 (defn diagnostic [(r (ptr Runtime))] (-> (slice u8))
   (slice (.diagnostic r)))
 
-;;; Destroy the live widget now; the worker releases its sessions, and the
-;;; runtime's memory goes when that finishes (via service-poll!).
+;;; Destroy the live widget now; the runtime's memory goes once its retiring
+;;; generations have finished (via service-poll!), and its source's code once no
+;;; pane uses it.
 (defn free! [(r (ptr Runtime))] (-> void)
   (set! (.closing r) true)
+  (source-leave! (.source r) r)
   (if (live? r)
-      (let [slot (.live r)]
-        (set! (.live r) -1)
-        (retire! r
-                 (.widget r)
-                 true
-                 slot
-                 (load (index (field r services) slot))))
+      (let [c (.code r)]
+        (set! (.code r) (p/cast (ptr Generation) 0))
+        (retire! r (.widget r) true c (.services r)))
       (drain-retiring! r)))

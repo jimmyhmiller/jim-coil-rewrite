@@ -1,0 +1,230 @@
+(module jim.session-launch-test)
+(import "coil.cc" :as cc)
+(import "coil.os" :as os)
+(import "coil.primitive" :as p)
+(import "jim.session.transport" :as transport)
+
+;;; A service must start outside its caller's coalition, because a force quit of an app
+;;; sends SIGTERM to the app's coalition. These run the real path through launchd. They
+;;; can't run a force quit: only the Dock and loginwindow hold the entitlement for one.
+
+(extern mkdtemp :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern getcwd :cc (cc/C) [(ptr i8) u64] (-> (ptr i8)))
+
+(extern setenv :cc (cc/C) [(ptr i8) (ptr i8) i32] (-> i32))
+
+(extern system :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern usleep :cc (cc/C) [u32] (-> i32))
+
+(extern _NSGetEnviron :cc (cc/C) [] (-> (ptr (ptr (ptr i8)))))
+
+(extern getuid :cc (cc/C) [] (-> u32))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
+(extern strlen :cc (cc/C) [(ptr i8)] (-> isize))
+
+(extern strcmp :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
+
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
+
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+
+(extern close :cc (cc/C) [i32] (-> i32))
+
+(defstruct Paths
+  [(dir (array i8 64))
+   (socket (array i8 256))
+   (executable (array i8 1024))
+   (resources (array i8 1024))
+   (label (array i8 256))
+   (empty-environment (array (ptr i8) 1))])
+
+(defn run [(format (ptr i8)) (a (ptr i8)) (b (ptr i8))] (-> i32)
+  (let [(mut command) (zeroed (array i8 2048))
+        out (p/cast (ptr i8) (mut command))]
+    (snprintf out (: 2048 u64) format a b)
+    (system out)))
+
+(defn paths! [(out (ptr Paths)) (name (ptr i8))] (-> i64)
+  (let [(mut cwd) (zeroed (array i8 900))
+        cwd-bytes (p/cast (ptr i8) (mut cwd))
+        dir (p/cast (ptr i8) (mut (.dir out)))]
+    (getcwd cwd-bytes (: 900 u64))
+    (snprintf dir (: 64 u64) c"/tmp/jim-launch-XXXXXX")
+    (assert (!= (p/cast i64 (mkdtemp dir)) 0))
+    (snprintf (p/cast (ptr i8) (mut (.socket out)))
+              (: 256 u64)
+              c"%s/%s.sock"
+              dir
+              name)
+    ; A copy, and a home with no shell configuration. Run from build/, under ~/Documents,
+    ; an unbundled service with launchd for a parent waits on a privacy prompt: the
+    ; bundled one has the app's permissions (scripts/build.py).
+    (snprintf (p/cast (ptr i8) (mut (.executable out)))
+              (: 1024 u64)
+              c"%s/jim-session"
+              dir)
+    (let [(mut source) (zeroed (array i8 1024))
+          source-bytes (p/cast (ptr i8) (mut source))]
+      (snprintf source-bytes (: 1024 u64) c"%s/build/jim-session" cwd-bytes)
+      (assert (= (run c"cp '%s' '%s'"
+                      source-bytes
+                      (p/cast (ptr i8) (mut (.executable out))))
+                 (: 0 i32))))
+    ; Only this environment, which the service then passes on to its shell. An inherited
+    ; PWD or PATH could lead the shell back under ~/Documents.
+    (set! (index (_NSGetEnviron) 0)
+          (p/cast (ptr (ptr i8)) (mut (.empty-environment out))))
+    (setenv c"HOME" dir (: 1 i32))
+    (setenv c"PATH" c"/usr/bin:/bin" (: 1 i32))
+    (snprintf (p/cast (ptr i8) (mut (.resources out)))
+              (: 1024 u64)
+              c"%s/ghostty"
+              dir)
+    (snprintf (p/cast (ptr i8) (mut (.label out)))
+              (: 256 u64)
+              c"dev.jim.coil.session.%s.sock"
+              name)
+    (transport/log-open! (p/cast (ptr i8) (mut (.socket out))) c"test")
+    0))
+
+(defn job-gone? [(label (ptr i8))] (-> bool)
+  (let [(mut uid) (zeroed (array i8 16))
+        uid-bytes (p/cast (ptr i8) (mut uid))]
+    (snprintf uid-bytes (: 16 u64) c"%u" (getuid))
+    (!= (run c"/bin/launchctl print gui/%s/%s >/dev/null 2>&1" uid-bytes label)
+        (: 0 i32))))
+
+;;; Nothing but the service's own socket and lock, and the log, stays in the directory.
+(defn no-leftovers? [(socket (ptr i8))] (-> bool)
+  (= (run c"! ls %s.launch %s.plist >/dev/null 2>&1" socket socket) (: 0 i32)))
+
+(defn remove! [(dir (ptr i8))] (-> i32)
+  (run c"rm -rf %s%s" dir c""))
+
+(deftest a-service-starts-outside-the-callers-coalition-with-the-callers-environment
+  (let [(mut paths) (zeroed Paths)]
+    (paths! (mut paths) c"AAAAAAAA-0000-4000-8000-000000000001")
+    (let [dir (p/cast (ptr i8) (mut (.dir paths)))
+          socket (p/cast (ptr i8) (mut (.socket paths)))
+          label (p/cast (ptr i8) (mut (.label paths)))
+          value c"a&b<c>\"d'\x1b;[0m\nline two"]
+      (setenv c"JIM_LAUNCH_TEST" value (: 1 i32))
+      (let [fd
+              (transport/session-open (p/cast (ptr i8)
+                                              (mut (.executable paths)))
+                                      socket
+                                      dir
+                                      (p/cast (ptr i8) (mut (.resources paths))))]
+        (assert (>= fd (: 0 i32)))
+        (let [service (transport/peer-pid fd)
+              theirs (transport/coalition-of service)
+              ours (transport/own-coalition)]
+          (assert (> theirs 0))
+          (assert (> ours 0))
+          (assert (!= theirs ours)))
+        (assert (job-gone? label))
+        (assert (no-leftovers? socket))
+        (let [(mut input) (zeroed (array i8 256))
+              (mut output) (zeroed (array i8 256))
+              (mut result) (zeroed (array i8 256))
+              input-bytes (p/cast (ptr i8) (mut input))
+              output-bytes (p/cast (ptr i8) (mut output))
+              result-bytes (p/cast (ptr i8) (mut result))]
+          (snprintf output-bytes (: 256 u64) c"%s/got" dir)
+          (snprintf input-bytes
+                    (: 256 u64)
+                    c"printf %%s \"$JIM_LAUNCH_TEST\" > %s.new; mv %s.new %s\n"
+                    output-bytes
+                    output-bytes
+                    output-bytes)
+          (assert (>= (transport/session-send fd
+                                              (p/cast u32 transport/JIM-INPUT)
+                                              input-bytes
+                                              (p/cast i64 (strlen input-bytes)))
+                      (: 0 i32)))
+          (let [(mut waited) 0
+                (mut file) (open output-bytes (: 0 i32))]
+            (while (and (< (load file) (: 0 i32)) (< (load waited) 3000))
+              (usleep (: 10000 u32))
+              (set! waited (+ (load waited) 1))
+              (set! file (open output-bytes (: 0 i32))))
+            (assert (>= (load file) (: 0 i32)))
+            (read (load file) result-bytes (: 255 isize))
+            (close (load file))
+            (assert (= (strcmp result-bytes value) (: 0 i32)))))
+        (assert (= (transport/session-kill socket) (: 0 i32)))
+        (close fd)
+        0)
+      (remove! dir))))
+
+(deftest adopting-a-daemon-that-is-gone-reports-enoent
+  (let [(mut paths) (zeroed Paths)]
+    (paths! (mut paths) c"AAAAAAAA-0000-4000-8000-000000000002")
+    (let [dir (p/cast (ptr i8) (mut (.dir paths)))
+          socket (p/cast (ptr i8) (mut (.socket paths)))
+          (mut upstream) (zeroed (array i8 128))
+          upstream-bytes (p/cast (ptr i8) (mut upstream))]
+      (snprintf upstream-bytes (: 128 u64) c"%s/7.sock" dir)
+      (assert (< (transport/session-adopt (p/cast (ptr i8)
+                                                  (mut (.executable paths)))
+                                          socket
+                                          dir
+                                          (p/cast (ptr i8)
+                                                  (mut (.resources paths)))
+                                          upstream-bytes)
+                 (: 0 i32)))
+      (assert (= (os/errno) transport/ENOENT))
+      (assert (job-gone? (p/cast (ptr i8) (mut (.label paths)))))
+      (assert (no-leftovers? socket))
+      (remove! dir))))
+
+(deftest a-job-an-interrupted-launch-left-behind-does-not-block-the-next
+  (let [(mut paths) (zeroed Paths)]
+    (paths! (mut paths) c"AAAAAAAA-0000-4000-8000-000000000003")
+    (let [dir (p/cast (ptr i8) (mut (.dir paths)))
+          socket (p/cast (ptr i8) (mut (.socket paths)))
+          label (p/cast (ptr i8) (mut (.label paths)))
+          (mut stale) (zeroed (array i8 256))
+          (mut domain) (zeroed (array i8 32))
+          stale-bytes (p/cast (ptr i8) (mut stale))
+          domain-bytes (p/cast (ptr i8) (mut domain))]
+      (snprintf stale-bytes (: 256 u64) c"%s/stale.plist" dir)
+      (snprintf domain-bytes (: 32 u64) c"gui/%u" (getuid))
+      (assert (transport/write-plist! stale-bytes
+                                      label
+                                      c"/usr/bin/true"
+                                      c"unused"))
+      (assert (= (transport/launchctl! c"bootstrap" domain-bytes stale-bytes)
+                 (: 0 i32)))
+      (assert (not (job-gone? label)))
+      (let [fd
+              (transport/session-open (p/cast (ptr i8)
+                                              (mut (.executable paths)))
+                                      socket
+                                      dir
+                                      (p/cast (ptr i8) (mut (.resources paths))))]
+        (assert (>= fd (: 0 i32)))
+        (assert (job-gone? label))
+        (assert (= (transport/session-kill socket) (: 0 i32)))
+        (close fd)
+        0)
+      (remove! dir))))
+
+(deftest a-service-launchd-cannot-start-fails-without-trying-another-way
+  (let [(mut paths) (zeroed Paths)]
+    (paths! (mut paths) c"AAAAAAAA-0000-4000-8000-000000000004")
+    (let [dir (p/cast (ptr i8) (mut (.dir paths)))
+          socket (p/cast (ptr i8) (mut (.socket paths)))]
+      (assert (< (transport/session-open c"/nonexistent/jim-session"
+                                         socket
+                                         dir
+                                         (p/cast (ptr i8)
+                                                 (mut (.resources paths))))
+                 (: 0 i32)))
+      (assert (job-gone? (p/cast (ptr i8) (mut (.label paths)))))
+      (assert (no-leftovers? socket))
+      (remove! dir))))

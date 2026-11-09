@@ -1,0 +1,822 @@
+(module jim.widget-kit.wall)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.os" :as os)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.diff" :as d)
+(import "jim.widget-kit.json" :as json)
+
+;;; The diff wall's logic, apart from any window: what to diff, which files to
+;;; keep, how a diff divides into tiles, and where the tiles go. Port of original
+;;; Jim's `jimctl git diff-wall`.
+(const WORKING 0)
+
+(const STAGED 1)
+
+(const UNSTAGED 2)
+
+(const RANGE 3)
+
+(const PR 4)
+
+(const DEFAULT-MAX 150)
+
+;;; ---- globs -------------------------------------------------------------------
+
+;;; The index just past the bracket set opening at P[AT], or -1 if it never closes.
+(defn set-end [(pat (slice u8)) (at i64)] (-> i64)
+  (let [start (+ at 1)
+        first
+          (if (and (< start (len pat)) (= (get pat start) (: 33 u8)))
+              (+ start 1)
+              start)
+        (mut i) (+ first 1)
+        (mut end) -1]
+    (while (and (< (load end) 0) (< (load i) (len pat)))
+      (when (= (get pat (load i)) (: 93 u8)) (set! end (+ (load i) 1)))
+      (set! i (+ (load i) 1)))
+    (load end)))
+
+;;; Whether byte C is in the set PAT[AT..END), which includes its brackets.
+(defn in-set? [(pat (slice u8)) (at i64) (end i64) (c u8)] (-> bool)
+  (let [negated (= (get pat (+ at 1)) (: 33 u8))
+        last (- end 1)
+        (mut i) (if negated (+ at 2) (+ at 1))
+        (mut found) false]
+    (while (< (load i) last)
+      (let [low (get pat (load i))]
+        (if (and (< (+ (load i) 2) last)
+                 (= (get pat (+ (load i) 1)) (: 45 u8)))
+            (do
+              (when (and (>= c low) (<= c (get pat (+ (load i) 2))))
+                (set! found true))
+              (set! i (+ (load i) 3)))
+            (do
+              (when (= c low) (set! found true))
+              (set! i (+ (load i) 1))))))
+    (if negated (not (load found)) (load found))))
+
+(const SLASH (: 47 u8))
+
+;;; Shell-style match: `*` and `?` stop at '/', `**/` spans directories, a final
+;;; `**` takes the rest, and `[a-z]`/`[!a-z]` take one byte.
+(defn glob-match? [(pat (slice u8)) (s (slice u8))] (-> bool)
+  (cond (= (len pat) 0) (= (len s) 0)
+        (text/starts-with? pat "**/")
+          (let [rest (text/from pat 3)
+                (mut found) (glob-match? rest s)]
+            (for [i 0 (len s)]
+              (when (and (not (load found))
+                         (= (get s i) SLASH)
+                         (glob-match? rest (text/from s (+ i 1))))
+                (set! found true)))
+            (load found))
+        (= pat "**") true
+        (= (get pat 0) (: 42 u8))
+          (let [rest (text/from pat 1)
+                (mut found) false
+                (mut i) 0
+                (mut open) true]
+            (while (and (load open) (not (load found)))
+              (when (glob-match? rest (text/from s (load i))) (set! found true))
+              (if (or (>= (load i) (len s)) (= (get s (load i)) SLASH))
+                  (set! open false)
+                  (set! i (+ (load i) 1))))
+            (load found))
+        (= (len s) 0) false
+        (= (get pat 0) (: 63 u8))
+          (and (!= (get s 0) SLASH)
+               (glob-match? (text/from pat 1) (text/from s 1)))
+        (and (= (get pat 0) (: 91 u8)) (>= (set-end pat 0) 0))
+          (let [end (set-end pat 0)]
+            (and (!= (get s 0) SLASH)
+                 (in-set? pat 0 end (get s 0))
+                 (glob-match? (text/from pat end) (text/from s 1))))
+        :else
+          (and (= (get pat 0) (get s 0))
+               (glob-match? (text/from pat 1) (text/from s 1)))))
+
+;;; Whether any pattern matches PATH or a directory above it.
+(defn any-match? [(patterns (ptr (ArrayList (ArrayList u8)))) (path (slice u8))]
+  (-> bool)
+  (let [(mut found) false]
+    (for [k 0 (len (load patterns))]
+      (let [pat (slice (get (load patterns) k))]
+        (when (glob-match? pat path) (set! found true))
+        (for [i 0 (len path)]
+          (when (and (= (get path i) SLASH)
+                     (glob-match? pat (subslice path 0 i)))
+            (set! found true)))))
+    (load found)))
+
+;;; ---- the wall's spec ---------------------------------------------------------
+
+;;; `[repo=PATH] [working|staged|unstaged|range BASE [HEAD]|pr N] [per=file|hunk]
+;;; [path=GLOB]… [exclude=GLOB]… [max=N]`. Globs are relative to the repository.
+;;; Exclusions win.
+(defstruct Spec
+  [(repo (ArrayList u8))
+   (source i64)
+   (base (ArrayList u8))
+   (head (ArrayList u8))
+   (pr (ArrayList u8))
+   (per-hunk bool)
+   (max i64)
+   (include (ArrayList (ArrayList u8)))
+   (exclude (ArrayList (ArrayList u8)))
+   ;; Why the text could not be understood, or empty.
+   (problem (ArrayList u8))])
+
+(defn say! [(s (ptr Spec)) (a (slice u8)) (b (slice u8)) (c (slice u8))]
+  (-> void)
+  (when (= (len (.problem s)) 0)
+    (text/push-str! (mut (.problem s)) a)
+    (text/push-str! (mut (.problem s)) b)
+    (text/push-str! (mut (.problem s)) c)
+    0)
+  (do))
+
+;;; The words of S, split on spaces.
+(defn words! [(s (slice u8)) (out (ptr (ArrayList (slice u8))))] (-> void)
+  (let [(mut start) -1]
+    (for [i 0 (+ (len s) 1)]
+      (let [space
+              (or (= i (len s))
+                  (= (get s i) (: 32 u8))
+                  (= (get s i) (: 10 u8))
+                  (= (get s i) (: 9 u8)))]
+        (cond (and space (>= (load start) 0))
+                (do
+                  (push! (mut out) (subslice s (load start) i))
+                  (set! start -1))
+              (and (not space) (< (load start) 0)) (set! start i)
+              :else 0)))
+    (do)))
+
+(defn glob-valid? [(pat (slice u8))] (-> bool)
+  (let [(mut ok) true]
+    (for [i 0 (len pat)]
+      (when (and (= (get pat i) (: 91 u8)) (< (set-end pat i) 0))
+        (set! ok false)))
+    (load ok)))
+
+(defn push-glob! [(s (ptr Spec))
+                  (out (ptr (ArrayList (ArrayList u8))))
+                  (word (slice u8))
+                  (value (slice u8))] (-> void)
+  (let [without-dot
+          (if (text/starts-with? value "./") (text/from value 2) value)
+        (mut end) (len without-dot)]
+    (while (and (> (load end) 0) (= (get without-dot (- (load end) 1)) SLASH))
+      (set! end (- (load end) 1)))
+    (let [pat (subslice without-dot 0 (load end))]
+      (if (and (> (len pat) 0) (glob-valid? pat))
+          (do (push! (mut out) (text/owned pat)) (do))
+          (say! s "bad glob in '" word "'")))))
+
+(defn spec-new [] (-> Spec)
+  (let [a (alloc/malloc-allocator)]
+    (Spec
+      :repo (ArrayList::new [u8] a)
+      :source WORKING
+      :base (ArrayList::new [u8] a)
+      :head (ArrayList::new [u8] a)
+      :pr (ArrayList::new [u8] a)
+      :per-hunk false
+      :max DEFAULT-MAX
+      :include (ArrayList::new [(ArrayList u8)] a)
+      :exclude (ArrayList::new [(ArrayList u8)] a)
+      :problem (ArrayList::new [u8] a))))
+
+(defn free-globs! [(g (ptr (ArrayList (ArrayList u8))))] (-> void)
+  (for [i 0 (len (load g))] (free! (elem g i)))
+  (free! (mut g))
+  (do))
+
+(defn spec-free! [(s (ptr Spec))] (-> void)
+  (free! (mut (.repo s)))
+  (free! (mut (.base s)))
+  (free! (mut (.head s)))
+  (free! (mut (.pr s)))
+  (free-globs! (mut (.include s)))
+  (free-globs! (mut (.exclude s)))
+  (free! (mut (.problem s)))
+  (do))
+
+(defn parse-spec [(input (slice u8))] (-> Spec)
+  (let [(mut s) (spec-new)
+        (mut ws) (ArrayList::new [(slice u8)] (alloc/malloc-allocator))
+        (mut i) 0
+        (mut chosen) false]
+    (words! input (mut ws))
+    (while (< (load i) (len ws))
+      (let [w (get ws (load i))
+            next (if (< (+ (load i) 1) (len ws)) (get ws (+ (load i) 1)) "")
+            operand (and (> (len next) 0) (not (text/contains? next "=")))]
+        (set! i (+ (load i) 1))
+        (cond (text/starts-with? w "repo=")
+                (text/set-str! (mut (.repo s)) (text/from w 5))
+              (text/starts-with? w "path=")
+                (push-glob! (mut s) (mut (.include s)) w (text/from w 5))
+              (text/starts-with? w "exclude=")
+                (push-glob! (mut s) (mut (.exclude s)) w (text/from w 8))
+              (= w "per=hunk") (set! (.per-hunk s) true)
+              (= w "per=file") (set! (.per-hunk s) false)
+              (text/starts-with? w "max=")
+                (let [n (text/parse-i64 (text/from w 4) -1)]
+                  (if (> n 0)
+                      (set! (.max s) n)
+                      (say! (mut s) "bad number in '" w "'")))
+              (load chosen) (say! (mut s) "don't understand '" w "'")
+              (= w "working") (do (set! (.source s) WORKING) (set! chosen true))
+              (= w "staged") (do (set! (.source s) STAGED) (set! chosen true))
+              (= w "unstaged")
+                (do (set! (.source s) UNSTAGED) (set! chosen true))
+              (= w "range")
+                (do
+                  (set! (.source s) RANGE)
+                  (set! chosen true)
+                  (if operand
+                      (do
+                        (text/set-str! (mut (.base s)) next)
+                        (set! i (+ (load i) 1))
+                        (let [head
+                                (if (< (load i) (len ws)) (get ws (load i)) "")]
+                          (if (and (> (len head) 0)
+                                   (not (text/contains? head "=")))
+                              (do
+                                (text/set-str! (mut (.head s)) head)
+                                (set! i (+ (load i) 1)))
+                              (text/set-str! (mut (.head s)) "HEAD"))))
+                      (say! (mut s)
+                            "range needs a base, as in 'range main'"
+                            ""
+                            "")))
+              (= w "pr")
+                (do
+                  (set! (.source s) PR)
+                  (set! chosen true)
+                  (if operand
+                      (do
+                        (text/set-str! (mut (.pr s)) next)
+                        (set! i (+ (load i) 1)))
+                      (say! (mut s) "pr needs a number, as in 'pr 123'" "" "")))
+              :else (say! (mut s) "don't understand '" w "'"))))
+    (free! (mut ws))
+    (load s)))
+
+;;; Whether SPEC keeps file PATH.
+(defn selected? [(s (ptr Spec)) (path (slice u8))] (-> bool)
+  (and (or (= (len (.include s)) 0) (any-match? (mut (.include s)) path))
+       (not (any-match? (mut (.exclude s)) path))))
+
+;;; What a review comment on this wall is against, as `jimctl review` records it.
+(defn push-base-ref! [(s (ptr Spec)) (out (ptr (ArrayList u8)))] (-> void)
+  (cond (= (.source s) RANGE)
+          (do
+            (text/push-str! out "range ")
+            (text/push-str! out (slice (.base s)))
+            (text/push-str! out " ")
+            (text/push-str! out (slice (.head s))))
+        (= (.source s) PR)
+          (do (text/push-str! out "pr ") (text/push-str! out (slice (.pr s))))
+        (= (.source s) STAGED) (text/push-str! out "staged")
+        (= (.source s) UNSTAGED) (text/push-str! out "unstaged")
+        :else (text/push-str! out "working")))
+
+;;; A short name for the wall: its project's name and its pane's title.
+(defn push-name! [(s (ptr Spec)) (repo (slice u8)) (out (ptr (ArrayList u8)))]
+  (-> void)
+  (text/push-str! out "diff ")
+  (cond (= (.source s) RANGE)
+          (do
+            (text/push-str! out (slice (.base s)))
+            (text/push-str! out "..")
+            (text/push-str! out (slice (.head s))))
+        (= (.source s) PR)
+          (do
+            (text/push-str! out (text/basename repo))
+            (text/push-str! out " PR ")
+            (text/push-str! out (slice (.pr s))))
+        (= (.source s) STAGED)
+          (do
+            (text/push-str! out (text/basename repo))
+            (text/push-str! out " staged"))
+        (= (.source s) UNSTAGED)
+          (do
+            (text/push-str! out (text/basename repo))
+            (text/push-str! out " unstaged"))
+        :else (text/push-str! out (text/basename repo))))
+
+;;; Whether this source can have untracked files, which `git diff` leaves out.
+(defn wants-untracked? [(s (ptr Spec))] (-> bool)
+  (or (= (.source s) WORKING) (= (.source s) UNSTAGED)))
+
+;;; Whether this source follows the working tree, as a pull request does not.
+(defn local? [(s (ptr Spec))] (-> bool)
+  (!= (.source s) PR))
+
+;;; The command that prints this wall's diff, in the repository's top directory.
+;;; Whitespace-only changes are left out, as original Jim's review panes do.
+(defn diff-argv! [(s (ptr Spec)) (out (ptr (ArrayList (slice u8))))] (-> void)
+  (clear! (mut out))
+  (if (= (.source s) PR)
+      (do
+        (push! (mut out) "gh")
+        (push! (mut out) "pr")
+        (push! (mut out) "diff")
+        (push! (mut out) (slice (.pr s)))
+        (do))
+      (do
+        (push! (mut out) "git")
+        (push! (mut out) "-c")
+        (push! (mut out) "core.quotepath=off")
+        (push! (mut out) "diff")
+        (push! (mut out) "--no-color")
+        (push! (mut out) "--no-ext-diff")
+        (push! (mut out) "--ignore-all-space")
+        (cond (= (.source s) STAGED) (do (push! (mut out) "--cached") 0)
+              (= (.source s) RANGE)
+                (do
+                  (push! (mut out) (slice (.base s)))
+                  (push! (mut out) (slice (.head s)))
+                  0)
+              (= (.source s) WORKING) (do (push! (mut out) "HEAD") 0)
+              :else 0)
+        (do))))
+
+;;; ---- dividing a diff into tiles -----------------------------------------------
+(defstruct Tile
+  [(key (ArrayList u8))
+   (title (ArrayList u8))
+   (patch (ArrayList u8))
+   ;; Display rows, and the widest line in characters.
+   (rows i64)
+   (cols i64)
+   (adds i64)
+   (dels i64)])
+
+(defn tile-free! [(t (ptr Tile))] (-> void)
+  (free! (mut (.key t)))
+  (free! (mut (.title t)))
+  (free! (mut (.patch t)))
+  (do))
+
+(defn tiles-clear! [(tiles (ptr (ArrayList Tile)))] (-> void)
+  (for [i 0 (len (load tiles))] (tile-free! (elem tiles i)))
+  (clear! (mut tiles))
+  (do))
+
+;;; Characters a line of diff shows, its leading sign aside. Tabs count as 4.
+(defn display-width [(line (slice u8))] (-> i64)
+  (let [(mut n) 0]
+    (for [i 1 (len line)]
+      (let [b (p/cast i64 (get line i))]
+        (cond (= b 9) (set! n (+ (load n) 4))
+              (!= (& b 192) 128) (set! n (+ (load n) 1))
+              :else 0)))
+    (load n)))
+
+;;; The file a section of a diff is about, from its header lines.
+(defn section-path [(raw (slice u8)) (lines (slice text/Span))] (-> (slice u8))
+  (let [(mut new) ""
+        (mut old) ""
+        (mut renamed) ""]
+    (for [i 0 (len lines)]
+      (let [l (text/span-text raw (get lines i))]
+        (cond (text/starts-with? l "+++ ")
+                (set! new (d/strip-prefix (text/from l 4)))
+              (text/starts-with? l "--- ")
+                (set! old (d/strip-prefix (text/from l 4)))
+              (text/starts-with? l "rename to ")
+                (set! renamed (text/trim (text/from l 10)))
+              :else 0)))
+    (cond (and (> (len (load new)) 0) (!= (load new) "/dev/null")) (load new)
+          (> (len (load renamed)) 0) (load renamed)
+          (and (> (len (load old)) 0) (!= (load old) "/dev/null")) (load old)
+          :else
+            (let [first (text/span-text raw (get lines 0))
+                  rest (text/from first 11)
+                  b (text/index-of rest " b/")]
+              (if (>= b 0) (d/strip-prefix (text/from rest (+ b 1))) rest)))))
+
+;;; The line a hunk is about: its first change, on the new side.
+(defn hunk-line [(raw (slice u8)) (lines (slice text/Span))] (-> i64)
+  (let [(mut line) (.b (d/hunk-starts (text/span-text raw (get lines 0))))
+        (mut looking) true]
+    (for [i 1 (len lines)]
+      (when (load looking)
+        (let [l (text/span-text raw (get lines i))]
+          (if (and (> (len l) 0)
+                   (or (= (get l 0) (: 43 u8)) (= (get l 0) (: 45 u8))))
+              (set! looking false)
+              (when (not (text/starts-with? l "\\"))
+                (set! line (+ (load line) 1)))))))
+    (load line)))
+
+;;; Bytes of RAW from the start of line A of SPANS up to the start of line B, or
+;;; to the end of RAW.
+(defn lines-text [(raw (slice u8)) (spans (slice text/Span)) (a i64) (b i64)]
+  (-> (slice u8))
+  (subslice raw
+            (.at (get spans a))
+            (if (< b (len spans)) (.at (get spans b)) (len raw))))
+
+;;; A tile for one file's HEADER and the hunks on lines [FIRST, END) of SPANS.
+(defn tile-of [(raw (slice u8))
+               (spans (slice text/Span))
+               (header (slice u8))
+               (first i64)
+               (end i64)
+               (key (slice u8))
+               (title (slice u8))] (-> Tile)
+  (let [(mut patch) (text/owned header)
+        (mut rows) 0
+        (mut cols) 0
+        (mut adds) 0
+        (mut dels) 0]
+    (when (< first end)
+      (text/push-str! (mut patch) (lines-text raw spans first end))
+      0)
+    (for [i first end]
+      (let [l (text/span-text raw (get spans i))]
+        (when (not (text/starts-with? l "\\"))
+          (set! rows (+ (load rows) 1))
+          (when (> (display-width l) (load cols))
+            (set! cols (display-width l)))
+          (cond (text/starts-with? l "@@") 0
+                (text/starts-with? l "+") (set! adds (+ (load adds) 1))
+                (text/starts-with? l "-") (set! dels (+ (load dels) 1))
+                :else 0))))
+    (Tile
+      :key (text/owned key)
+      :title (text/owned title)
+      :patch (load patch)
+      :rows (if (< (load rows) 1) 1 (load rows))
+      :cols (load cols)
+      :adds (load adds)
+      :dels (load dels))))
+
+;;; Whether a section with no hunks still says something: a binary change, a
+;;; rename, or an empty file coming or going. A bare mode change does not.
+(defn says-something? [(raw (slice u8)) (lines (slice text/Span))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len lines)]
+      (let [l (text/span-text raw (get lines i))]
+        (when (or (text/starts-with? l "Binary files")
+                  (text/starts-with? l "rename from")
+                  (text/starts-with? l "copy from")
+                  (text/starts-with? l "new file")
+                  (text/starts-with? l "deleted file"))
+          (set! found true))))
+    (load found)))
+
+;;; The tiles of one file: lines [START, END) of SPANS.
+(defn section! [(raw (slice u8))
+                (spans (slice text/Span))
+                (start i64)
+                (end i64)
+                (spec (ptr Spec))
+                (out (ptr (ArrayList Tile)))
+                (filtered (ptr i64))] (-> void)
+  (let [(mut first-hunk) start]
+    (while (and (< (load first-hunk) end)
+                (not (text/starts-with? (text/span-text raw
+                                                        (get spans
+                                                             (load first-hunk)))
+                                        "@@")))
+      (set! first-hunk (+ (load first-hunk) 1)))
+    (let [head-lines (subslice spans start (load first-hunk))
+          path (section-path raw head-lines)
+          header (lines-text raw spans start (load first-hunk))]
+      (cond (not (selected? spec path)) (set! filtered (+ (load filtered) 1))
+            (and (= (load first-hunk) end)
+                 (not (says-something? raw head-lines)))
+              0
+            (.per-hunk spec)
+              (let [(mut at) (load first-hunk)
+                    (mut number) 0
+                    (mut key) (ArrayList::new [u8] (alloc/malloc-allocator))
+                    (mut title) (ArrayList::new [u8] (alloc/malloc-allocator))]
+                (when (= (load at) end)
+                  (push! (mut out)
+                         (tile-of raw spans header end end path path))
+                  0)
+                (while (< (load at) end)
+                  (let [(mut next) (+ (load at) 1)]
+                    (while (and (< (load next) end)
+                                (not (text/starts-with? (text/span-text raw
+                                                                        (get spans
+                                                                             (load next)))
+                                                        "@@")))
+                      (set! next (+ (load next) 1)))
+                    (text/set-str! (mut key) path)
+                    (text/push-str! (mut key) "#")
+                    (text/push-i64! (mut key) (load number))
+                    (text/set-str! (mut title) path)
+                    (text/push-str! (mut title) ":")
+                    (text/push-i64! (mut title)
+                                    (hunk-line raw
+                                               (subslice spans
+                                                         (load at)
+                                                         (load next))))
+                    (push! (mut out)
+                           (tile-of raw
+                                    spans
+                                    header
+                                    (load at)
+                                    (load next)
+                                    (slice key)
+                                    (slice title)))
+                    (set! number (+ (load number) 1))
+                    (set! at (load next))))
+                (free! (mut key))
+                (free! (mut title))
+                0)
+            :else
+              (do
+                (push! (mut out)
+                       (tile-of raw
+                                spans
+                                header
+                                (load first-hunk)
+                                end
+                                path
+                                path))
+                0)))
+    (do)))
+
+;;; RAW, the output of `git diff` or `gh pr diff`, as tiles in diff order, keeping
+;;; what SPEC selects. FILTERED counts the files it left out.
+(defn split! [(raw (slice u8))
+              (spec (ptr Spec))
+              (out (ptr (ArrayList Tile)))
+              (filtered (ptr i64))] (-> void)
+  (let [(mut spans) (ArrayList::new [text/Span] (alloc/malloc-allocator))
+        (mut start) -1]
+    (text/lines! raw (mut spans))
+    (for [i 0 (+ (len spans) 1)]
+      (when (or (= i (len spans))
+                (text/starts-with? (text/span-text raw (get spans i))
+                                   "diff --git "))
+        (when (>= (load start) 0)
+          (section! raw (slice spans) (load start) i spec out filtered)
+          0)
+        (set! start i)
+        0))
+    (free! (mut spans))
+    (do)))
+
+;;; A diff adding the untracked file PATH with CONTENT.
+(defn push-new-file! [(out (ptr (ArrayList u8)))
+                      (path (slice u8))
+                      (content (slice u8))] (-> void)
+  (let [(mut binary) false
+        (mut count) 0
+        scan (if (> (len content) 8000) 8000 (len content))]
+    (for [i 0 scan]
+      (when (= (get content i) (: 0 u8)) (set! binary true)))
+    (for [i 0 (len content)]
+      (when (= (get content i) (: 10 u8)) (set! count (+ (load count) 1))))
+    (when (and (> (len content) 0)
+               (!= (get content (- (len content) 1)) (: 10 u8)))
+      (set! count (+ (load count) 1))
+      0)
+    (text/push-str! out "diff --git a/")
+    (text/push-str! out path)
+    (text/push-str! out " b/")
+    (text/push-str! out path)
+    (text/push-str! out "\nnew file mode 100644\n")
+    (cond (load binary)
+            (do
+              (text/push-str! out "Binary files /dev/null and b/")
+              (text/push-str! out path)
+              (text/push-str! out " differ\n"))
+          (= (len content) 0) (do)
+          :else
+            (let [(mut spans)
+                    (ArrayList::new [text/Span]
+                                    (alloc/malloc-allocator))]
+              (text/push-str! out "--- /dev/null\n+++ b/")
+              (text/push-str! out path)
+              (text/push-str! out "\n@@ -0,0 +1,")
+              (text/push-i64! out (load count))
+              (text/push-str! out " @@\n")
+              (text/lines! content (mut spans))
+              (for [i 0 (len spans)]
+                (text/push-str! out "+")
+                (text/push-str! out (text/span-text content (get spans i)))
+                (text/push-str! out "\n"))
+              (free! (mut spans))
+              (do)))))
+
+;;; ---- layout -------------------------------------------------------------------
+(const GAP 24.0)
+
+(const ORIGIN 40.0)
+
+;;; Width to height of the whole wall, roughly a laptop screen.
+(const ASPECT 1.6)
+
+;;; A tile's pane: header, padding and file line around its rows of 20.
+(const TILE-CHROME 74.0)
+
+(const ROW-H 20.0)
+
+(const MIN-TILE-H 180.0)
+
+(const MAX-TILE-H 900.0)
+
+;;; The control pane's height: fixed part, then an index row per tile.
+(const CONTROL-CHROME 150.0)
+
+(const INDEX-ROW-H 24.0)
+
+(const MAX-CONTROL-H 460.0)
+
+(defstruct Box [(x f64) (y f64) (w f64) (h f64)])
+
+(defn clamp [(v f64) (low f64) (high f64)] (-> f64)
+  (cond (< v low) low
+        (> v high) high
+        :else v))
+
+(defn tile-height [(rows i64)] (-> f64)
+  (clamp (+ TILE-CHROME (* ROW-H (p/cast f64 rows))) MIN-TILE-H MAX-TILE-H))
+
+;;; One width for every tile, from the widest line: a mono character of the diff's
+;;; font and the line number gutter.
+(defn column-width [(widest i64)] (-> f64)
+  (clamp (+ 140.0 (* 7.5 (p/cast f64 widest))) 560.0 1000.0))
+
+(defn control-height [(tiles i64)] (-> f64)
+  (clamp (+ CONTROL-CHROME (* INDEX-ROW-H (p/cast f64 tiles)))
+         200.0
+         MAX-CONTROL-H))
+
+(defn sqrt [(x f64)] (-> f64)
+  (let [(mut g) (if (> x 1.0) x 1.0)]
+    (for [i 0 40] (set! g (* 0.5 (+ (load g) (/ x (load g))))))
+    (load g)))
+
+;;; Columns for a wall that stacks to STACKED points of height: as many as make
+;;; it about ASPECT wide, at least one and at most one per tile.
+(defn column-count [(stacked f64) (width f64) (tiles i64)] (-> i64)
+  (let [n (p/cast i64 (+ 0.5 (sqrt (/ (* ASPECT stacked) (+ width GAP)))))]
+    (cond (< n 1) 1
+          (and (> tiles 0) (> n tiles)) tiles
+          :else n)))
+
+;;; The wall so far: each column's next free y, the control pane on top of the
+;;; first. Tiles drop into the shortest column.
+(defstruct Wall [(width f64) (ys (ArrayList f64))])
+
+(defn wall-new [(width f64) (columns i64) (control-h f64)] (-> Wall)
+  (let [(mut ys) (ArrayList::new [f64] (alloc/malloc-allocator))]
+    (for [i 0 columns]
+      (push! (mut ys) (if (= i 0) (+ ORIGIN control-h GAP) ORIGIN)))
+    (Wall :width width :ys (load ys))))
+
+(defn wall-free! [(w (ptr Wall))] (-> void)
+  (free! (mut (.ys w)))
+  (do))
+
+;;; Reserve BOX in the column it sits in, so tiles added later avoid it.
+(defn wall-note! [(w (ptr Wall)) (b Box)] (-> void)
+  (let [i (p/cast i64 (+ 0.5 (/ (- (.x b) ORIGIN) (+ (.width w) GAP))))]
+    (when (and (>= i 0) (< i (len (.ys w))))
+      (let [bottom (+ (.y b) (.h b) GAP)]
+        (when (> bottom (get (.ys w) i)) (set! (mut (.ys w)) i bottom) 0))
+      0)
+    (do)))
+
+(defn place! [(w (ptr Wall)) (height f64)] (-> Box)
+  (let [(mut best) 0]
+    (for [i 1 (len (.ys w))]
+      (when (< (get (.ys w) i) (get (.ys w) (load best))) (set! best i)))
+    (let [y (get (.ys w) (load best))]
+      (set! (mut (.ys w)) (load best) (+ y height GAP))
+      (Box
+        :x (+ ORIGIN (* (p/cast f64 (load best)) (+ (.width w) GAP)))
+        :y y
+        :w (.width w)
+        :h height))))
+
+;;; ---- where a wall keeps its tiles' diffs ---------------------------------------
+
+;;; The wall's directory under the user's temporary directory. Tiles read their
+;;; diff from here, and the wall writes it again whenever it is gone.
+(defn push-dir! [(out (ptr (ArrayList u8))) (id i64)] (-> void)
+  (let [tmp (os/getenv c"TMPDIR")]
+    (if (= (p/cast i64 tmp) 0)
+        (text/push-str! out "/tmp/")
+        (let [c (p/cast (ptr u8) tmp)
+              (mut n) 0]
+          (while (!= (load (index c (load n))) (: 0 u8))
+            (set! n (+ (load n) 1)))
+          (text/push-str! out (slice::new c (load n)))
+          (when (not (text/ends-with? (slice::new c (load n)) "/"))
+            (text/push-str! out "/")
+            0)
+          (do)))
+    (text/push-str! out "jim-diff-wall/")
+    (text/push-i64! out id)))
+
+(defn push-patch-path! [(out (ptr (ArrayList u8))) (id i64) (slot i64)]
+  (-> void)
+  (push-dir! out id)
+  (text/push-str! out "/")
+  (text/push-i64! out slot)
+  (text/push-str! out ".diff"))
+
+(defn push-reviews-path! [(out (ptr (ArrayList u8))) (id i64)] (-> void)
+  (push-dir! out id)
+  (text/push-str! out "/reviews.json"))
+
+;;; The widget spec of tile SLOT of wall ID: `diff tile ID SLOT file|hunk BASE-REF`.
+(defn push-tile-spec! [(out (ptr (ArrayList u8)))
+                       (id i64)
+                       (slot i64)
+                       (per-hunk bool)
+                       (spec (ptr Spec))] (-> void)
+  (text/push-str! out "diff tile ")
+  (text/push-i64! out id)
+  (text/push-str! out " ")
+  (text/push-i64! out slot)
+  (text/push-str! out (if per-hunk " hunk " " file "))
+  (push-base-ref! spec out))
+
+;;; The topic the wall tells its tiles about changes on. The payload is the wall's
+;;; ID, then the slots whose diff changed, and "reviews" if the threads did.
+(defn changed-topic [] (-> (slice u8))
+  "diffwall.changed")
+
+;;; Whether a notice is for wall ID and names WORD (a slot number or "reviews").
+(defn notice-names? [(payload (slice u8)) (id i64) (word (slice u8))] (-> bool)
+  (let [(mut ws) (ArrayList::new [(slice u8)] (alloc/malloc-allocator))
+        (mut found) false]
+    (words! payload (mut ws))
+    (when (and (> (len ws) 0) (= (text/parse-i64 (get ws 0) -1) id))
+      (for [i 1 (len ws)]
+        (when (= (get ws i) word) (set! found true)))
+      0)
+    (free! (mut ws))
+    (load found)))
+
+;;; ---- review comments -----------------------------------------------------------
+
+;;; The open threads of a `jimctl review list` reply as text to paste to whoever
+;;; will act on them. Empty when there are none. COUNT gets the number of threads.
+(defn push-comments! [(reply (slice u8))
+                      (repo (slice u8))
+                      (out (ptr (ArrayList u8)))
+                      (count (ptr i64))] (-> void)
+  (let [(mut r) (json/parse reply)]
+    (set! count 0)
+    (when (json/ok? (mut r))
+      (let [threads (json/get (mut r) (json/root (mut r)) "threads")
+            (mut body) (ArrayList::new [u8] (alloc/malloc-allocator))
+            (mut status) (ArrayList::new [u8] (alloc/malloc-allocator))]
+        (for [k 0 (json/count (mut r) threads)]
+          (let [t (json/nth (mut r) threads k)]
+            (clear! (mut status))
+            (json/field-into! (mut r) t "status" (mut status) "open")
+            (when (= (slice status) "open")
+              (set! count (+ (load count) 1))
+              (when (> (len body) 0) (text/push-str! (mut body) "\n\n") 0)
+              (json/field-into! (mut r) t "file" (mut body) "")
+              (text/push-str! (mut body) ":")
+              (text/push-i64! (mut body) (json/field-i64 (mut r) t "line" 0))
+              (text/push-str! (mut body) " (thread #")
+              (text/push-i64! (mut body) (json/field-i64 (mut r) t "id" 0))
+              (text/push-str! (mut body) ")")
+              (let [before (len body)]
+                (text/push-str! (mut body) "\nCode: ")
+                (let [marked (len body)]
+                  (json/field-into! (mut r) t "context_line" (mut body) "")
+                  (when (= (len body) marked) (set! (.len body) before) 0)))
+              (text/push-str! (mut body) "\n")
+              (json/field-into! (mut r) t "author" (mut body) "user")
+              (text/push-str! (mut body) ": ")
+              (json/field-into! (mut r) t "body" (mut body) "")
+              (let [replies (json/get (mut r) t "replies")]
+                (for [j 0 (json/count (mut r) replies)]
+                  (let [reply-at (json/nth (mut r) replies j)]
+                    (text/push-str! (mut body) "\n")
+                    (json/field-into! (mut r) reply-at "author" (mut body) "")
+                    (text/push-str! (mut body) ": ")
+                    (json/field-into! (mut r) reply-at "body" (mut body) ""))))
+              0)))
+        (when (> (len body) 0)
+          (text/push-str! out "Review comments for ")
+          (text/push-str! out repo)
+          (text/push-str! out ":\n\n")
+          (text/push-str! out (slice body))
+          0)
+        (free! (mut body))
+        (free! (mut status))
+        0))
+    (json/free! (mut r))
+    (do)))

@@ -1372,6 +1372,10 @@
       0)
     (load found)))
 
+;;; Whether an element under PT, a point in W's view, reacts to clicks.
+(defn reacts-at? [(w (ptr WidgetPane)) (pt Point)] (-> bool)
+  (!= (hit w (Point :x (.x pt) :y (+ (.y pt) (.scroll w)))) api/NONE))
+
 (defn local [(self (ptr i8)) (event (ptr i8))] (-> Point)
   (let [w (pane-of self)
         pt
@@ -1891,6 +1895,11 @@
              (sel c"stringByAppendingString:")
              [(ptr i8)]
              (string args)))))
+
+;;; Whether this pane runs SPEC, "NAME ARGS…".
+(defn spec-is? [(w (ptr WidgetPane)) (spec (slice u8))] (-> bool)
+  (and (= (name w) (spec-name spec))
+       (= (slice (.args (.runtime w))) (spec-args spec))))
 
 ;;; The title the widget chose, or "" before it chose one.
 (defn title [(w (ptr WidgetPane))] (-> (slice u8))

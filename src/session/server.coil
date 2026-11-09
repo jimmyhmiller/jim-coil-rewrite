@@ -315,6 +315,12 @@
 
 (extern signal :cc (cc/C) [i32 (ptr i8)] (-> (ptr i8)))
 
+(extern execve :cc (cc/C) [(ptr i8) (ptr (ptr i8)) (ptr (ptr i8))] (-> i32))
+
+(extern malloc :cc (cc/C) [u64] (-> (ptr i8)))
+
+(extern snprintf :cc (cc/C) [(ptr i8) u64 (ptr i8) ...] (-> i32))
+
 (extern kill :cc (cc/C) [i32 i32] (-> i32))
 
 (extern strrchr :cc (cc/C) [(ptr i8) i32] (-> (ptr i8)))
@@ -1534,10 +1540,125 @@
           (execl shell shell c"-l" (p/cast (ptr i8) 0))
           (_exit 127)))))
 
+;;; The most a request may hold. Arguments and environment together cannot pass exec's
+;;; limit, 1 MiB on macOS.
+(const REQUEST-CAPACITY 4194304)
+
+(const O-RDONLY-CLOEXEC 16777216)
+
+;;; O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+(const O-REPLACE-CLOEXEC 16778753)
+
+(defn launch-failed! [(step (ptr i8))] (-> i64)
+  (transport/log! c"launcher-failed step=%s errno=%lld"
+                  (p/cast i64 step)
+                  (p/cast i64 (os/errno))
+                  0
+                  0)
+  1)
+
+;;; Report the launcher's wait status, as a rename so that it is never seen half written.
+(defn report-status! [(request (ptr i8)) (status i32)] (-> bool)
+  (let [(mut temporary-bytes) (zeroed (array i8 1300))
+        (mut final-bytes) (zeroed (array i8 1300))
+        temporary (p/cast (ptr i8) (mut temporary-bytes))
+        final (p/cast (ptr i8) (mut final-bytes))
+        (mut value) status]
+    (snprintf temporary (: 1300 u64) c"%s.status.new" request)
+    (snprintf final (: 1300 u64) c"%s.status" request)
+    (let [fd (open temporary O-REPLACE-CLOEXEC (: 384 i32))]
+      (and (>= fd (: 0 i32))
+           (let [wrote (write fd (p/cast (ptr i8) (mut value)) (: 4 isize))]
+             (close fd)
+             (= wrote (: 4 isize)))
+           (= (transport/rename-file temporary final) (: 0 i32))))))
+
+;;; launchd runs this in place of the launcher: see "starting a service through launchd"
+;;; in transport.coil. It runs the ordinary command line REQUEST holds, with the
+;;; environment REQUEST holds and none of launchd's.
+(defn launched [(request (ptr i8))] (-> i64)
+  (transport/log-open! request c"launcher")
+  (let [bytes (malloc (: 4194304 u64))
+        fd (open request O-RDONLY-CLOEXEC)]
+    (if (or (= (p/cast i64 bytes) 0) (< fd (: 0 i32)))
+        (launch-failed! c"open")
+        (let [(mut length) 0
+              (mut reading) true]
+          (while (and (load reading) (< (load length) REQUEST-CAPACITY))
+            (let [got
+                    (read fd
+                          (index bytes (load length))
+                          (p/cast isize (- REQUEST-CAPACITY (load length))))]
+              (if (> got (: 0 isize))
+                  (set! length (+ (load length) (p/cast i64 got)))
+                  (when (or (= got (: 0 isize)) (!= (os/errno) transport/EINTR))
+                    (set! reading false)))))
+          (close fd)
+          ; It holds the environment. It has no reason to outlive being read.
+          (unlink request)
+          (if (or (>= (load length) REQUEST-CAPACITY)
+                  (= (load length) 0)
+                  (!= (load (index bytes (- (load length) 1))) (: 0 i8)))
+              (launch-failed! c"read")
+              (let [(mut count) 0]
+                (for [i 0 (load length)]
+                  (when (= (load (index bytes i)) (: 0 i8))
+                    (set! count (+ (load count) 1))))
+                (let [strings
+                        (p/cast (ptr (ptr i8))
+                                (malloc (p/cast u64 (* (+ (load count) 1) 8))))]
+                  (if (= (p/cast i64 strings) 0)
+                      (launch-failed! c"allocate")
+                      (let [(mut at) 0
+                            (mut separator) -1]
+                        (for [i 0 (load count)]
+                          (let [string (index bytes (load at))]
+                            (set! (index strings i) string)
+                            (when (and (< (load separator) 0)
+                                       (= (load string) (: 0 i8)))
+                              (set! separator i))
+                            (set! at
+                                  (+ (load at) (p/cast i64 (strlen string)) 1))))
+                        (set! (index strings (load count)) (p/cast (ptr i8) 0))
+                        (if (< (load separator) 1)
+                            (launch-failed! c"parse")
+                            (let [pid
+                                    (do
+                                      (set! (index strings (load separator))
+                                            (p/cast (ptr i8) 0))
+                                      (fork))]
+                              (cond (< pid (: 0 i32)) (launch-failed! c"fork")
+                                    (= pid (: 0 i32))
+                                      (do
+                                        (execve (load (index strings 0))
+                                                strings
+                                                (index strings
+                                                       (+ (load separator) 1)))
+                                        (launch-failed! c"exec")
+                                        (_exit 127)
+                                        1)
+                                    :else
+                                      (let [(mut status) (zeroed i32)]
+                                        (while (and (< (waitpid pid
+                                                                (mut status)
+                                                                0)
+                                                       (: 0 i32))
+                                                    (= (os/errno)
+                                                       transport/EINTR))
+                                          0)
+                                        (if (report-status! request
+                                                            (load status))
+                                            0
+                                            (launch-failed! c"report")))))))))))))))
+
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (if (and (>= argc 3) (= (strcmp (load (index argv 1)) c"--adopt") (: 0 i32)))
-      (serve (- argc (: 2 i32)) (index argv 2) (load (index argv 2)))
-      (serve argc argv (p/cast (ptr i8) 0))))
+  (cond (and (= argc (: 3 i32))
+             (= (strcmp (load (index argv 1)) c"--launched") (: 0 i32)))
+          (launched (load (index argv 2)))
+        (and (>= argc 3)
+             (= (strcmp (load (index argv 1)) c"--adopt") (: 0 i32)))
+          (serve (- argc (: 2 i32)) (index argv 2) (load (index argv 2)))
+        :else (serve argc argv (p/cast (ptr i8) 0))))
 
 ;;; UPSTREAM, unless null, is the socket of the original Jim daemon to adopt. Its
 ;;; connection stands where the PTY would be, opened before this process detaches so
@@ -1803,11 +1924,11 @@
               c"%.8s"
               (if (= (p/cast i64 name) 0) socket-path (index name 1)))
     (transport/log-open! socket-path out)
-    (transport/log! c"service-start shell_pid=%lld adopted=%lld journal_end=%lld"
+    (transport/log! c"service-start shell_pid=%lld adopted=%lld journal_end=%lld coalition=%lld"
                     (p/cast i64 (.child s))
                     (if (.upstream s) 1 0)
                     (.end s)
-                    0)
+                    (transport/own-coalition))
     (watch-signals!)
     0)
   (if (not (set-nonblocking (.pty s)))

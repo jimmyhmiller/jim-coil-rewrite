@@ -1,0 +1,58 @@
+(module jim.unread)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+
+;;; How many times each project has asked for attention while nobody could see it, as a
+;;; dictionary of project id to count. Counts last until the project is looked at or the
+;;; app quits: what rang before a launch comes back as replay, which rings nothing.
+
+(defn fresh [] (-> (ptr i8))
+  (new c"NSMutableDictionary"))
+
+;;; The app's counts.
+(defn shared [] (-> (ptr i8))
+  (let [cell (p/alloc-static (ptr i8))]
+    (when (= (p/cast i64 (load cell)) 0)
+      (set! cell (fresh)))
+    (load cell)))
+
+(defn number [(value i64)] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSNumber") (sel c"numberWithLongLong:") [i64] value))
+
+(defn of [(counts (ptr i8)) (project i64)] (-> i64)
+  (msg i64
+       (msg (ptr i8) counts (sel c"objectForKey:") [(ptr i8)] (number project))
+       (sel c"longLongValue")
+       []))
+
+(defn add! [(counts (ptr i8)) (project i64) (n i64)] (-> void)
+  (do
+    (msg i64
+         counts
+         (sel c"setObject:forKey:")
+         [(ptr i8) (ptr i8)]
+         (number (+ (of counts project) n))
+         (number project))
+    (do)))
+
+;;; Forget PROJECT's count, returning whether it had one.
+(defn clear! [(counts (ptr i8)) (project i64)] (-> bool)
+  (let [had (> (of counts project) 0)]
+    (msg i64 counts (sel c"removeObjectForKey:") [(ptr i8)] (number project))
+    had))
+
+(defn total [(counts (ptr i8))] (-> i64)
+  (let [values (msg (ptr i8) counts (sel c"allValues") [])
+        (mut sum) 0]
+    (for [i 0 (msg i64 values (sel c"count") [])]
+      (set! sum
+            (+ (load sum)
+               (msg i64
+                    (msg (ptr i8) values (sel c"objectAtIndex:") [i64] i)
+                    (sel c"longLongValue")
+                    []))))
+    (load sum)))
+
+;;; N as a sidebar row shows it, where a large count must not push the name aside.
+(defn row-text [(n i64)] (-> (ptr i8))
+  (if (> n 99) (ns c"99+") (indexed-string c"" n c"")))

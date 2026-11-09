@@ -1,0 +1,39 @@
+(module jim.unread-test)
+(import "jim.unread" :as unread)
+(import "jim.sidebar" :as sidebar)
+(import "jim.native" :use *)
+
+(defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (!= (msg i8 a (sel c"isEqualToString:") [(ptr i8)] (ns b)) (: 0 i8)))
+
+(deftest counts-are-per-project-and-the-total-sums-them
+  (let [counts (unread/fresh)]
+    (assert (= (unread/of counts 7) 0))
+    (assert (= (unread/total counts) 0))
+    (unread/add! counts 7 1)
+    (unread/add! counts 7 2)
+    (unread/add! counts 9 4)
+    (assert (= (unread/of counts 7) 3))
+    (assert (= (unread/of counts 9) 4))
+    (assert (= (unread/total counts) 7))))
+
+(deftest clearing-one-project-leaves-the-others
+  (let [counts (unread/fresh)]
+    (unread/add! counts 7 3)
+    (unread/add! counts 9 4)
+    (assert (unread/clear! counts 7))
+    (assert (= (unread/of counts 7) 0))
+    (assert (= (unread/of counts 9) 4))
+    (assert (= (unread/total counts) 4))
+    (assert (not (unread/clear! counts 7)))))
+
+(deftest a-row-caps-its-count-where-the-total-does-not
+  (assert (same? (unread/row-text 1) c"1"))
+  (assert (same? (unread/row-text 99) c"99"))
+  (assert (same? (unread/row-text 100) c"99+")))
+
+(deftest a-row-tag-names-its-project-and-part
+  (for [part 0 sidebar/ROW-PARTS]
+    (let [tag (sidebar/row-tag 41 part)]
+      (assert (= (sidebar/tag-id tag) 41))
+      (assert (= (sidebar/tag-part tag) part)))))

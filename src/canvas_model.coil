@@ -128,6 +128,18 @@
 (defn on-close? [(w f64) (x f64) (y f64)] (-> bool)
   (and (in-header? y) (> x (- w HEADER))))
 
+;;; Whether a secondary click at the pane-local point (X, Y) of a pane W×H opens the
+;;; pane's menu, as in Jim: on a pinned pane anywhere, since its chrome is hidden; on any
+;;; other only on its chrome, the header and the resize band, since its content takes
+;;; clicks of its own. BAND is the resize band's width, as for edges-at.
+(defn opens-pane-menu? [(pinned bool)
+                        (w f64)
+                        (h f64)
+                        (x f64)
+                        (y f64)
+                        (band f64)] (-> bool)
+  (or pinned (in-header? y) (!= (edges-at w h x y band) 0)))
+
 ;;; The edges within BAND of the pane-local point (X, Y) in a pane of size W×H;
 ;;; two at a corner, 0 away from every edge. BAND grows as the canvas zooms out, so
 ;;; the top edge stops at a third of the header, which must stay there to drag by.

@@ -1,0 +1,113 @@
+(module jim.remote-wire)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+
+;;; What `jimc` and the app say to each other: one JSON object per line each way, on a
+;;; connection that carries one request and one reply. Both sides build their JSON here.
+(const MAX-REQUEST 1048576)
+
+(defn push-str! [(out (ptr (ArrayList u8))) (s (slice u8))] (-> void)
+  (extend! out (data s) (len s)))
+
+(defn push-byte! [(out (ptr (ArrayList u8))) (b u8)] (-> void)
+  (push! out b))
+
+(defn hex-digit [(value i64)] (-> u8)
+  (p/cast u8 (if (< value 10) (+ value 48) (+ value 87))))
+
+;;; S as a JSON string. Bytes above ASCII pass through, so valid UTF-8 stays valid.
+(defn push-string! [(out (ptr (ArrayList u8))) (s (slice u8))] (-> void)
+  (push-byte! out (: 34 u8))
+  (for [i 0 (len s)]
+    (let [b (get s i)
+          value (p/cast i64 b)]
+      (cond (= value 34) (push-str! out "\\\"")
+            (= value 92) (push-str! out "\\\\")
+            (= value 10) (push-str! out "\\n")
+            (= value 13) (push-str! out "\\r")
+            (= value 9) (push-str! out "\\t")
+            (< value 32)
+              (do
+                (push-str! out "\\u00")
+                (push-byte! out (hex-digit (/ value 16)))
+                (push-byte! out (hex-digit (% value 16))))
+            :else (push-byte! out b))))
+  (push-byte! out (: 34 u8)))
+
+(defn push-i64! [(out (ptr (ArrayList u8))) (value i64)] (-> void)
+  (when (< value 0) (push-byte! out (: 45 u8)))
+  (let [(mut digits) (zeroed (array u8 20))
+        (mut count) 0
+        (mut rest) value]
+    (loop (let [digit (% (load rest) 10)]
+            (set! (index (mut digits) (load count))
+                  (p/cast u8 (+ 48 (if (< digit 0) (- 0 digit) digit))))
+            (set! count (+ (load count) 1))
+            (set! rest (/ (load rest) 10))
+            (when (= (load rest) 0) (break))))
+    (while (> (load count) 0)
+      (set! count (- (load count) 1))
+      (push-byte! out (index (mut digits) (load count))))))
+
+;;; The comma a new member or element needs, unless it is the first in its container.
+(defn comma! [(out (ptr (ArrayList u8)))] (-> void)
+  (when (> (len (load out)) 0)
+    (let [last (get (load out) (- (len (load out)) 1))]
+      (when (and (!= last (: 123 u8))
+                 (!= last (: 91 u8))
+                 (!= last (: 58 u8)))
+        (push-byte! out (: 44 u8))))))
+
+(defn key! [(out (ptr (ArrayList u8))) (name (slice u8))] (-> void)
+  (comma! out)
+  (push-string! out name)
+  (push-byte! out (: 58 u8)))
+
+(defn field-string! [(out (ptr (ArrayList u8)))
+                     (name (slice u8))
+                     (value (slice u8))] (-> void)
+  (key! out name)
+  (push-string! out value))
+
+(defn field-i64! [(out (ptr (ArrayList u8))) (name (slice u8)) (value i64)]
+  (-> void)
+  (key! out name)
+  (push-i64! out value))
+
+(defn field-bool! [(out (ptr (ArrayList u8))) (name (slice u8)) (value bool)]
+  (-> void)
+  (key! out name)
+  (push-str! out (if value "true" "false")))
+
+;;; Open a container as a new member or element: pass the member's name, or "" for an
+;;; element of an array.
+(defn open-object! [(out (ptr (ArrayList u8))) (name (slice u8))] (-> void)
+  (if (> (len name) 0) (key! out name) (comma! out))
+  (push-byte! out (: 123 u8)))
+
+(defn close-object! [(out (ptr (ArrayList u8)))] (-> void)
+  (push-byte! out (: 125 u8)))
+
+(defn open-array! [(out (ptr (ArrayList u8))) (name (slice u8))] (-> void)
+  (key! out name)
+  (push-byte! out (: 91 u8)))
+
+(defn close-array! [(out (ptr (ArrayList u8)))] (-> void)
+  (push-byte! out (: 93 u8)))
+
+;;; A whole reply saying the request failed because of PROBLEM.
+(defn push-failure! [(out (ptr (ArrayList u8))) (problem (slice u8))] (-> void)
+  (push-byte! out (: 123 u8))
+  (field-bool! out "ok" false)
+  (field-string! out "error" problem)
+  (close-object! out))
+
+;;; A whole reply saying the request worked, with FIELDS as its members after "ok".
+(defn push-success! [(out (ptr (ArrayList u8))) (fields (slice u8))] (-> void)
+  (push-byte! out (: 123 u8))
+  (field-bool! out "ok" true)
+  (when (> (len fields) 0)
+    (push-byte! out (: 44 u8))
+    (push-str! out fields))
+  (close-object! out))

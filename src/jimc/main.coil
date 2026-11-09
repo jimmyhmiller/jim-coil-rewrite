@@ -1,0 +1,635 @@
+(module jim.jimc)
+(import "coil.alloc" :as alloc)
+(import "coil.args" :as args)
+(import "coil.arraylist" :use *)
+(import "coil.cc" :as cc)
+(import "coil.json" :as json)
+(import "coil.os" :as os)
+(import "coil.primitive" :as p)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "jim.remote-wire" :as wire)
+(import "jim.session.transport" :as transport)
+
+;;; `jimc`: control a running Jim Coil from a shell or an agent. It turns a command line
+;;; into one JSON request on the app's socket and prints the JSON reply. What a command
+;;; means is the app's business, in src/main.coil; this only knows how to spell it.
+
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(extern getcwd :cc (cc/C) [(ptr i8) u64] (-> (ptr i8)))
+
+(extern write :cc (cc/C) [i32 (ptr i8) u64] (-> isize))
+
+(const USAGE-EXIT 2)
+
+(const FAILED-EXIT 1)
+
+;;; How long the app gets to answer. It answers between events, so this is only ever
+;;; reached if it is stuck.
+(const REPLY-MILLISECONDS (: 30000 i32))
+
+(const USAGE
+       "usage: jimc <command> [args...]    (every reply is one line of JSON; exit 1 if ok is false)
+
+commands:
+  status
+  project list
+  project new NAME [--dir D] [--background]
+  project activate NAME|ID
+  project set-dir [--project P] [DIR]        DIR defaults to this directory
+  project delete NAME|ID --yes               also ends the project's terminals
+  pane list [--project P]
+  pane focus ID [--project P]                switches project and takes the keyboard
+  pane move ID X Y [W H] [--project P]
+  pane pin ID [--project P]                  behind every pane, without chrome or keyboard
+  pane unpin ID [--project P]
+  pane move-to ID PROJECT [--project P]      keeps its place on the canvas and its shell
+  pane close ID [--project P]                closing a terminal ends its shell
+  term new [--project P] [--dir D] [--at X,Y,W,H]
+  term send ID TEXT [--enter] [--project P]
+  term read ID [--project P]                 the text on screen
+  term scroll ID LINES [--project P]         turn the wheel over it; LINES > 0 is up
+  widget list
+  widget open NAME [ARGS...] [--project P] [--at X,Y,W,H]
+  diff-wall [SPEC...] [--background]         in this directory unless SPEC has repo=PATH
+  canvas fit [--project P]
+  action list
+  action run TITLE|ID [--answer TEXT]        anything the palette does
+  msg TOPIC [BODY]                           broadcast to every widget
+  raw JSON                                   send one request as written
+
+P is a project's name or id, and defaults to the selected project.
+Nothing here brings the app to the front. Panes open behind the keyboard. Only project
+activate, pane focus and action run move it, as do project new and diff-wall, which
+switch to what they make unless given --background.
+
+SPEC is what the palette's Diff: Open diff wall takes:
+  [working|staged|unstaged|range BASE [HEAD]|pr N] [per=file|hunk]
+  [path=GLOB]... [exclude=GLOB]... [max=N] [repo=PATH]
+
+The socket is ~/.jim-coil/control/socket, or $JIM_COIL_SOCKET.
+")
+
+(defstruct Flag [(name (slice u8)) (value (slice u8))])
+
+;;; A command line after the words that chose the command.
+(defstruct Parsed
+  [(words (ArrayList (slice u8)))
+   (flags (ArrayList Flag))
+   ;; The first thing wrong with the line, or "".
+   (problem (slice u8))])
+
+(defn print! [(fd i32) (text (slice u8))] (-> void)
+  (write fd (p/cast (ptr i8) (data text)) (p/cast u64 (len text)))
+  (do))
+
+(defn usage-failure [(problem (slice u8)) (detail (slice u8))] (-> i64)
+  (print! (: 2 i32) "jimc: ")
+  (print! (: 2 i32) problem)
+  (print! (: 2 i32) detail)
+  (print! (: 2 i32) "\n\n")
+  (print! (: 2 i32) USAGE)
+  USAGE-EXIT)
+
+;;; Whether WORD is one of the space-separated words in LIST.
+(defn listed? [(list (slice u8)) (word (slice u8))] (-> bool)
+  (let [(mut start) 0
+        (mut found) false]
+    (for [i 0 (+ (len list) 1)]
+      (when (or (= i (len list)) (= (get list i) (: 32 u8)))
+        (when (= (subslice list (load start) i) word) (set! found true))
+        (set! start (+ i 1))))
+    (load found)))
+
+;;; A and B as one slice, which lasts as long as the process does.
+(defn joined-text [(a (slice u8)) (b (slice u8))] (-> (slice u8))
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wire/push-str! (mut out) a)
+    (wire/push-str! (mut out) b)
+    (into-slice (mut out))))
+
+;;; Sort the arguments from index FIRST into words and flags. VALUED flags take the next
+;;; argument, BARE flags stand alone, and everything after `--` is a word, so text that
+;;; starts with dashes can be sent.
+(defn parse-from [(first i64) (valued (slice u8)) (bare (slice u8))] (-> Parsed)
+  (let [a (alloc/malloc-allocator)
+        (mut out)
+          (Parsed
+            :words (ArrayList::new [(slice u8)] a)
+            :flags (ArrayList::new [Flag] a)
+            :problem "")
+        (mut i) first
+        (mut literal) false]
+    (while (< (load i) (args/count))
+      (let [word (args/nth (load i))
+            dashed
+              (and (not (load literal))
+                   (>= (len word) 2)
+                   (= (subslice word 0 2) "--"))]
+        (cond (and dashed (= (len word) 2)) (set! literal true)
+              (and dashed (listed? valued word))
+                (if (>= (+ (load i) 1) (args/count))
+                    (when (= (len (.problem out)) 0)
+                      (set! (.problem out)
+                            (joined-text "this flag needs a value: " word)))
+                    (do
+                      (push! (mut (.flags out))
+                             (Flag :name word :value (args/nth (+ (load i) 1))))
+                      (set! i (+ (load i) 1))))
+              (and dashed (listed? bare word))
+                (push! (mut (.flags out)) (Flag :name word :value ""))
+              dashed
+                (when (= (len (.problem out)) 0)
+                  (set! (.problem out)
+                        (joined-text "this command has no flag " word)))
+              :else (push! (mut (.words out)) word)))
+      (set! i (+ (load i) 1)))
+    out))
+
+(defn flag-at [(line (ptr Parsed)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (len (.flags line))]
+      (when (= (.name (get (.flags line) i)) name) (set! found i)))
+    (load found)))
+
+(defn flag? [(line (ptr Parsed)) (name (slice u8))] (-> bool)
+  (>= (flag-at line name) 0))
+
+(defn flag-value [(line (ptr Parsed)) (name (slice u8))] (-> (slice u8))
+  (let [at (flag-at line name)]
+    (if (>= at 0) (.value (get (.flags line) at)) "")))
+
+(defn word [(line (ptr Parsed)) (i i64)] (-> (slice u8))
+  (if (< i (len (.words line))) (get (.words line) i) ""))
+
+(defn word-count [(line (ptr Parsed))] (-> i64)
+  (len (.words line)))
+
+(defn integer? [(text (slice u8))] (-> bool)
+  (let [digits
+          (if (and (> (len text) 0) (= (get text 0) (: 45 u8)))
+              (subslice text 1 (len text))
+              text)
+        (mut ok) (and (> (len digits) 0) (<= (len digits) 15))]
+    (for [i 0 (len digits)]
+      (when (or (< (get digits i) (: 48 u8)) (> (get digits i) (: 57 u8)))
+        (set! ok false)))
+    (load ok)))
+
+(defn integer-of [(text (slice u8))] (-> i64)
+  (let [negative (and (> (len text) 0) (= (get text 0) (: 45 u8)))
+        (mut value) 0]
+    (for [i (if negative 1 0) (len text)]
+      (set! value
+            (+ (* (load value) 10) (p/cast i64 (- (get text i) (: 48 u8))))))
+    (if negative (- 0 (load value)) (load value))))
+
+(defn begin! [(out (ptr (ArrayList u8))) (action (slice u8))] (-> void)
+  (wire/open-object! out "")
+  (wire/field-string! out "action" action))
+
+(defn string-flag! [(out (ptr (ArrayList u8)))
+                    (line (ptr Parsed))
+                    (flag (slice u8))
+                    (key (slice u8))] (-> void)
+  (when (flag? line flag) (wire/field-string! out key (flag-value line flag))))
+
+(defn project-flag! [(out (ptr (ArrayList u8))) (line (ptr Parsed))] (-> void)
+  (string-flag! out line "--project" "project"))
+
+(defn bool-flag! [(out (ptr (ArrayList u8)))
+                  (line (ptr Parsed))
+                  (flag (slice u8))
+                  (key (slice u8))] (-> void)
+  (when (flag? line flag) (wire/field-bool! out key true)))
+
+;;; PATH as the app should see it: its working directory is not this one.
+(defn push-absolute! [(out (ptr (ArrayList u8))) (path (slice u8))] (-> bool)
+  (if (and (> (len path) 0) (= (get path 0) (: 47 u8)))
+      (do (wire/push-str! out path) true)
+      (let [(mut buffer) (zeroed (array i8 4096))
+            here (getcwd (p/cast (ptr i8) (mut buffer)) (: 4096 u64))]
+        (if (= (p/cast i64 here) 0)
+            false
+            (do
+              (wire/push-str! out (str/from-cstr here))
+              (when (and (> (len path) 0) (!= path "."))
+                (wire/push-byte! out (: 47 u8))
+                (wire/push-str! out path))
+              true)))))
+
+;;; KEY: PATH, made absolute. False if this directory can't be known.
+(defn directory-field! [(out (ptr (ArrayList u8)))
+                        (key (slice u8))
+                        (path (slice u8))] (-> bool)
+  (let [(mut full) (ArrayList::new [u8] (alloc/malloc-allocator))
+        ok (push-absolute! (mut full) path)]
+    (when ok (wire/field-string! out key (slice full)))
+    (ArrayList::free! (mut full))
+    ok))
+
+;;; Up to four numbers separated by commas as x, y, w and h. False if TEXT isn't that.
+(defn at-fields! [(out (ptr (ArrayList u8))) (text (slice u8))] (-> bool)
+  (let [(mut start) 0
+        (mut field) 0
+        (mut ok) true]
+    (for [i 0 (+ (len text) 1)]
+      (when (or (= i (len text)) (= (get text i) (: 44 u8)))
+        (let [number (subslice text (load start) i)]
+          (if (and (integer? number) (< (load field) 4))
+              (wire/field-i64! out
+                               (cond (= (load field) 0) "x"
+                                     (= (load field) 1) "y"
+                                     (= (load field) 2) "w"
+                                     :else "h")
+                               (integer-of number))
+              (set! ok false)))
+        (set! field (+ (load field) 1))
+        (set! start (+ i 1))))
+    (and (load ok) (>= (load field) 2))))
+
+;;; ---- the commands ---------------------------------------------------------------
+
+;;; Each builds its request in OUT and returns "" or what's wrong with the line. A
+;;; command's own arguments start after its noun and verb, at NOUN-FROM.
+(const NOUN-FROM 3)
+
+(defn project-command! [(out (ptr (ArrayList u8))) (verb (slice u8))]
+  (-> (slice u8))
+  (let [(mut line) (parse-from NOUN-FROM "--dir --project" "--background --yes")
+        l (p/cast (ptr Parsed) (mut line))]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (= verb "list") (do (begin! out "list_projects") "")
+          (= verb "new")
+            (if (!= (word-count l) 1)
+                "project new takes one NAME"
+                (do
+                  (begin! out "new_project")
+                  (wire/field-string! out "name" (word l 0))
+                  (bool-flag! out l "--background" "background")
+                  (if (and (flag? l "--dir")
+                           (not (directory-field! out
+                                                  "directory"
+                                                  (flag-value l "--dir"))))
+                      "this directory can't be read"
+                      "")))
+          (= verb "activate")
+            (if (!= (word-count l) 1)
+                "project activate takes one NAME or ID"
+                (do
+                  (begin! out "activate_project")
+                  (wire/field-string! out "project" (word l 0))
+                  ""))
+          (= verb "set-dir")
+            (if (> (word-count l) 1)
+                "project set-dir takes at most one DIR"
+                (do
+                  (begin! out "set_project_directory")
+                  (project-flag! out l)
+                  (if (directory-field! out
+                                        "directory"
+                                        (if (= (word-count l) 1) (word l 0) "."))
+                      ""
+                      "this directory can't be read")))
+          (= verb "delete")
+            (cond (!= (word-count l) 1) "project delete takes one NAME or ID"
+                  (not (flag? l "--yes"))
+                    "project delete ends the project's terminals; pass --yes"
+                  :else
+                    (do
+                      (begin! out "delete_project")
+                      (wire/field-string! out "project" (word l 0))
+                      ""))
+          :else "project takes list, new, activate, set-dir or delete")))
+
+(defn pane-command! [(out (ptr (ArrayList u8))) (verb (slice u8))]
+  (-> (slice u8))
+  (let [(mut line) (parse-from NOUN-FROM "--project" "")
+        l (p/cast (ptr Parsed) (mut line))
+        id-needed (not (= verb "list"))
+        id (word l 0)]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (and id-needed (not (integer? id)))
+            "this needs a pane ID; see jimc pane list"
+          (= verb "list")
+            (do (begin! out "list_panes") (project-flag! out l) "")
+          (= verb "focus")
+            (do
+              (begin! out "focus_pane")
+              (project-flag! out l)
+              (wire/field-i64! out "pane" (integer-of id))
+              "")
+          (= verb "close")
+            (do
+              (begin! out "close_pane")
+              (project-flag! out l)
+              (wire/field-i64! out "pane" (integer-of id))
+              "")
+          (or (= verb "pin") (= verb "unpin"))
+            (do
+              (begin! out (if (= verb "pin") "pin_pane" "unpin_pane"))
+              (project-flag! out l)
+              (wire/field-i64! out "pane" (integer-of id))
+              "")
+          (= verb "move-to")
+            (if (!= (word-count l) 2)
+                "pane move-to takes ID and one PROJECT"
+                (do
+                  (begin! out "move_pane_to_project")
+                  (project-flag! out l)
+                  (wire/field-i64! out "pane" (integer-of id))
+                  (wire/field-string! out "to" (word l 1))
+                  ""))
+          (= verb "move")
+            (let [count (word-count l)
+                  (mut numbers) true]
+              (for [i 1 count]
+                (when (not (integer? (word l i))) (set! numbers false)))
+              (if (or (not (load numbers)) (and (!= count 3) (!= count 5)))
+                  "pane move takes ID X Y, or ID X Y W H"
+                  (do
+                    (begin! out "move_pane")
+                    (project-flag! out l)
+                    (wire/field-i64! out "pane" (integer-of id))
+                    (wire/field-i64! out "x" (integer-of (word l 1)))
+                    (wire/field-i64! out "y" (integer-of (word l 2)))
+                    (when (= count 5)
+                      (wire/field-i64! out "w" (integer-of (word l 3)))
+                      (wire/field-i64! out "h" (integer-of (word l 4))))
+                    "")))
+          :else "pane takes list, focus, move, pin, unpin, move-to or close")))
+
+(defn term-command! [(out (ptr (ArrayList u8))) (verb (slice u8))]
+  (-> (slice u8))
+  (let [(mut line) (parse-from NOUN-FROM "--project --dir --at" "--enter")
+        l (p/cast (ptr Parsed) (mut line))]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (= verb "new")
+            (do
+              (begin! out "new_terminal")
+              (project-flag! out l)
+              (cond (and (flag? l "--dir")
+                         (not (directory-field! out
+                                                "directory"
+                                                (flag-value l "--dir"))))
+                      "this directory can't be read"
+                    (and (flag? l "--at")
+                         (not (at-fields! out (flag-value l "--at"))))
+                      "--at takes X,Y or X,Y,W,H"
+                    :else ""))
+          (= verb "send")
+            (cond (not (integer? (word l 0)))
+                    "term send needs a pane ID; see jimc pane list"
+                  (!= (word-count l) 2)
+                    "term send takes ID and one TEXT; quote the text"
+                  :else
+                    (do
+                      (begin! out "send_text")
+                      (project-flag! out l)
+                      (wire/field-i64! out "pane" (integer-of (word l 0)))
+                      (wire/field-string! out "text" (word l 1))
+                      (bool-flag! out l "--enter" "enter")
+                      ""))
+          (= verb "read")
+            (if (not (integer? (word l 0)))
+                "term read needs a pane ID; see jimc pane list"
+                (do
+                  (begin! out "read_terminal")
+                  (project-flag! out l)
+                  (wire/field-i64! out "pane" (integer-of (word l 0)))
+                  ""))
+          (= verb "scroll")
+            (cond (not (integer? (word l 0)))
+                    "term scroll needs a pane ID; see jimc pane list"
+                  (or (!= (word-count l) 2) (not (integer? (word l 1))))
+                    "term scroll takes ID and a number of LINES"
+                  :else
+                    (do
+                      (begin! out "scroll_terminal")
+                      (project-flag! out l)
+                      (wire/field-i64! out "pane" (integer-of (word l 0)))
+                      (wire/field-i64! out "lines" (integer-of (word l 1)))
+                      ""))
+          :else "term takes new, send, read or scroll")))
+
+;;; The words from FIRST, joined by spaces, as member KEY.
+(defn joined-field! [(out (ptr (ArrayList u8)))
+                     (key (slice u8))
+                     (line (ptr Parsed))
+                     (first i64)] (-> void)
+  (let [(mut joined) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (for [i first (word-count line)]
+      (when (> i first) (wire/push-byte! (mut joined) (: 32 u8)))
+      (wire/push-str! (mut joined) (word line i)))
+    (wire/field-string! out key (slice joined))
+    (ArrayList::free! (mut joined))))
+
+(defn widget-command! [(out (ptr (ArrayList u8))) (verb (slice u8))]
+  (-> (slice u8))
+  (let [(mut line) (parse-from NOUN-FROM "--project --at" "")
+        l (p/cast (ptr Parsed) (mut line))]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (= verb "list") (do (begin! out "list_widgets") "")
+          (= verb "open")
+            (if (= (word-count l) 0)
+                "widget open needs a NAME; see jimc widget list"
+                (do
+                  (begin! out "open_widget")
+                  (project-flag! out l)
+                  (joined-field! out "spec" l 0)
+                  (if (and (flag? l "--at")
+                           (not (at-fields! out (flag-value l "--at"))))
+                      "--at takes X,Y or X,Y,W,H"
+                      "")))
+          :else "widget takes list or open")))
+
+;;; Whether a word of the spec chooses the repository.
+(defn names-repo? [(line (ptr Parsed))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (word-count line)]
+      (let [w (word line i)]
+        (when (and (>= (len w) 5) (= (subslice w 0 5) "repo="))
+          (set! found true))))
+    (load found)))
+
+(defn diff-wall-command! [(out (ptr (ArrayList u8)))] (-> (slice u8))
+  (let [(mut line) (parse-from 2 "" "--background")
+        l (p/cast (ptr Parsed) (mut line))]
+    (if (> (len (.problem line)) 0)
+        (.problem line)
+        (do
+          (begin! out "diff_wall")
+          (when (> (word-count l) 0) (joined-field! out "spec" l 0))
+          (bool-flag! out l "--background" "background")
+          (if (or (names-repo? l) (directory-field! out "directory" "."))
+              ""
+              "this directory can't be read")))))
+
+(defn canvas-command! [(out (ptr (ArrayList u8))) (verb (slice u8))]
+  (-> (slice u8))
+  (let [(mut line) (parse-from NOUN-FROM "--project" "")
+        l (p/cast (ptr Parsed) (mut line))]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (= verb "fit") (do (begin! out "fit_canvas") (project-flag! out l) "")
+          :else "canvas takes fit")))
+
+(defn action-command! [(out (ptr (ArrayList u8))) (verb (slice u8))]
+  (-> (slice u8))
+  (let [(mut line) (parse-from NOUN-FROM "--answer" "")
+        l (p/cast (ptr Parsed) (mut line))]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (= verb "list") (do (begin! out "list_actions") "")
+          (= verb "run")
+            (if (= (word-count l) 0)
+                "action run needs a TITLE or ID; see jimc action list"
+                (do
+                  (begin! out "run_action")
+                  (if (and (= (word-count l) 1) (integer? (word l 0)))
+                      (wire/field-i64! out "id" (integer-of (word l 0)))
+                      (joined-field! out "name" l 0))
+                  (string-flag! out l "--answer" "answer")
+                  ""))
+          :else "action takes list or run")))
+
+(defn message-command! [(out (ptr (ArrayList u8)))] (-> (slice u8))
+  (let [(mut line) (parse-from 2 "" "")
+        l (p/cast (ptr Parsed) (mut line))]
+    (cond (> (len (.problem line)) 0) (.problem line)
+          (or (< (word-count l) 1) (> (word-count l) 2))
+            "msg takes TOPIC and at most one BODY; quote the body"
+          :else
+            (do
+              (begin! out "message")
+              (wire/field-string! out "topic" (word l 0))
+              (when (= (word-count l) 2)
+                (wire/field-string! out "body" (word l 1)))
+              ""))))
+
+;;; ---- talking to the app ---------------------------------------------------------
+
+(defn socket-path [(out (ptr (ArrayList u8)))] (-> void)
+  (let [override (getenv c"JIM_COIL_SOCKET")]
+    (if (!= (p/cast i64 override) 0)
+        (wire/push-str! out (str/from-cstr override))
+        (do
+          (wire/push-str! out (str/from-cstr (getenv c"HOME")))
+          (wire/push-str! out "/.jim-coil/control/socket")))
+    (push! out (: 0 u8))))
+
+(defn failed [(problem (slice u8))] (-> i64)
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wire/push-failure! (mut out) problem)
+    (wire/push-byte! (mut out) (: 10 u8))
+    (print! (: 1 i32) (slice out))
+    (ArrayList::free! (mut out))
+    FAILED-EXIT))
+
+(defn send-all? [(fd i32) (bytes (slice u8))] (-> bool)
+  (let [(mut at) 0
+        (mut ok) true]
+    (while (and (load ok) (< (load at) (len bytes)))
+      (let [sent
+              (transport/send fd
+                              (p/cast (ptr i8) (index (data bytes) (load at)))
+                              (p/cast isize (- (len bytes) (load at)))
+                              (: 0 i32))]
+        (if (> sent (: 0 isize))
+            (set! at (+ (load at) (p/cast i64 sent)))
+            (set! ok false))))
+    (load ok)))
+
+;;; All the app says, up to its hanging up. False if it hasn't answered in time.
+(defn read-reply? [(fd i32) (out (ptr (ArrayList u8)))] (-> bool)
+  (let [(mut buffer) (zeroed (array u8 65536))
+        (mut open) true
+        (mut ok) true]
+    (while (load open)
+      (if (<= (transport/session-readable fd REPLY-MILLISECONDS) (: 0 i32))
+          (do (set! open false) (set! ok false))
+          (let [got
+                  (transport/recv fd
+                                  (p/cast (ptr i8) (mut buffer))
+                                  (: 65536 isize)
+                                  (: 0 i32))]
+            (if (> got (: 0 isize))
+                (extend! out (p/cast (ptr u8) (mut buffer)) (p/cast i64 got))
+                (set! open false)))))
+    (load ok)))
+
+;;; Whether REPLY is an object whose "ok" is true.
+(defn reply-ok? [(reply (slice u8))] (-> bool)
+  (try (let [(mut doc)
+               (try-or! (json/parse (alloc/malloc-allocator) reply) false)
+             at (json/object-get doc 0 "ok")
+             ok
+               (and (>= at 0)
+                    (json/is-bool? (json/token doc at))
+                    (json/bool (json/token doc at)))]
+         (json/doc-free! (mut doc))
+         ok)))
+
+(defn trimmed-line [(bytes (slice u8))] (-> (slice u8))
+  (if (and (> (len bytes) 0) (= (get bytes (- (len bytes) 1)) (: 10 u8)))
+      (subslice bytes 0 (- (len bytes) 1))
+      bytes))
+
+(defn exchange [(request (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut path) (ArrayList::new [u8] a)
+        (mut line) (ArrayList::new [u8] a)
+        (mut reply) (ArrayList::new [u8] a)]
+    (socket-path (mut path))
+    (wire/push-str! (mut line) request)
+    (wire/push-byte! (mut line) (: 10 u8))
+    (let [fd (transport/session-connect (p/cast (ptr i8) (data (slice path))))]
+      (cond (and (< fd (: 0 i32))
+                 (or (= (os/errno) transport/ENOENT)
+                     (= (os/errno) transport/ECONNREFUSED)))
+              (failed "Jim Coil is not running")
+            (< fd (: 0 i32)) (failed "Could not reach Jim Coil's socket")
+            (not (send-all? fd (slice line)))
+              (do (transport/close fd) (failed "Jim Coil hung up"))
+            (not (read-reply? fd (mut reply)))
+              (do
+                (transport/close fd)
+                (failed "Jim Coil did not answer within 30 seconds"))
+            (= (len reply) 0)
+              (do (transport/close fd) (failed "Jim Coil hung up"))
+            :else
+              (do
+                (transport/close fd)
+                (print! (: 1 i32) (slice reply))
+                (if (reply-ok? (trimmed-line (slice reply))) 0 FAILED-EXIT))))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/init! argc argv)
+  (let [noun (args/nth 1)
+        verb (args/nth 2)
+        (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
+        problem
+          (cond (= noun "project") (project-command! (mut out) verb)
+                (= noun "pane") (pane-command! (mut out) verb)
+                (= noun "term") (term-command! (mut out) verb)
+                (= noun "widget") (widget-command! (mut out) verb)
+                (= noun "canvas") (canvas-command! (mut out) verb)
+                (= noun "action") (action-command! (mut out) verb)
+                (= noun "diff-wall") (diff-wall-command! (mut out))
+                (= noun "msg") (message-command! (mut out))
+                (= noun "status")
+                  (if (> (args/count) 2)
+                      "status takes no arguments"
+                      (do (begin! (mut out) "status") ""))
+                :else "")]
+    (cond (or (= noun "") (= noun "help") (= noun "--help") (= noun "-h"))
+            (do (print! (: 1 i32) USAGE) 0)
+          (= noun "raw")
+            (if (= (args/count) 3)
+                (exchange verb)
+                (usage-failure "raw takes one JSON request" ""))
+          (> (len problem) 0) (usage-failure problem "")
+          (= (len out) 0) (usage-failure "no such command: " noun)
+          :else
+            (do
+              (wire/close-object! (mut out))
+              (exchange (slice out))))))

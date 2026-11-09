@@ -23,6 +23,11 @@
   (assert (>= (actions/match-score (ns c"pwd") 19) 0))
   (assert (>= (actions/score (ns c"É") (ns c"éclair")) 0)))
 
+(deftest the-diff-wall-is-found-by-what-it-is-for
+  (assert (>= (actions/match-score (ns c"diff wall") 32) 0))
+  (assert (>= (actions/match-score (ns c"review") 32) 0))
+  (assert (>= (actions/match-score (ns c"pull request") 32) 0)))
+
 (deftest original-zoom-shortcuts-stay-distinct
   (assert (= (actions/key-action (: 29 u16) (: 1048576 u64)) 3))
   (assert (= (actions/key-action (: 29 u16) (: 1179648 u64)) 2))

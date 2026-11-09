@@ -7,6 +7,8 @@
 (import "jim.workspace" :as workspace)
 (import "jim.canvas" :as canvas)
 (import "jim.widget-view" :as widget-view)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.wall" :as wall)
 (import "jim.storage" :as storage)
 (import "jim.original" :as original)
 (import "jim.sessions" :as sessions)
@@ -25,6 +27,11 @@
 (import "coil.math" :use [Float])
 (import "jim.sky" :as sky)
 (import "jim.runtime" :as runtime)
+(import "jim.unread" :as unread)
+(import "jim.pane-menu" :as pane-menu)
+(import "jim.remote" :as remote)
+(import "jim.remote-wire" :as wire)
+(import "jim.widget-kit.json" :as kit-json)
 
 ;;; FACE holds the project in 3D: its PLATE, the solid wall of the cube that
 ;;; carries the background, and the canvas, whose panes float off the plate
@@ -757,6 +764,8 @@
                 (while (> (canvas/count c) 0)
                   (canvas/close! c (canvas/pane c 0))))
               (projects/delete-project! (.model s) (.id r))
+              (when (unread/clear! (unread/shared) (.id r))
+                (show-unread!))
               (canvas/free! (.canvas r))
               (msg i64 (.face r) (sel c"removeFromSuperview") [])
               (for [i index (- (count) 1)]
@@ -904,6 +913,63 @@
                :canvas c))
       (if (canvas/restorable? saved) (canvas/restore! c saved) true))))
 
+;;; ---- moving panes between projects and the pane menu -----------------------------
+
+;;; Move pane V of project FROM to project TO, by index. It is shown there when TO is.
+(defn move-pane! [(from i64) (v (ptr canvas/Pane)) (to i64)] (-> void)
+  (canvas/transfer! (project from) (project to) v)
+  (printf c"Jim: moved a pane from %s to %s\n" (name from) (name to))
+  (do))
+
+;;; Open the pane menu if mouse EVENT is a secondary click that opens one, for the pane
+;;; under it in the selected project. Whether it did.
+(defn pane-menu! [(event (ptr i8))] (-> bool)
+  (let [s (shell)
+        c (current)
+        v (canvas/menu-pane c event)]
+    (if (= (p/cast i64 v) 0)
+        false
+        (let [(mut destinations)
+                (al/ArrayList::new [pane-menu/Destination]
+                                   (alloc/malloc-allocator))]
+          ; The projects the profile shows, like every other switcher.
+          (for [i 0 (count)]
+            (when (and (!= i (.selected s)) (shown? i))
+              (push! (mut destinations)
+                     (pane-menu/Destination
+                       :project (.id (runtime i))
+                       :name (storage/get (record i) c"name")))))
+          (canvas/clear-resize-cursor!)
+          (pane-menu/show! event
+                           (.view c)
+                           (.id (runtime (.selected s)))
+                           (.id v)
+                           (.pinned v)
+                           (slice destinations))
+          (al/ArrayList::free! (mut destinations))
+          true))))
+
+;;; Carry out what was picked from the pane menu. The pane, or the project to move it
+;;; to, may have gone while the menu was open; then there is nothing to do.
+(defn apply-pane-menu! [(chosen pane-menu/Choice)] (-> void)
+  (let [index (index-of-project (.project chosen))
+        v
+          (if (>= index 0)
+              (canvas/pane-with-id (project index) (.pane chosen))
+              (p/cast (ptr canvas/Pane) 0))
+        action (.action chosen)]
+    (when (!= (p/cast i64 v) 0)
+      (cond (= action pane-menu/PIN) (canvas/pin! (project index) v)
+            (= action pane-menu/UNPIN) (canvas/unpin! (project index) v)
+            (= action pane-menu/CLOSE) (canvas/close! (project index) v)
+            (= action pane-menu/MOVE)
+              (let [to (index-of-project (.destination chosen))]
+                (when (>= to 0) (move-pane! index v to) 0)
+                (do))
+            :else (do))
+      0)
+    (do)))
+
 ;;; Advance a coasting cube to now: its spin slows and its tilt springs back.
 (defn coast! [] (-> void)
   (let [s (shell)]
@@ -932,6 +998,36 @@
         0)
     (do)))
 
+;;; Show the counts wherever they appear: each project's in the sidebar, their total on
+;;; the Dock icon.
+(defn show-unread! [] (-> void)
+  (let [total (unread/total (unread/shared))]
+    (sidebar/show-counts!)
+    (msg i64
+         (msg (ptr i8) (.app (shell)) (sel c"dockTile") [])
+         (sel c"setBadgeLabel:")
+         [(ptr i8)]
+         (if (> total 0) (indexed-string c"" total c"") (nil)))
+    (do)))
+
+;;; A terminal asking for attention counts against its project unless the project is
+;;; already in front of the user, and bringing a project in front of them clears it.
+(defn track-unread! [] (-> void)
+  (let [s (shell)
+        counts (unread/shared)
+        active (projects/active (.model s))
+        looking (!= (msg i8 (.app s) (sel c"isActive") []) (: 0 i8))
+        (mut changed) false]
+    (for [i 0 (count)]
+      (let [id (.id (runtime i))
+            bells (canvas/take-bells! (project i))]
+        (when (and (> bells 0) (not (and looking (= id active))))
+          (unread/add! counts id bells)
+          (set! changed true))))
+    (when (and looking (unread/clear! counts active))
+      (set! changed true))
+    (when (load changed) (show-unread!))))
+
 (defn maintenance! [] (-> void)
   (let [s (shell)
         bounds (msg Rect (.root s) (sel c"bounds") [])
@@ -940,6 +1036,7 @@
       (hold-window-frame! now)
       (coast!)
       (settle!)
+      (track-unread!)
       (if (or (< (.width s) (.w bounds))
               (> (.width s) (.w bounds))
               (< (.height s) (.h bounds))
@@ -1041,6 +1138,118 @@
             (sync-selection!))
         :else (do)))
 
+;;; ANSWER as a directory that exists, tilde expanded, or nil.
+(defn existing-directory [(answer (ptr i8))] (-> (ptr i8))
+  (let [path (msg (ptr i8) answer (sel c"stringByExpandingTildeInPath") [])
+        manager
+          (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+        directory (p/alloc-stack i8)]
+    (if (and (!= (msg i8
+                      manager
+                      (sel c"fileExistsAtPath:isDirectory:")
+                      [(ptr i8) (ptr i8)]
+                      path
+                      directory)
+                 (: 0 i8))
+             (!= (load directory) (: 0 i8)))
+        path
+        (nil))))
+
+(defn project-named? [(name (ptr i8))] (-> bool)
+  (let [list (projects/list (.model (shell)))
+        (mut found) false]
+    (for [i 0 (storage/count list)]
+      (when (!= (msg i8
+                     (storage/get (storage/at list i) c"name")
+                     (sel c"isEqualToString:")
+                     [(ptr i8)]
+                     name)
+                (: 0 i8))
+        (set! found true)
+        0))
+    (load found)))
+
+;;; NAME, or NAME with " (2)", " (3)", … if a project already has it.
+(defn unused-project-name [(name (ptr i8))] (-> (ptr i8))
+  (let [(mut chosen) name
+        (mut n) 2]
+    (while (project-named? (load chosen))
+      (set! chosen
+            (indexed-string (utf8 (msg (ptr i8)
+                                       name
+                                       (sel c"stringByAppendingString:")
+                                       [(ptr i8)]
+                                       (ns c" (")))
+                            (load n)
+                            c")"))
+      (set! n (+ (load n) 1)))
+    (load chosen)))
+
+;;; The palette's "Diff: Open diff wall". The wall gets a project of its own, in
+;;; the repository: the answer's repo=PATH, or the current project's directory.
+;;; FALLBACK, unless nil, stands in for the current project's directory. BEHIND leaves
+;;; the keyboard where it is. What the answer gets wrong is returned to ask about, or
+;;; nil when it opened.
+(defn open-diff-wall! [(answer (ptr i8)) (fallback (ptr i8)) (behind bool)]
+  (-> (ptr i8))
+  (let [s (shell)
+        model (.model s)
+        bytes (widget-view/string-bytes answer)
+        (mut spec) (wall/parse-spec bytes)
+        (mut kept) (al/ArrayList::new [u8] (alloc/malloc-allocator))
+        (mut words) (al/ArrayList::new [(slice u8)] (alloc/malloc-allocator))
+        (mut name) (al/ArrayList::new [u8] (alloc/malloc-allocator))
+        given
+          (if (> (len (.repo spec)) 0)
+              (widget-view/string (slice (.repo spec)))
+              (cond (!= (p/cast i64 fallback) 0) fallback
+                    (>= (.selected s) 0)
+                      (storage/get (record (.selected s)) c"directory")
+                    :else (ns c"~")))
+        directory (existing-directory given)
+        (mut wrong) (nil)]
+    (cond (> (len (.problem spec)) 0)
+            (set! wrong (widget-view/string (slice (.problem spec))))
+          (= (p/cast i64 directory) 0)
+            (set! wrong (ns c"Directory does not exist; give repo=PATH"))
+          :else
+            (do
+              (wall/words! bytes (mut words))
+              (for [i 0 (len words)]
+                (when (not (text/starts-with? (get words i) "repo="))
+                  (when (> (len kept) 0) (text/push-str! (mut kept) " ") 0)
+                  (text/push-str! (mut kept) (get words i))
+                  0))
+              (wall/push-name! (mut spec)
+                               (widget-view/string-bytes directory)
+                               (mut name))
+              (let [record
+                      (projects/new-project! model
+                                             (unused-project-name (widget-view/string (slice name))))
+                    (mut spec-text)
+                      (al/ArrayList::new [u8]
+                                         (alloc/malloc-allocator))]
+                (storage/put! record c"directory" directory)
+                (add-project-view! record)
+                (text/push-str! (mut spec-text) "diffwall")
+                (when (> (len kept) 0)
+                  (text/push-str! (mut spec-text) " ")
+                  (text/push-str! (mut spec-text) (slice kept))
+                  0)
+                (let [c (canvas-of (projects/id record))
+                      bounds (rect wall/ORIGIN wall/ORIGIN 640.0 300.0)
+                      text (widget-view/string (slice spec-text))]
+                  (if behind
+                      (do (canvas/add-widget-behind! c bounds text) (do))
+                      (do (canvas/add-widget! c bounds text (nil)) (do))))
+                (al/ArrayList::free! (mut spec-text))
+                (do))))
+    (al/ArrayList::free! (mut kept))
+    (al/ArrayList::free! (mut words))
+    (al/ArrayList::free! (mut name))
+    (wall/spec-free! (mut spec))
+    (load wrong)))
+
 (defn invoke! [(id i64)] (-> void)
   (let [s (shell)
         model (.model s)]
@@ -1137,6 +1346,10 @@
                                  c"Widget: NAME [ARGS] — e.g. diff, stage, branches, markdown README.md"
                                  c"")
                 (do (status! c"Create or show a project first") (do)))
+          (= id 32)
+            (palette/prompt! 32
+                             c"Diff wall: working, staged, unstaged, range BASE, or pr N; per=hunk path=GLOB exclude=GLOB repo=PATH"
+                             c"working")
           (= id 26)
             (let [requested (sidebar/take-delete-project!)]
               (delete-project! (if (> requested 0)
@@ -1146,70 +1359,763 @@
           (>= (.selected s) 0) (canvas-action! id)
           :else (do (status! c"Create or show a project first") (do)))))
 
-(defn submit! [(id i64) (input (ptr i8))] (-> void)
+;;; Whether answering action ID needs a project to be selected.
+(defn answer-needs-project? [(id i64)] (-> bool)
+  (or (= id 16) (= id 18) (= id 28)))
+
+;;; Give the actions that ask a question their answer, TEXT, which isn't empty. What's
+;;; wrong with it is returned, or nil when it was taken.
+(defn answer! [(id i64) (text (ptr i8))] (-> (ptr i8))
   (let [s (shell)
         model (.model s)
-        text
-          (msg (ptr i8)
-               input
-               (sel c"stringByTrimmingCharactersInSet:")
-               [(ptr i8)]
-               (msg (ptr i8)
-                    (class c"NSCharacterSet")
-                    (sel c"whitespaceAndNewlineCharacterSet")
-                    []))
-        (mut invalid-directory) false]
+        (mut problem) (nil)]
+    (cond (and (answer-needs-project? id) (< (.selected s) 0))
+            (set! problem (ns c"Create or show a project first"))
+          (= id 15)
+            (do
+              (add-project-view! (projects/new-project! model text))
+              (do))
+          (= id 16) (do (storage/put! (record (.selected s)) c"name" text) (do))
+          (= id 18)
+            (let [path (existing-directory text)]
+              (if (!= (p/cast i64 path) 0)
+                  (do
+                    (storage/put! (record (.selected s)) c"directory" path)
+                    (release (.directory (current)))
+                    (set! (.directory (current))
+                          (msg (ptr i8) path (sel c"retain") []))
+                    (do))
+                  (set! problem
+                        (ns c"Directory does not exist; enter a directory"))))
+          (= id 20) (projects/new-profile! model text)
+          (= id 28)
+            (do
+              (canvas/add-widget-visible! (current) text)
+              (do))
+          (= id 32) (set! problem (open-diff-wall! text (nil) false))
+          (= id 21)
+            (do (storage/put! (projects/profile model) c"name" text) (do))
+          :else (do))
+    (sync-selection!)
+    (load problem)))
+
+(defn trimmed [(input (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       input
+       (sel c"stringByTrimmingCharactersInSet:")
+       [(ptr i8)]
+       (msg (ptr i8)
+            (class c"NSCharacterSet")
+            (sel c"whitespaceAndNewlineCharacterSet")
+            [])))
+
+(defn submit! [(id i64) (input (ptr i8))] (-> void)
+  (let [text (trimmed input)]
     (if (= (msg u64 text (sel c"length") []) 0)
         (palette/prompt! id c"Please enter a nonempty value" c"")
+        (let [problem (answer! id text)]
+          (when (!= (p/cast i64 problem) 0)
+            (palette/prompt! id (utf8 problem) (utf8 text))
+            0)
+          (do)))))
+
+;;; ---- jimc -------------------------------------------------------------------------
+
+;;; What `jimc` can ask for, one request at a time from the main loop. A command returns
+;;; what's wrong as an NSString, or nil after adding its reply's members to OUT. None of
+;;; them activates the app, and only those asked to switch project or focus a pane move
+;;; the keyboard, so a script never pulls it out from under someone typing.
+(extern getpid :cc (cc/C) [] (-> i32))
+
+(defn remote-cell [] (-> (ptr (ptr remote/Server)))
+  (p/alloc-static (ptr remote/Server)))
+
+(defn remote-start! [] (-> void)
+  (msg i8
+       (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+       (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+       [(ptr i8) i8 (ptr i8) (ptr i8)]
+       (msg (ptr i8)
+            (ns c"~/.jim-coil")
+            (sel c"stringByExpandingTildeInPath")
+            [])
+       (: 1 i8)
+       (nil)
+       (nil))
+  (let [server
+          (remote/listen! (utf8 (msg (ptr i8)
+                                     (ns c"~/.jim-coil/control/socket")
+                                     (sel c"stringByExpandingTildeInPath")
+                                     [])))]
+    (store! (remote-cell) server)
+    (if (= (p/cast i64 server) 0)
+        (do (printf c"Jim: jimc has no socket; see the session log\n") (do))
+        (remote/watch! server
+                       (p/cast (ptr i8) (fnptr-of widget-view/wake-main))))))
+
+(defn remote-stop! [] (-> void)
+  (when (!= (p/cast i64 (load (remote-cell))) 0)
+    (remote/close! (load (remote-cell)))
+    (store! (remote-cell) (p/cast (ptr remote/Server) 0))
+    (do)))
+
+(defn joined [(start (ptr i8)) (end (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (ns start) (sel c"stringByAppendingString:") [(ptr i8)] end))
+
+(defn request-string [(r (ptr kit-json/Reply)) (key (slice u8))] (-> (ptr i8))
+  (let [(mut bytes) (al/ArrayList::new [u8] (alloc/malloc-allocator))
+        found
+          (kit-json/string-into! r
+                                 (kit-json/get r (kit-json/root r) key)
+                                 (mut bytes))
+        value (if found (widget-view/string (slice bytes)) (nil))]
+    (al/ArrayList::free! (mut bytes))
+    value))
+
+(defn request-i64 [(r (ptr kit-json/Reply)) (key (slice u8)) (default i64)]
+  (-> i64)
+  (kit-json/field-i64 r (kit-json/root r) key default))
+
+(defn request-has? [(r (ptr kit-json/Reply)) (key (slice u8))] (-> bool)
+  (>= (kit-json/get r (kit-json/root r) key) 0))
+
+(defn request-flag? [(r (ptr kit-json/Reply)) (key (slice u8))] (-> bool)
+  (kit-json/field-bool r (kit-json/root r) key false))
+
+(defn same-string? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (!= (msg i8 a (sel c"isEqualToString:") [(ptr i8)] b) (: 0 i8)))
+
+(defn push-string-field! [(out (ptr (al/ArrayList u8)))
+                          (key (slice u8))
+                          (value (ptr i8))] (-> void)
+  (wire/field-string! out key (widget-view/string-bytes value)))
+
+;;; The project called WANTED, or with that id when no name matches, as an index: -1
+;;; when there is none and -2 when several have the name.
+(defn project-called [(wanted (ptr i8))] (-> i64)
+  (let [(mut found) -1
+        (mut named) 0]
+    (for [i 0 (count)]
+      (when (same-string? (storage/get (record i) c"name") wanted)
+        (set! found i)
+        (set! named (+ (load named) 1))))
+    (when (= (load named) 0)
+      (for [i 0 (count)]
+        (when (same-string? (indexed-string c"" (.id (runtime i)) c"") wanted)
+          (set! found i))))
+    (if (> (load named) 1) -2 (load found))))
+
+;;; The index of the project the request names, or else the selected one. When there is
+;;; none, -1 with the reason in PROBLEM.
+(defn target-project [(r (ptr kit-json/Reply)) (problem (ptr (ptr i8)))]
+  (-> i64)
+  (let [wanted (request-string r "project")]
+    (if (= (p/cast i64 wanted) 0)
         (do
-          (cond (= id 15)
+          (when (< (.selected (shell)) 0)
+            (set! problem (ns c"No project is selected; pass --project")))
+          (.selected (shell)))
+        (let [index (project-called wanted)]
+          (cond (= index -2)
                   (do
-                    (add-project-view! (projects/new-project! model text))
-                    (do))
-                (= id 16)
-                  (do (storage/put! (record (.selected s)) c"name" text) (do))
-                (= id 18)
-                  (let [path
-                          (msg (ptr i8)
-                               text
-                               (sel c"stringByExpandingTildeInPath")
-                               [])
-                        manager
-                          (msg (ptr i8)
-                               (class c"NSFileManager")
-                               (sel c"defaultManager")
-                               [])
-                        directory (p/alloc-stack i8)]
-                    (if (and (!= (msg i8
-                                      manager
-                                      (sel c"fileExistsAtPath:isDirectory:")
-                                      [(ptr i8) (ptr i8)]
-                                      path
-                                      directory)
-                                 (: 0 i8))
-                             (!= (load directory) (: 0 i8)))
-                        (do
-                          (storage/put! (record (.selected s))
-                                        c"directory"
-                                        path)
-                          (release (.directory (current)))
-                          (set! (.directory (current))
-                                (msg (ptr i8) path (sel c"retain") []))
-                          (do))
-                        (do (set! invalid-directory true) (do))))
-                (= id 20) (projects/new-profile! model text)
-                (= id 28)
+                    (set! problem
+                          (joined c"Several projects are named " wanted))
+                    -1)
+                (= index -1)
                   (do
-                    (canvas/add-widget-visible! (current) text)
-                    (do))
-                (= id 21)
-                  (do (storage/put! (projects/profile model) c"name" text) (do))
-                :else (do))
-          (sync-selection!)
-          (when (load invalid-directory)
-            (palette/prompt! 18
-                             c"Directory does not exist; enter a directory"
-                             (utf8 text)))))))
+                    (set! problem (joined c"No project is called " wanted))
+                    -1)
+                :else index)))))
+
+;;; The pane the request's "pane" names in project INDEX, or null with the reason in
+;;; PROBLEM.
+(defn target-pane [(r (ptr kit-json/Reply))
+                   (index i64)
+                   (problem (ptr (ptr i8)))] (-> (ptr canvas/Pane))
+  (let [id (request-i64 r "pane" -1)
+        v (canvas/pane-with-id (project index) id)]
+    (when (= (p/cast i64 v) 0)
+      (set! problem
+            (indexed-string c"No pane "
+                            id
+                            c" in that project; see jimc pane list")))
+    v))
+
+(defn push-project-members! [(out (ptr (al/ArrayList u8))) (index i64)]
+  (-> void)
+  (let [s (shell)
+        id (.id (runtime index))]
+    (wire/field-i64! out "id" id)
+    (push-string-field! out "name" (storage/get (record index) c"name"))
+    (push-string-field! out
+                        "directory"
+                        (storage/get (record index) c"directory"))
+    (wire/field-bool! out "active" (= index (.selected s)))
+    (wire/field-bool! out
+                      "hidden"
+                      (projects/hidden? (projects/profile (.model s)) id))
+    (wire/field-i64! out "panes" (canvas/count (project index)))))
+
+(defn index-of-project [(id i64)] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (count)]
+      (when (= (.id (runtime i)) id) (set! found i)))
+    (load found)))
+
+;;; One pane's object, as a member called NAME, or an array element when that's "".
+(defn push-pane! [(out (ptr (al/ArrayList u8)))
+                  (name (slice u8))
+                  (c (ptr canvas/Canvas))
+                  (v (ptr canvas/Pane))] (-> void)
+  (let [bounds (.bounds v)]
+    (wire/open-object! out name)
+    (wire/field-i64! out "id" (.id v))
+    (wire/field-string! out "kind" (if (canvas/widget? v) "widget" "terminal"))
+    (push-string-field! out
+                        "title"
+                        (msg (ptr i8) (.title v) (sel c"stringValue") []))
+    (if (canvas/widget? v)
+        (push-string-field! out "spec" (widget-view/spec-string (.widget v)))
+        (let [t (canvas/term-of v)]
+          (when (!= (p/cast i64 (.session-id t)) 0)
+            (push-string-field! out "session" (.session-id t)))
+          (push-string-field! out "directory" (.directory t))
+          (wire/field-bool! out "alive" (!= (p/cast i64 (.surface t)) 0))))
+    (wire/field-i64! out "x" (p/cast i64 (.x bounds)))
+    (wire/field-i64! out "y" (p/cast i64 (.y bounds)))
+    (wire/field-i64! out "w" (p/cast i64 (.w bounds)))
+    (wire/field-i64! out "h" (p/cast i64 (.h bounds)))
+    (wire/field-bool! out
+                      "focused"
+                      (= (p/cast i64 (.focused c)) (p/cast i64 v)))
+    (wire/field-bool! out "pinned" (.pinned v))
+    (wire/close-object! out)))
+
+;;; Where the request asks a pane to go, or else where a new one of this size goes.
+(defn requested-bounds [(r (ptr kit-json/Reply))
+                        (c (ptr canvas/Canvas))
+                        (w f64)
+                        (h f64)] (-> Rect)
+  (if (request-has? r "x")
+      (canvas/storable (p/cast f64 (request-i64 r "x" 0))
+                       (p/cast f64 (request-i64 r "y" 0))
+                       (p/cast f64 (request-i64 r "w" (p/cast i64 w)))
+                       (p/cast f64 (request-i64 r "h" (p/cast i64 h))))
+      (canvas/next-bounds c w h)))
+
+;;; After a project was added: show what the model now selects, without leaving the cube
+;;; if that's what is on screen and the selection didn't change.
+(defn selection-changed! [(switched bool)] (-> void)
+  (if (and (not switched) (.overview (shell)))
+      (do (layout!) (save-layout!) (do))
+      (sync-selection!)))
+
+(defn remote-status! [(out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [s (shell)]
+    (wire/field-i64! out "pid" (p/cast i64 (getpid)))
+    (wire/field-i64! out
+                     "window"
+                     (msg i64 (.window s) (sel c"windowNumber") []))
+    (push-string-field! out
+                        "app"
+                        (msg (ptr i8)
+                             (msg (ptr i8)
+                                  (class c"NSBundle")
+                                  (sel c"mainBundle")
+                                  [])
+                             (sel c"bundlePath")
+                             []))
+    (wire/field-i64! out "projects" (count))
+    (when (>= (.selected s) 0)
+      (wire/field-i64! out "project" (.id (runtime (.selected s)))))
+    (wire/field-bool! out "overview" (.overview s))
+    (nil)))
+
+(defn remote-list-projects! [(out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (wire/open-array! out "projects")
+  (for [i 0 (count)]
+    (wire/open-object! out "")
+    (push-project-members! out i)
+    (wire/close-object! out))
+  (wire/close-array! out)
+  (nil))
+
+(defn remote-new-project! [(r (ptr kit-json/Reply))
+                           (out (ptr (al/ArrayList u8)))]
+  (-> (ptr i8))
+  (let [s (shell)
+        model (.model s)
+        name (request-string r "name")
+        wanted-directory (request-string r "directory")
+        directory
+          (if (= (p/cast i64 wanted-directory) 0)
+              (nil)
+              (existing-directory wanted-directory))
+        background (request-flag? r "background")
+        before (projects/active model)]
+    (cond (or (= (p/cast i64 name) 0)
+              (= (msg u64 (trimmed name) (sel c"length") []) (: 0 u64)))
+            (ns c"A project needs a name")
+          (project-named? name) (joined c"A project is already called " name)
+          (and (!= (p/cast i64 wanted-directory) 0)
+               (= (p/cast i64 directory) 0))
+            (joined c"No such directory: " wanted-directory)
+          :else
+            (let [created (projects/new-project! model name)
+                  id (projects/id created)]
+              (when (!= (p/cast i64 directory) 0)
+                (storage/put! created c"directory" directory)
+                0)
+              (add-project-view! created)
+              (when background (projects/select! model before))
+              (selection-changed! (not background))
+              (wire/open-object! out "project")
+              (push-project-members! out (index-of-project id))
+              (wire/close-object! out)
+              (nil)))))
+
+(defn remote-activate-project! [(r (ptr kit-json/Reply))
+                                (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        model (.model (shell))]
+    (when (>= index 0)
+      (let [id (.id (runtime index))]
+        (when (projects/hidden? (projects/profile model) id)
+          (projects/hide! model id false))
+        (projects/select! model id)
+        (sync-selection!)
+        (wire/open-object! out "project")
+        (push-project-members! out (index-of-project id))
+        (wire/close-object! out)))
+    (load problem)))
+
+(defn remote-set-directory! [(r (ptr kit-json/Reply))
+                             (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        wanted (request-string r "directory")
+        path (if (= (p/cast i64 wanted) 0) (nil) (existing-directory wanted))]
+    (cond (< index 0) (load problem)
+          (= (p/cast i64 wanted) 0) (ns c"No directory given")
+          (= (p/cast i64 path) 0) (joined c"No such directory: " wanted)
+          :else
+            (let [c (project index)]
+              (storage/put! (record index) c"directory" path)
+              (release (.directory c))
+              (set! (.directory c) (msg (ptr i8) path (sel c"retain") []))
+              (save-layout!)
+              (push-string-field! out "directory" path)
+              (nil)))))
+
+;;; Deleting ends the project's terminals, so it must be named: never "the current one".
+(defn remote-delete-project! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        wanted (request-string r "project")
+        index (target-project r (mut problem))]
+    (cond (= (p/cast i64 wanted) 0) (ns c"Name the project to delete")
+          (< index 0) (load problem)
+          :else (do (delete-project! (.id (runtime index))) (nil)))))
+
+(defn remote-list-panes! [(r (ptr kit-json/Reply))
+                          (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))]
+    (when (>= index 0)
+      (let [c (project index)]
+        (wire/field-i64! out "project" (.id (runtime index)))
+        (wire/open-array! out "panes")
+        (for [i 0 (canvas/count c)]
+          (push-pane! out "" c (canvas/pane c i)))
+        (wire/close-array! out)))
+    (load problem)))
+
+(defn remote-focus-pane! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        v
+          (if (>= index 0)
+              (target-pane r index (mut problem))
+              (p/cast (ptr canvas/Pane) 0))]
+    (cond (= (p/cast i64 v) 0) (do)
+          (.pinned v)
+            (set! problem
+                  (ns c"That pane is pinned to the background, which takes no keyboard; unpin it first"))
+          :else
+            (do
+              (when (!= index (.selected (shell)))
+                (projects/select! (.model (shell)) (.id (runtime index)))
+                (sync-selection!))
+              (canvas/reveal! (project index) v)))
+    (load problem)))
+
+(defn remote-move-pane! [(r (ptr kit-json/Reply)) (out (ptr (al/ArrayList u8)))]
+  (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        v
+          (if (>= index 0)
+              (target-pane r index (mut problem))
+              (p/cast (ptr canvas/Pane) 0))]
+    (when (!= (p/cast i64 v) 0)
+      (cond (not (and (request-has? r "x") (request-has? r "y")))
+              (set! problem (ns c"Moving a pane needs x and y"))
+            :else
+              (let [c (project index)
+                    now (.bounds v)]
+                (canvas/place-pane! c
+                                    v
+                                    (requested-bounds r c (.w now) (.h now)))
+                (push-pane! out "pane" c v))))
+    (load problem)))
+
+(defn remote-pin-pane! [(r (ptr kit-json/Reply))
+                        (out (ptr (al/ArrayList u8)))
+                        (pinned bool)] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        v
+          (if (>= index 0)
+              (target-pane r index (mut problem))
+              (p/cast (ptr canvas/Pane) 0))]
+    (when (!= (p/cast i64 v) 0)
+      (if pinned
+          (canvas/pin! (project index) v)
+          (canvas/unpin! (project index) v))
+      (push-pane! out "pane" (project index) v))
+    (load problem)))
+
+(defn remote-move-pane-to-project! [(r (ptr kit-json/Reply))
+                                    (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        v
+          (if (>= index 0)
+              (target-pane r index (mut problem))
+              (p/cast (ptr canvas/Pane) 0))
+        wanted (request-string r "to")]
+    (when (!= (p/cast i64 v) 0)
+      (if (= (p/cast i64 wanted) 0)
+          (set! problem (ns c"Moving a pane to a project needs \"to\""))
+          (let [to (project-called wanted)]
+            (cond (= to -2)
+                    (set! problem
+                          (joined c"Several projects are named " wanted))
+                  (= to -1)
+                    (set! problem (joined c"No project is called " wanted))
+                  (= to index)
+                    (set! problem (ns c"The pane is already in that project"))
+                  :else
+                    (do
+                      (move-pane! index v to)
+                      (wire/field-i64! out "project" (.id (runtime to)))
+                      (push-pane! out "pane" (project to) v))))))
+    (load problem)))
+
+(defn remote-close-pane! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        v
+          (if (>= index 0)
+              (target-pane r index (mut problem))
+              (p/cast (ptr canvas/Pane) 0))]
+    (when (!= (p/cast i64 v) 0)
+      (canvas/close! (project index) v)
+      (set! (.dirty (project index)) true))
+    (load problem)))
+
+(defn remote-new-terminal! [(r (ptr kit-json/Reply))
+                            (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        wanted (request-string r "directory")
+        path (if (= (p/cast i64 wanted) 0) (nil) (existing-directory wanted))]
+    (cond (< index 0) (load problem)
+          (and (!= (p/cast i64 wanted) 0) (= (p/cast i64 path) 0))
+            (joined c"No such directory: " wanted)
+          :else
+            (let [c (project index)
+                  v
+                    (canvas/add-terminal-behind! c
+                                                 (requested-bounds r
+                                                                   c
+                                                                   640.0
+                                                                   430.0)
+                                                 (if (= (p/cast i64 path) 0)
+                                                     (.directory c)
+                                                     path))]
+              (push-pane! out "pane" c v)
+              (nil)))))
+
+;;; The terminal the request's "pane" names, or null with the reason in PROBLEM.
+(defn target-terminal [(r (ptr kit-json/Reply)) (problem (ptr (ptr i8)))]
+  (-> (ptr terminal/Terminal))
+  (let [index (target-project r problem)
+        v
+          (if (>= index 0)
+              (target-pane r index problem)
+              (p/cast (ptr canvas/Pane) 0))]
+    (cond (= (p/cast i64 v) 0) (p/cast (ptr terminal/Terminal) 0)
+          (canvas/widget? v)
+            (do
+              (set! problem (ns c"That pane is a widget, not a terminal"))
+              (p/cast (ptr terminal/Terminal) 0))
+          :else (canvas/term-of v))))
+
+(defn remote-send-text! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        t (target-terminal r (mut problem))
+        text (request-string r "text")]
+    (cond (= (p/cast i64 t) 0) (load problem)
+          (= (p/cast i64 text) 0) (ns c"No text given")
+          (terminal/type-text! t (utf8 text) (request-flag? r "enter")) (nil)
+          :else (ns c"That terminal has no live session"))))
+
+(defn remote-scroll-terminal! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        t (target-terminal r (mut problem))]
+    (cond (= (p/cast i64 t) 0) (load problem)
+          (not (request-has? r "lines")) (ns c"No lines given")
+          (terminal/wheel! t (request-i64 r "lines" 0)) (nil)
+          :else (ns c"That terminal has no live session"))))
+
+(defn remote-read-terminal! [(r (ptr kit-json/Reply))
+                             (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        t (target-terminal r (mut problem))]
+    (when (!= (p/cast i64 t) 0)
+      (push-string-field! out "text" (terminal/visible-text t)))
+    (load problem)))
+
+(defn remote-list-widgets! [(out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [names
+          (msg (ptr i8)
+               (msg (ptr i8)
+                    (msg (ptr i8)
+                         (class c"NSFileManager")
+                         (sel c"defaultManager")
+                         [])
+                    (sel c"contentsOfDirectoryAtPath:error:")
+                    [(ptr i8) (ptr i8)]
+                    (ns c"widgets")
+                    (nil))
+               (sel c"sortedArrayUsingSelector:")
+               [(ptr i8)]
+               (sel c"compare:"))]
+    (wire/open-array! out "widgets")
+    (for [i 0 (storage/count names)]
+      (let [file (storage/at names i)]
+        (when (!= (msg i8 file (sel c"hasSuffix:") [(ptr i8)] (ns c".coil"))
+                  (: 0 i8))
+          (wire/comma! out)
+          (wire/push-string! out
+                             (widget-view/string-bytes (msg (ptr i8)
+                                                            file
+                                                            (sel c"stringByDeletingPathExtension")
+                                                            []))))))
+    (wire/close-array! out)
+    (nil)))
+
+;;; Whether SPEC's first word is a widget Jim has, which a pane would otherwise only say
+;;; once it is open.
+(defn known-widget? [(spec (ptr i8))] (-> bool)
+  (let [name (widget-view/spec-name (widget-view/string-bytes spec))
+        path
+          (joined c"widgets/"
+                  (msg (ptr i8)
+                       (widget-view/string name)
+                       (sel c"stringByAppendingPathExtension:")
+                       [(ptr i8)]
+                       (ns c"coil")))]
+    (and (> (len name) 0)
+         (not (text/contains? name "/"))
+         (!= (msg i8
+                  (msg (ptr i8)
+                       (class c"NSFileManager")
+                       (sel c"defaultManager")
+                       [])
+                  (sel c"fileExistsAtPath:")
+                  [(ptr i8)]
+                  path)
+             (: 0 i8)))))
+
+(defn remote-open-widget! [(r (ptr kit-json/Reply))
+                           (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))
+        spec (request-string r "spec")]
+    (cond (< index 0) (load problem)
+          (= (p/cast i64 spec) 0) (ns c"No widget given")
+          (not (known-widget? spec))
+            (joined c"No such widget; see jimc widget list: " spec)
+          :else
+            (let [c (project index)
+                  v
+                    (canvas/add-widget-behind! c
+                                               (requested-bounds r
+                                                                 c
+                                                                 760.0
+                                                                 600.0)
+                                               spec)]
+              (canvas/project! c)
+              (push-pane! out "pane" c v)
+              (nil)))))
+
+(defn remote-diff-wall! [(r (ptr kit-json/Reply)) (out (ptr (al/ArrayList u8)))]
+  (-> (ptr i8))
+  (let [model (.model (shell))
+        before (projects/active model)
+        spec (request-string r "spec")
+        background (request-flag? r "background")
+        problem
+          (open-diff-wall! (if (= (p/cast i64 spec) 0) (ns c"working") spec)
+                           (request-string r "directory")
+                           background)]
+    (when (= (p/cast i64 problem) 0)
+      (let [created (projects/active model)]
+        (when background (projects/select! model before))
+        (selection-changed! (not background))
+        (wire/open-object! out "project")
+        (push-project-members! out (index-of-project created))
+        (wire/close-object! out)))
+    problem))
+
+(defn remote-fit-canvas! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [(mut problem) (nil)
+        index (target-project r (mut problem))]
+    (when (>= index 0) (canvas/fit! (project index)))
+    (load problem)))
+
+(defn remote-list-actions! [(out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (wire/open-array! out "actions")
+  (for [i 0 (actions/count)]
+    (wire/open-object! out "")
+    (wire/field-i64! out "id" i)
+    (push-string-field! out "title" (ns (actions/title i)))
+    (let [shortcut (actions/shortcut i)]
+      (when (!= (p/cast i64 shortcut) 0)
+        (push-string-field! out "shortcut" (ns shortcut))))
+    (wire/close-object! out))
+  (wire/close-array! out)
+  (nil))
+
+;;; The action whose title is NAME, ignoring case, or -1.
+(defn action-called [(name (ptr i8))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (actions/count)]
+      (when (and (< (load found) 0)
+                 (= (msg i64
+                         (ns (actions/title i))
+                         (sel c"caseInsensitiveCompare:")
+                         [(ptr i8)]
+                         name)
+                    0))
+        (set! found i)))
+    (load found)))
+
+;;; The actions that ask a question before they act, which `action run` can answer.
+(defn action-answerable? [(id i64)] (-> bool)
+  (or (= id 15)
+      (= id 16)
+      (= id 18)
+      (= id 20)
+      (= id 21)
+      (= id 28)
+      (= id 32)))
+
+(defn remote-run-action! [(r (ptr kit-json/Reply))
+                          (out (ptr (al/ArrayList u8)))] (-> (ptr i8))
+  (let [name (request-string r "name")
+        answer (request-string r "answer")
+        id
+          (if (= (p/cast i64 name) 0)
+              (request-i64 r "id" -1)
+              (action-called name))]
+    (cond (or (< id 0) (>= id (actions/count)))
+            (ns c"No such action; see jimc action list")
+          (= (p/cast i64 answer) 0)
+            (do
+              (invoke! id)
+              (wire/field-bool! out "prompted" (palette/open?))
+              (nil))
+          (not (action-answerable? id)) (ns c"That action takes no answer")
+          (= (msg u64 (trimmed answer) (sel c"length") []) (: 0 u64))
+            (ns c"The answer is empty")
+          :else (answer! id (trimmed answer)))))
+
+(defn remote-message! [(r (ptr kit-json/Reply))] (-> (ptr i8))
+  (let [topic (request-string r "topic")
+        body (request-string r "body")]
+    (if (= (p/cast i64 topic) 0)
+        (ns c"No topic given")
+        (do
+          (widget-view/broadcast! (p/cast (ptr widget-view/WidgetPane) 0)
+                                  (widget-view/string-bytes topic)
+                                  (if (= (p/cast i64 body) 0)
+                                      ""
+                                      (widget-view/string-bytes body)))
+          (nil)))))
+
+(defn action-is? [(action (ptr i8)) (name (ptr i8))] (-> bool)
+  (same-string? action (ns name)))
+
+(defn remote-dispatch [(r (ptr kit-json/Reply)) (out (ptr (al/ArrayList u8)))]
+  (-> (ptr i8))
+  (if (not (.ok r))
+      (ns c"The request is not valid JSON")
+      (let [action (request-string r "action")]
+        (cond (= (p/cast i64 action) 0) (ns c"The request has no action")
+              (action-is? action c"status") (remote-status! out)
+              (action-is? action c"list_projects") (remote-list-projects! out)
+              (action-is? action c"new_project") (remote-new-project! r out)
+              (action-is? action c"activate_project")
+                (remote-activate-project! r out)
+              (action-is? action c"set_project_directory")
+                (remote-set-directory! r out)
+              (action-is? action c"delete_project") (remote-delete-project! r)
+              (action-is? action c"list_panes") (remote-list-panes! r out)
+              (action-is? action c"focus_pane") (remote-focus-pane! r)
+              (action-is? action c"move_pane") (remote-move-pane! r out)
+              (action-is? action c"close_pane") (remote-close-pane! r)
+              (action-is? action c"pin_pane") (remote-pin-pane! r out true)
+              (action-is? action c"unpin_pane") (remote-pin-pane! r out false)
+              (action-is? action c"move_pane_to_project")
+                (remote-move-pane-to-project! r out)
+              (action-is? action c"new_terminal") (remote-new-terminal! r out)
+              (action-is? action c"send_text") (remote-send-text! r)
+              (action-is? action c"read_terminal") (remote-read-terminal! r out)
+              (action-is? action c"scroll_terminal") (remote-scroll-terminal! r)
+              (action-is? action c"list_widgets") (remote-list-widgets! out)
+              (action-is? action c"open_widget") (remote-open-widget! r out)
+              (action-is? action c"diff_wall") (remote-diff-wall! r out)
+              (action-is? action c"fit_canvas") (remote-fit-canvas! r)
+              (action-is? action c"list_actions") (remote-list-actions! out)
+              (action-is? action c"run_action") (remote-run-action! r out)
+              (action-is? action c"message") (remote-message! r)
+              :else (joined c"Unknown action: " action)))))
+
+(defn remote-serve! [(s (ptr remote/Server)) (c (ptr remote/Connection))]
+  (-> void)
+  (let [(mut r) (kit-json/parse (remote/request c))
+        (mut fields) (al/ArrayList::new [u8] (alloc/malloc-allocator))
+        (mut reply) (al/ArrayList::new [u8] (alloc/malloc-allocator))
+        problem (remote-dispatch (mut r) (mut fields))]
+    (if (= (p/cast i64 problem) 0)
+        (wire/push-success! (mut reply) (slice fields))
+        (wire/push-failure! (mut reply) (widget-view/string-bytes problem)))
+    (remote/answer! s c (slice reply))
+    (al/ArrayList::free! (mut reply))
+    (al/ArrayList::free! (mut fields))
+    (kit-json/free! (mut r))))
+
+(defn remote-tick! [] (-> void)
+  (let [s (load (remote-cell))]
+    (when (and (!= (p/cast i64 s) 0) (remote/due? s))
+      (remote/pump! s (timings/now))
+      (let [(mut c) (remote/take-request! s)]
+        (while (!= (p/cast i64 (load c)) 0)
+          (remote-serve! s (load c))
+          (set! c (remote/take-request! s)))))))
 
 (defn handle! [(event (ptr i8))] (-> bool)
   (let [s (shell)
@@ -1263,6 +2169,8 @@
               (do (dictation/detach!) false)
             (and (= kind 5) (or (< (.selected s) 0) (.overview s)))
               (do (canvas/clear-resize-cursor!) false)
+            (and (>= (.selected s) 0) (not (.overview s)) (pane-menu! event))
+              true
             (and (>= (.selected s) 0)
                  (not (.overview s))
                  (canvas/handle! (current) event))
@@ -1724,6 +2632,7 @@
             :else
               (let [s (shell)]
                 (do
+                  (remote-start!)
                   (while (and (.running s)
                               (!= (msg i8 (.window s) (sel c"isVisible") [])
                                   (: 0 i8)))
@@ -1762,6 +2671,7 @@
                             (if (>= action 0) (invoke! action) (do)))
                           (let [action (sidebar/take-action!)]
                             (if (!= action -1) (invoke! action) (do)))
+                          (apply-pane-menu! (pane-menu/take!))
                           (let [dropped (terminal/take-dropped!)]
                             (when (and (!= (p/cast i64 dropped) 0)
                                        (>= (.selected s) 0)
@@ -1776,6 +2686,7 @@
                             (if (>= action 0)
                                 (submit! action (palette/text))
                                 (do)))
+                          (remote-tick!)
                           (timings/record! 0
                                            (* 1000.0
                                               (- (timings/now) input-start)))
@@ -1792,6 +2703,7 @@
                                                (* 1000.0
                                                   (- (timings/now) start)))))
                           (release frame-pool)))))
+                  (remote-stop!)
                   (remember-window-frame!)
                   (save-layout!)
                   (palette/free!)

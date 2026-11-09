@@ -3,6 +3,7 @@
 (import "jim.projects" :as projects)
 (import "jim.storage" :as s)
 (import "jim.controls" :as controls)
+(import "jim.unread" :as unread)
 (import "coil.primitive" :as p)
 
 (defstruct Sidebar
@@ -85,14 +86,27 @@
 (defn row-id [(index i64)] (-> i64)
   (projects/id (s/at (.rows (state)) index)))
 
+;;; The views of a project's row, told apart by their tags.
+(const PART-ROW 0)
+
+(const PART-EYE 1)
+
+(const PART-DELETE 2)
+
+(const PART-COUNT 3)
+
+(const PART-NAME 4)
+
+(const ROW-PARTS 5)
+
 (defn row-tag [(id i64) (part i64)] (-> i64)
-  (+ 100 (+ (* id 3) part)))
+  (+ 100 (+ (* id ROW-PARTS) part)))
 
 (defn tag-id [(tag i64)] (-> i64)
-  (/ (- tag 100) 3))
+  (/ (- tag 100) ROW-PARTS))
 
 (defn tag-part [(tag i64)] (-> i64)
-  (% (- tag 100) 3))
+  (% (- tag 100) ROW-PARTS))
 
 (defn request-delete! [(id i64)] (-> void)
   (do (set! (.delete-project (state)) id) (set! (.pending (state)) 26) (do)))
@@ -107,7 +121,7 @@
 
 (defn reveal-eye! [(id i64) (revealed bool)] (-> void)
   (let [children (msg (ptr i8) (.document (state)) (sel c"subviews") [])
-        wanted (row-tag id 1)]
+        wanted (row-tag id PART-EYE)]
     (do
       (for [i 0 (s/count children)]
         (let [child (s/at children i)]
@@ -169,6 +183,48 @@
                 13.0))
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] b)
       b)))
+
+;;; Show one row's count just left of its eye. A name long enough to reach the count is
+;;; cut short where the count starts, and has its width back once the count is gone.
+(defn show-count! [(count-view (ptr i8))] (-> void)
+  (let [st (state)
+        id (tag-id (msg i64 count-view (sel c"tag") []))
+        n (unread/of (unread/shared) id)
+        name-view
+          (msg (ptr i8)
+               (.document st)
+               (sel c"viewWithTag:")
+               [i64]
+               (row-tag id PART-NAME))
+        full-name-width (- (.width st) 74.0)]
+    (msg i64
+         count-view
+         (sel c"setStringValue:")
+         [(ptr i8)]
+         (if (> n 0) (unread/row-text n) (ns c"")))
+    (let [shown (msg Rect count-view (sel c"frame") [])
+          text (msg Point count-view (sel c"fittingSize") [])
+          width (if (> n 0) (.x text) 0.0)
+          left (- (- (.width st) 49.0) width)
+          room (- (- left 14.0) 4.0)]
+      (frame! count-view (rect left (.y shown) width (.h shown)))
+      (when (!= (p/cast i64 name-view) 0)
+        (let [named (msg Rect name-view (sel c"frame") [])]
+          (frame! name-view
+                  (rect (.x named)
+                        (.y named)
+                        (if (< room full-name-width) room full-name-width)
+                        (.h named))))))))
+
+;;; Bring every row's count up to date. Unlike refresh!, this leaves a rename in progress
+;;; alone, so a bell ringing elsewhere cannot take the field away while it is being typed in.
+(defn show-counts! [] (-> void)
+  (let [children (msg (ptr i8) (.document (state)) (sel c"subviews") [])]
+    (for [i 0 (s/count children)]
+      (let [child (s/at children i)
+            tag (msg i64 child (sel c"tag") [])]
+        (when (and (>= tag 100) (= (tag-part tag) PART-COUNT))
+          (show-count! child))))))
 
 (defn refresh! [] (-> void)
   (let [st (state)
@@ -241,19 +297,24 @@
                      b
                      (sel c"setTag:")
                      [i64]
-                     (row-tag (projects/id record) 0))
+                     (row-tag (projects/id record) PART-ROW))
                 (msg i64
                      b
                      (sel c"setToolTip:")
                      [(ptr i8)]
                      (s/get record c"directory"))
-                (if (!= title (nil))
-                    (msg i64
-                         title
-                         (sel c"setAlphaValue:")
-                         [f64]
-                         (if hidden 0.5 1.0))
-                    0)
+                (when (!= title (nil))
+                  (msg i64
+                       title
+                       (sel c"setAlphaValue:")
+                       [f64]
+                       (if hidden 0.5 1.0))
+                  (msg i64
+                       title
+                       (sel c"setTag:")
+                       [i64]
+                       (row-tag (projects/id record) PART-NAME))
+                  0)
                 (controls/select! b active)
                 (if (= (.renaming st) (projects/id record))
                     (let [field
@@ -340,7 +401,7 @@
                          eye
                          (sel c"setTag:")
                          [i64]
-                         (row-tag (projects/id record) 1))
+                         (row-tag (projects/id record) PART-EYE))
                     (controls/transparent! eye)
                     (msg i64
                          eye
@@ -351,13 +412,29 @@
                          delete
                          (sel c"setTag:")
                          [i64]
-                         (row-tag (projects/id record) 2))
+                         (row-tag (projects/id record) PART-DELETE))
                     (msg i64
                          delete
                          (sel c"setToolTip:")
                          [(ptr i8)]
                          (ns c"Delete project"))
-                    (controls/transparent! delete))))))
+                    (controls/transparent! delete)))
+                (let [count-view
+                        (label (.document st)
+                               c""
+                               (rect 0.0 (+ bottom 4.0) 0.0 20.0)
+                               13.0
+                               false)]
+                  (msg i64
+                       count-view
+                       (sel c"setTag:")
+                       [i64]
+                       (row-tag (projects/id record) PART-COUNT))
+                  (msg i64
+                       count-view
+                       (sel c"setTextColor:")
+                       [(ptr i8)]
+                       (color 0.88 0.68 0.31 1.0))))))
           (let [new-project
                   (control (.document st)
                            c""
@@ -386,6 +463,7 @@
                    (ns c"New project"))
               (do new-title (do))
               (do)))))
+      (show-counts!)
       (msg i64
            (.header st)
            (sel c"setStringValue:")
@@ -446,14 +524,15 @@
       (cond (>= tag 100)
               (let [id (tag-id tag)]
                 (do
-                  (cond (= (tag-part tag) 0) (projects/select! (.model st) id)
-                        (= (tag-part tag) 1)
+                  (cond (= (tag-part tag) PART-ROW)
+                          (projects/select! (.model st) id)
+                        (= (tag-part tag) PART-EYE)
                           (projects/hide! (.model st)
                                           id
                                           (not (projects/hidden? (projects/profile (.model st))
                                                                  id)))
                         :else (request-delete! id))
-                  (if (!= (tag-part tag) 2) (set! (.pending st) -2) 0)
+                  (if (!= (tag-part tag) PART-DELETE) (set! (.pending st) -2) 0)
                   (do)))
             (= tag 23)
               (do (set! (.show-hidden st) (not (.show-hidden st))) (refresh!))
@@ -482,7 +561,7 @@
 
 (defn unhovered [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
   (let [tag (msg i64 sender (sel c"tag") [])]
-    (cond (and (>= tag 100) (= (tag-part tag) 0))
+    (cond (and (>= tag 100) (= (tag-part tag) PART-ROW))
             (do (reveal-eye! (tag-id tag) false) (set! (.hovered (state)) 0))
           (= tag 23)
             (do

@@ -48,6 +48,22 @@ Objective-C messaging and animation modules come from the existing Coil GPU UI
 experiment and are maintained in `src/` as Jim modules; see
 [source origins](PROVENANCE.md).
 
+## Pinned panes and the pane menu
+
+A canvas's pane array is its z-order, back to front, and pinned panes are its first
+entries, so no pane is ever raised behind one. A pane's host view is a `JimPaneView`
+whose `hitTest:` answers NSView's, except that a pinned pane returns nil unless the
+point is on a widget element that takes clicks (`widget-view/reacts-at?`) or inside
+one of its text fields. AppKit then routes clicks, scrolls and drops to whatever is
+behind it. The canvas's own gestures skip pinned panes the same way.
+
+`src/pane_menu.coil` builds the pane menu as a native NSMenu with a project submenu.
+What was picked waits for the main loop and names its pane by project and pane id,
+because the pane can close while the menu is open. Moving a pane between projects
+reparents its view onto the other canvas and gives it that canvas's next id. Its
+terminal keeps its session, and both layouts are marked dirty. jimc's `pane pin`,
+`pane unpin` and `pane move-to` do the same things.
+
 ## Session ownership and transport
 
 `src/session/server.coil` is a small per-terminal private service, and
@@ -55,10 +71,27 @@ experiment and are maintained in `src/` as Jim modules; see
 mode-0700 socket directory and peer-UID checks protect its Unix connection. A file
 lock serializes creation of a session UUID. The service owns the PTY child,
 terminal query responses, foreground cwd discovery, and an in-memory journal.
-The launcher uses posix_spawn; the detached service forks the shell before adding
-any renderer threads. Closing the GUI does not signal the child. Explicit close
-sends a control frame, then the service terminates the shell/foreground process
-group and removes its socket. Exited shells remain attachable for inspection.
+The detached service forks the shell before adding any renderer threads. Closing the
+GUI does not signal the child. Explicit close sends a control frame, then the service
+terminates the shell/foreground process group and removes its socket. Exited shells
+remain attachable for inspection.
+
+A force quit, from the Dock, Cmd-Opt-Esc or the low-memory dialog, sends SIGTERM to every
+process in the app's coalition, and a child stays in its parent's coalition however it
+detaches. So the launcher runs as a launchd job, which gives it and the service a coalition
+of their own. `src/session/transport.coil` writes the arguments and environment to a private
+request file, since launchd passes neither, boots a job running `jim-session --launched
+REQUEST`, waits for the launcher's wait status in `REQUEST.status`, and boots the job out.
+The job outlives none of this, and a launch launchd can't do fails rather than falling back
+to a direct spawn. Each service logs its coalition in `service-start`.
+
+macOS attributes a shell's use of protected folders to the service, so the service lives in
+the bundle, at `Contents/MacOS/jim-session`, signed with the app's identity, and shares the
+app's privacy permissions. Unbundled, it is a separate subject, and if it is under
+`~/Documents` it waits on a privacy prompt before `main` runs. `coil run` starts it that way
+from `build/`. The tests run a copy from `/tmp` with a clean environment for the same reason.
+Only the Dock and loginwindow hold the entitlement for a force quit, so no test can run one:
+`tests/session_launch_test.coil` checks the coalition, and a force quit is checked by hand.
 
 The JIM1 protocol has a 12-byte big-endian magic/type/length header and 64-KiB
 payload limit. Attach, input, resize, and kill requests are distinct from output,
@@ -89,6 +122,22 @@ Attaching leaves the terminal's size alone: the client reports only its newest s
 once replay ends, so a running TUI is not resized unless the size really changed.
 Replay is exact for the retained stream, not a model snapshot. Reboot recovery and
 graphics referencing vanished files require further work.
+
+## Asking for attention
+
+A terminal asks for attention by ringing the bell or by sending a desktop notification,
+and Ghostty reports either as a surface action. Each adds to the project's count, unless
+the app is active with that project selected. Being there clears it. A project's count
+shows in its sidebar row, capped at `99+`, and the total of all projects on the Dock icon,
+including projects hidden in the current profile. Counts are not saved, and replayed
+history rings nothing, so a restart starts them at zero. Jim posts no system notifications.
+
+Agents need no event stream of their own for this. Claude Code rings or notifies through
+its `preferredNotifChannel`, and Codex through its `notification_method = "bel"` setting;
+`~/.claude/settings.json` also rings from a `Stop` hook. Unlike original Jim, nothing here
+reads Claude's hook events from `~/.claude/bus.sock`. Those events reach Jim only as the
+bell they ring, so a Claude configured with `notifications_disabled` and no `Stop` hook
+stays silent.
 
 ## Previewing terminal images
 
@@ -156,6 +205,45 @@ service: poll failing, an adopted daemon's connection failing, and being told to
 
 `~/.jim-coil/sessions/events.log` records each lifecycle event with its time and reason.
 A service writes it from the binary it started with, so a running one logs nothing new.
+
+## The diff wall
+
+`widgets/diffwall.coil` lays a diff across a project's canvas, a port of original Jim's
+`jimctl git diff-wall`, whose patch files never changed once written. Here the index pane
+is the only thing that talks to git and `jimctl review`, however many tiles there are. It
+runs one diff, divides it on a worker task (`src/widget_kit/wall.coil`) and writes each
+tile's patch and the threads under `$TMPDIR/jim-diff-wall/ID`, only where the bytes differ.
+It then emits one `diffwall.changed` naming the tiles that changed, so unchanged tiles read
+nothing. A tile is the `diff` widget with its source set to `tile`; it watches nothing and
+spawns only to write a comment.
+
+Those files are a cache. A restart re-runs the diff and rewrites any that are gone, and
+tiles wait until told. Slots live in the index's saved state, which is why a restart opens
+nothing twice and a tile someone closed stays closed.
+
+A wall is only possible because panes of a widget share compiled code. `src/widgets.coil`
+keeps one `Source` per file with the `Generation`s compiled from it, reference counted by
+the widgets running each. One JIT session is hundreds of megabytes, and a wall can have 150
+panes. Panes placed by a widget (`open-widget-at!`) never take the keyboard, and closing a
+pane other than the focused one leaves focus alone, since either can happen mid-comment.
+
+## Control from outside
+
+`jimc` (`src/jimc/main.coil`) spells a command line as one JSON request, sends it and
+prints the reply. It knows nothing else, and links no frameworks. What a request means is
+in `src/main.coil`, under the `jimc` heading, since commands need the shell's state.
+
+`src/remote.coil` serves the socket on the main thread. Original Jim reads requests on
+worker threads and queues them, because a client that never finished could otherwise wedge
+it. Here nothing can block: every socket is non-blocking and a client that goes quiet is
+dropped after five seconds. A command therefore runs between events, in the same place as
+a palette action, and can touch AppKit without a queue or a lock. A `CFFileDescriptor` per
+socket tells the run loop when one is ready, only so it can post the event that ends the
+loop's wait. Without it a request would wait up to 200 ms for the next pass.
+
+The socket's directory must be private to the user, and each connection's peer UID is
+checked as well. Something answering at the path means another app has it, which is left
+alone; a socket file nothing answers on was left by a crash, and is replaced.
 
 ## Dictation
 

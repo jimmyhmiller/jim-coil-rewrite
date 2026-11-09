@@ -1,0 +1,163 @@
+(module jim.pane-menu)
+(import "jim.native" :use *)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+
+;;; The menu a secondary click on a pane opens, after Jim's (`jim-app/src/context_menu.rs`):
+;;; pin or unpin, move to another project, close. It is a native NSMenu, so the project
+;;; list is a real submenu. What was picked is kept until the main loop takes it, and
+;;; names its pane by project and pane id, since the pane may be gone by then.
+
+(const NONE 0)
+
+(const PIN 1)
+
+(const UNPIN 2)
+
+(const CLOSE 3)
+
+(const MOVE 4)
+
+;;; A destination's tag is this plus its place in the menu's list.
+(const MOVE-TAG 16)
+
+;;; What was picked for pane PANE of project PROJECT; for MOVE, DESTINATION is the
+;;; project to move it to.
+(defstruct Choice
+  [(action i64) (project i64) (pane i64) (destination i64)])
+
+;;; A project the pane can move to: its id and its name, an NSString.
+(defstruct Destination [(project i64) (name (ptr i8))])
+
+(defn no-choice [] (-> Choice)
+  (Choice
+    :action NONE
+    :project -1
+    :pane -1
+    :destination -1))
+
+;;; The choice a menu item's TAG stands for, before it is given its pane, when the menu
+;;; offered DESTINATIONS, by project id.
+(defn tag-choice [(tag i64) (destinations (slice i64))] (-> Choice)
+  (cond (and (>= tag MOVE-TAG) (< (- tag MOVE-TAG) (len destinations)))
+          (Choice
+            :action MOVE
+            :project -1
+            :pane -1
+            :destination (get destinations (- tag MOVE-TAG)))
+        (or (= tag PIN) (= tag UNPIN) (= tag CLOSE))
+          (Choice
+            :action tag
+            :project -1
+            :pane -1
+            :destination -1)
+        :else (no-choice)))
+
+(defstruct State
+  [(target (ptr i8))
+   ;; The pane the open menu is for.
+   (project i64)
+   (pane i64)
+   ;; The ids of the projects it offers, in its order.
+   (destinations (al/ArrayList i64))
+   (picked Choice)])
+
+(defn state [] (-> (ptr State))
+  (p/alloc-static State))
+
+(defn picked [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (let [st (state)
+        chosen
+          (tag-choice (msg i64 sender (sel c"tag") [])
+                      (slice (.destinations st)))]
+    (set! (.picked st)
+          (Choice
+            :action (.action chosen)
+            :project (.project st)
+            :pane (.pane st)
+            :destination (.destination chosen)))
+    (do)))
+
+(defn target [] (-> (ptr i8))
+  (let [st (state)]
+    (when (= (p/cast i64 (.target st)) 0)
+      (let [cls
+              (objc_allocateClassPair (class c"NSObject")
+                                      c"JimPaneMenuActions"
+                                      0)]
+        (method! cls c"picked:" (p/cast (ptr i8) (fnptr-of picked)) c"v@:@")
+        (objc_registerClassPair cls)
+        (set! (.target st) (new c"JimPaneMenuActions"))
+        (set! (.destinations st)
+              (al/ArrayList::new [i64] (alloc/malloc-allocator)))))
+    (.target st)))
+
+(defn item! [(menu (ptr i8)) (title (ptr i8)) (tag i64)] (-> (ptr i8))
+  (let [item
+          (msg (ptr i8)
+               menu
+               (sel c"addItemWithTitle:action:keyEquivalent:")
+               [(ptr i8) (ptr i8) (ptr i8)]
+               title
+               (sel c"picked:")
+               (ns c""))]
+    (msg i64 item (sel c"setTarget:") [(ptr i8)] (target))
+    (msg i64 item (sel c"setTag:") [i64] tag)
+    item))
+
+(defn menu [] (-> (ptr i8))
+  (let [m (new c"NSMenu")]
+    (msg i64 m (sel c"setAutoenablesItems:") [i8] (: 0 i8))
+    m))
+
+;;; Open the menu for pane PANE of project PROJECT at mouse EVENT in VIEW. PINNED says
+;;; which of pin and unpin it offers; it offers a move to each of DESTINATIONS, if any.
+(defn show! [(event (ptr i8))
+             (view (ptr i8))
+             (project i64)
+             (pane i64)
+             (pinned bool)
+             (destinations (slice Destination))] (-> void)
+  (let [st (state)
+        m (menu)]
+    (target)
+    (set! (.project st) project)
+    (set! (.pane st) pane)
+    (clear! (mut (.destinations st)))
+    (if pinned
+        (item! m (ns c"Unpin") UNPIN)
+        (item! m (ns c"Pin to background") PIN))
+    (when (> (len destinations) 0)
+      (let [sub (menu)
+            parent (item! m (ns c"Move to project") NONE)]
+        (for [i 0 (len destinations)]
+          (let [d (get destinations i)]
+            (push! (mut (.destinations st)) (.project d))
+            (item! sub (.name d) (+ MOVE-TAG i))))
+        ; A row with a submenu opens it rather than being picked.
+        (msg i64 parent (sel c"setAction:") [(ptr i8)] (nil))
+        (msg i64 m (sel c"setSubmenu:forItem:") [(ptr i8) (ptr i8)] sub parent)
+        (release sub)))
+    (msg i64
+         m
+         (sel c"addItem:")
+         [(ptr i8)]
+         (msg (ptr i8) (class c"NSMenuItem") (sel c"separatorItem") []))
+    (item! m (ns c"Close") CLOSE)
+    (msg i64
+         (class c"NSMenu")
+         (sel c"popUpContextMenu:withEvent:forView:")
+         [(ptr i8) (ptr i8) (ptr i8)]
+         m
+         event
+         view)
+    (release m)
+    (do)))
+
+;;; What was picked since this was last called, or a choice whose action is NONE.
+(defn take! [] (-> Choice)
+  (let [st (state)
+        chosen (.picked st)]
+    (set! (.picked st) (no-choice))
+    chosen))

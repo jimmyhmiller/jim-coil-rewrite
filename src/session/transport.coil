@@ -105,6 +105,22 @@
 
 (extern posix_spawnattr_setflags :cc (cc/C) [(ptr (ptr i8)) i16] (-> i32))
 
+(extern posix_spawn_file_actions_init :cc (cc/C) [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawn_file_actions_destroy :cc (cc/C) [(ptr (ptr i8))] (-> i32))
+
+(extern posix_spawn_file_actions_addopen
+        :cc
+        (cc/C)
+        [(ptr (ptr i8)) i32 (ptr i8) i32 u16]
+        (-> i32))
+
+(extern posix_spawn_file_actions_adddup2
+        :cc
+        (cc/C)
+        [(ptr (ptr i8)) i32 i32]
+        (-> i32))
+
 (extern _NSGetEnviron :cc (cc/C) [] (-> (ptr (ptr (ptr i8)))))
 
 (extern __error :cc (cc/C) [] (-> (ptr i32)))
@@ -410,6 +426,297 @@
 ;;; is gone. Reported as ENOENT, distinct from a service that failed to start.
 (const EXIT-UPSTREAM-GONE 3)
 
+;;; ---- starting a service through launchd ------------------------------------------
+;;; Force quitting an app, from the Dock, Cmd-Opt-Esc or the low-memory dialog, sends
+;;; SIGTERM to every process in its coalition. A child stays in its parent's coalition
+;;; however it detaches, and setsid, a double fork or disclaiming responsibility do not
+;;; change that. launchd gives what it starts a coalition of its own, so a service starts
+;;; as a launchd job. The job lasts only until the service is running, since the service
+;;; then belongs to no one but itself.
+;;;
+;;; launchd carries neither the caller's environment nor the launcher's exit status. So
+;;; the job is `jim-session --launched REQUEST`: REQUEST holds the service's arguments and
+;;; environment, and it leaves the launcher's wait status in REQUEST.status.
+
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+
+(extern unlink :cc (cc/C) [(ptr i8)] (-> i32))
+
+(const O-RDONLY-CLOEXEC 16777216)
+
+;;; O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+(const O-REPLACE-CLOEXEC 16778753)
+
+(const O-WRONLY-NOCTTY 131073)
+
+(const ENAMETOOLONG 63)
+
+;;; How long launchd has to run the launcher, in tries 10 ms apart.
+(const LAUNCH-ATTEMPTS 500)
+
+;;; The jetsam coalition of this process: the unit a force quit ends. Logged by a service,
+;;; since it is what proves a service is out of the app's reach. 20 is
+;;; PROC_PIDCOALITIONINFO, which fills two ids, resource and then jetsam.
+(extern proc_pidinfo :cc (cc/C) [i32 i32 u64 (ptr i8) i32] (-> i32))
+
+(extern getpid :cc (cc/C) [] (-> i32))
+
+(defn coalition-of [(pid i32)] (-> i64)
+  (let [(mut ids) (zeroed (array u64 8))
+        got
+          (proc_pidinfo pid
+                        (: 20 i32)
+                        (: 0 u64)
+                        (p/cast (ptr i8) (mut ids))
+                        (: 64 i32))]
+    (if (>= got (: 16 i32)) (p/cast i64 (load (index (mut ids) 1))) -1)))
+
+(defn own-coalition [] (-> i64)
+  (coalition-of (getpid)))
+
+(defn rename-file [(from (ptr i8)) (to (ptr i8))] (-> i32)
+  (rename from to))
+
+(defn write-all! [(fd i32) (bytes (ptr i8)) (length i64)] (-> bool)
+  (let [(mut done) 0
+        (mut ok) true]
+    (while (and (load ok) (< (load done) length))
+      (let [wrote
+              (write fd
+                     (index bytes (load done))
+                     (p/cast isize (- length (load done))))]
+        (if (> wrote (: 0 isize))
+            (set! done (+ (load done) (p/cast i64 wrote)))
+            (when (or (= wrote (: 0 isize)) (!= (os/errno) EINTR))
+              (set! ok false)))))
+    (load ok)))
+
+;;; S and the NUL that ends it.
+(defn write-string! [(fd i32) (s (ptr i8))] (-> bool)
+  (write-all! fd s (+ (p/cast i64 (strlen s)) 1)))
+
+;;; REQUEST: each argument, an empty string, then each environment entry.
+(defn write-request! [(request (ptr i8)) (argv (ptr (ptr i8)))] (-> bool)
+  (let [fd (open request O-REPLACE-CLOEXEC (: 384 i32))]
+    (if (< fd (: 0 i32))
+        false
+        (let [environment (load (_NSGetEnviron))
+              (mut ok) true
+              (mut i) 0]
+          (while (and (load ok)
+                      (!= (p/cast i64 (load (index argv (load i)))) 0))
+            (set! ok (write-string! fd (load (index argv (load i)))))
+            (set! i (+ (load i) 1)))
+          (when (load ok) (set! ok (write-string! fd c"")))
+          (set! i 0)
+          (while (and (load ok)
+                      (!= (p/cast i64 (load (index environment (load i)))) 0))
+            (set! ok (write-string! fd (load (index environment (load i)))))
+            (set! i (+ (load i) 1)))
+          (close fd)
+          (load ok)))))
+
+;;; S as XML text. A control character has no XML spelling, so it fails.
+(defn write-xml! [(fd i32) (s (ptr i8))] (-> bool)
+  (let [(mut ok) true
+        (mut i) 0
+        length (p/cast i64 (strlen s))]
+    (while (and (load ok) (< (load i) length))
+      (let [c (byte-at s (load i))]
+        (cond (< c (: 32 u8)) (set! ok false)
+              (= c (: 38 u8)) (set! ok (write-all! fd c"&amp;" 5))
+              (= c (: 60 u8)) (set! ok (write-all! fd c"&lt;" 4))
+              (= c (: 62 u8)) (set! ok (write-all! fd c"&gt;" 4))
+              :else (set! ok (write-all! fd (index s (load i)) 1))))
+      (set! i (+ (load i) 1)))
+    (load ok)))
+
+(defn write-text! [(fd i32) (s (ptr i8))] (-> bool)
+  (write-all! fd s (p/cast i64 (strlen s))))
+
+;;; AbandonProcessGroup, or launchd would end what the launcher leaves behind. The
+;;; service sets up its own session, but nothing depends on the order that happens in.
+(defn write-plist! [(plist (ptr i8))
+                    (label (ptr i8))
+                    (executable (ptr i8))
+                    (request (ptr i8))] (-> bool)
+  (let [fd (open plist O-REPLACE-CLOEXEC (: 384 i32))]
+    (if (< fd (: 0 i32))
+        false
+        (let [ok
+                (and (write-text! fd
+                                  c"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>")
+                     (write-xml! fd label)
+                     (write-text! fd
+                                  c"</string>\n<key>ProgramArguments</key><array><string>")
+                     (write-xml! fd executable)
+                     (write-text! fd
+                                  c"</string><string>--launched</string><string>")
+                     (write-xml! fd request)
+                     (write-text! fd
+                                  c"</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><false/>\n<key>AbandonProcessGroup</key><true/>\n<key>ProcessType</key><string>Interactive</string>\n<key>LimitLoadToSessionType</key><string>Aqua</string>\n</dict></plist>\n"))]
+          (close fd)
+          ok))))
+
+;;; Run launchctl VERB FIRST [SECOND]: its wait status, or -1 with errno set. What it
+;;; prints about a failure goes to the event log.
+(defn launchctl! [(verb (ptr i8)) (first (ptr i8)) (second (ptr i8))] (-> i32)
+  (let [(mut attributes) (: (p/cast (ptr i8) 0) (ptr i8))
+        (mut actions) (: (p/cast (ptr i8) 0) (ptr i8))
+        (mut pid) (zeroed i32)
+        (mut status) (zeroed i32)
+        argv (p/alloc-stack (array (ptr i8) 5))
+        log-fd (- (load (log-fd-cell)) (: 1 i32))]
+    (set! (index argv 0) c"/bin/launchctl")
+    (set! (index argv 1) verb)
+    (set! (index argv 2) first)
+    (set! (index argv 3) second)
+    (set! (index argv 4) (p/cast (ptr i8) 0))
+    (if (or (!= (posix_spawnattr_init (mut attributes)) (: 0 i32))
+            (!= (posix_spawn_file_actions_init (mut actions)) (: 0 i32)))
+        (: -1 i32)
+        (do
+          (posix_spawnattr_setflags (mut attributes)
+                                    (p/cast i16 POSIX-SPAWN-CLOEXEC-DEFAULT))
+          (posix_spawn_file_actions_addopen (mut actions)
+                                            (: 0 i32)
+                                            c"/dev/null"
+                                            (: 0 i32)
+                                            (: 0 u16))
+          (posix_spawn_file_actions_addopen (mut actions)
+                                            (: 1 i32)
+                                            c"/dev/null"
+                                            O-WRONLY-NOCTTY
+                                            (: 0 u16))
+          (if (> log-fd (: 2 i32))
+              (posix_spawn_file_actions_adddup2 (mut actions) log-fd (: 2 i32))
+              (posix_spawn_file_actions_addopen (mut actions)
+                                                (: 2 i32)
+                                                c"/dev/null"
+                                                O-WRONLY-NOCTTY
+                                                (: 0 u16)))
+          (let [spawn-error
+                  (posix_spawn (mut pid)
+                               c"/bin/launchctl"
+                               (p/cast (ptr i8) (mut actions))
+                               (p/cast (ptr i8) (mut attributes))
+                               (p/cast (ptr (ptr i8)) argv)
+                               (load (_NSGetEnviron)))]
+            (posix_spawn_file_actions_destroy (mut actions))
+            (posix_spawnattr_destroy (mut attributes))
+            (if (!= spawn-error (: 0 i32))
+                (do (set-errno! spawn-error) (: -1 i32))
+                (do
+                  (while (and (< (waitpid pid (mut status) 0) (: 0 i32))
+                              (= (os/errno) EINTR))
+                    0)
+                  (load status))))))))
+
+;;; The launcher's wait status once it has reported one, or -1.
+(defn launcher-status [(path (ptr i8))] (-> i32)
+  (let [fd (open path O-RDONLY-CLOEXEC)]
+    (if (< fd (: 0 i32))
+        (: -1 i32)
+        (let [(mut status) (zeroed i32)
+              got (read fd (p/cast (ptr i8) (mut status)) (: 4 isize))]
+          (close fd)
+          (if (= got (: 4 isize)) (load status) (: -1 i32))))))
+
+;;; Run the launcher as a launchd job and wait for it: its wait status, or -1 with errno
+;;; set. No path falls back to spawning it directly, which would quietly put the terminal
+;;; back where a force quit ends it.
+(defn launch! [(executable (ptr i8))
+               (path (ptr i8))
+               (cwd (ptr i8))
+               (resources (ptr i8))
+               (upstream (ptr i8))] (-> i32)
+  (if (>= (p/cast i64 (strlen path)) 1000)
+      (do (set-errno! ENAMETOOLONG) (: -1 i32))
+      (let [(mut request-bytes) (zeroed (array i8 1200))
+            (mut plist-bytes) (zeroed (array i8 1200))
+            (mut status-bytes) (zeroed (array i8 1200))
+            (mut label-bytes) (zeroed (array i8 1200))
+            (mut domain-bytes) (zeroed (array i8 64))
+            (mut service-bytes) (zeroed (array i8 1400))
+            request (p/cast (ptr i8) (mut request-bytes))
+            plist (p/cast (ptr i8) (mut plist-bytes))
+            status-path (p/cast (ptr i8) (mut status-bytes))
+            label (p/cast (ptr i8) (mut label-bytes))
+            domain (p/cast (ptr i8) (mut domain-bytes))
+            service (p/cast (ptr i8) (mut service-bytes))
+            slash (strrchr path (: 47 i32))
+            name (if (= (p/cast i64 slash) 0) path (index slash 1))
+            argv (p/alloc-stack (array (ptr i8) 7))
+            adopting (!= (p/cast i64 upstream) 0)
+            first (if adopting 3 1)]
+        (snprintf request (: 1200 u64) c"%s.launch" path)
+        (snprintf plist (: 1200 u64) c"%s.plist" path)
+        (snprintf status-path (: 1200 u64) c"%s.launch.status" path)
+        (snprintf label (: 1200 u64) c"dev.jim.coil.session.%s" name)
+        (snprintf domain (: 64 u64) c"gui/%u" (getuid))
+        (snprintf service (: 1400 u64) c"%s/%s" domain label)
+        (set! (index argv 0) executable)
+        (when adopting
+          (set! (index argv 1) c"--adopt")
+          (set! (index argv 2) upstream))
+        (set! (index argv first) path)
+        (set! (index argv (+ first 1)) cwd)
+        (set! (index argv (+ first 2)) resources)
+        (set! (index argv (+ first 3)) (p/cast (ptr i8) 0))
+        (unlink status-path)
+        (let [result
+                (if (not (and (write-request! request
+                                              (p/cast (ptr (ptr i8)) argv))
+                              (write-plist! plist label executable request)))
+                    (do
+                      (log! c"launch-failed step=write errno=%lld"
+                            (p/cast i64 (os/errno))
+                            0
+                            0
+                            0)
+                      (set-errno! EIO)
+                      (: -1 i32))
+                    (let [(mut loaded) (launchctl! c"bootstrap" domain plist)]
+                      ; A job an interrupted launch left behind holds the label.
+                      (when (!= (load loaded) (: 0 i32))
+                        (launchctl! c"bootout" service (p/cast (ptr i8) 0))
+                        (set! loaded (launchctl! c"bootstrap" domain plist)))
+                      (if (!= (load loaded) (: 0 i32))
+                          (do
+                            (log! c"launch-failed step=bootstrap status=%lld errno=%lld"
+                                  (p/cast i64 (load loaded))
+                                  (p/cast i64 (os/errno))
+                                  0
+                                  0)
+                            (set-errno! EIO)
+                            (: -1 i32))
+                          (let [(mut attempts) 0
+                                (mut status) (launcher-status status-path)
+                                (mut delay)
+                                  (: (Timespec :seconds 0 :nanoseconds 10000000)
+                                     Timespec)]
+                            (while (and (< (load status) (: 0 i32))
+                                        (< (load attempts) LAUNCH-ATTEMPTS))
+                              (nanosleep (p/cast (ptr i8) (mut delay))
+                                         (p/cast (ptr i8) 0))
+                              (set! status (launcher-status status-path))
+                              (set! attempts (+ (load attempts) 1)))
+                            (launchctl! c"bootout" service (p/cast (ptr i8) 0))
+                            (when (< (load status) (: 0 i32))
+                              (log! c"launch-failed step=wait attempts=%lld"
+                                    (load attempts)
+                                    0
+                                    0
+                                    0)
+                              (set-errno! EIO))
+                            (load status)))))
+              saved (os/errno)]
+          (unlink plist)
+          (unlink request)
+          (unlink status-path)
+          (set-errno! (p/cast i32 saved))
+          result))))
+
 (defn session-open [(executable (ptr i8))
                     (path (ptr i8))
                     (cwd (ptr i8))
@@ -435,73 +742,32 @@
         (attach existing)
         (if (and (!= (os/errno) ENOENT) (!= (os/errno) ECONNREFUSED))
             (: -1 i32)
-            (let [(mut attributes) (: (p/cast (ptr i8) 0) (ptr i8))
-                  (mut pid) (zeroed i32)]
-              (if (!= (posix_spawnattr_init (mut attributes)) (: 0 i32))
-                  (: -1 i32)
-                  (let [argv (p/alloc-stack (array (ptr i8) 7))
-                        adopting (!= (p/cast i64 upstream) 0)
-                        first (if adopting 3 1)
-                        (mut status) (zeroed i32)]
-                    (set! (index argv 0) executable)
-                    (when adopting
-                      (set! (index argv 1) c"--adopt")
-                      (set! (index argv 2) upstream))
-                    (set! (index argv first) path)
-                    (set! (index argv (+ first 1)) cwd)
-                    (set! (index argv (+ first 2)) resources)
-                    (set! (index argv (+ first 3)) (p/cast (ptr i8) 0))
-                    (let [flags-error
-                            (posix_spawnattr_setflags (mut attributes)
-                                                      (p/cast i16
-                                                              POSIX-SPAWN-CLOEXEC-DEFAULT))
-                          spawn-error
-                            (if (= flags-error 0)
-                                (posix_spawn (mut pid)
-                                             executable
-                                             (p/cast (ptr i8) 0)
-                                             (p/cast (ptr i8) (mut attributes))
-                                             (p/cast (ptr (ptr i8)) argv)
-                                             (load (_NSGetEnviron)))
-                                flags-error)]
-                      (posix_spawnattr_destroy (mut attributes))
-                      (if (!= spawn-error (: 0 i32))
-                          (do (set-errno! spawn-error) (: -1 i32))
-                          (do
-                            (loop (if (>= (waitpid pid (mut status) 0) 0)
-                                      (break (: 0 i32))
-                                      (if (!= (os/errno) EINTR)
-                                          (break (: 0 i32))
-                                          (: 0 i32))))
-                            (if (and adopting
-                                     (= (load status)
-                                        (p/cast i32 (<< EXIT-UPSTREAM-GONE 8))))
-                                (do (set-errno! ENOENT) (: -1 i32))
-                                (let [(mut attempts) 0
-                                      (mut delay)
-                                        (: (Timespec
-                                             :seconds 0
-                                             :nanoseconds 10000000)
-                                           Timespec)]
-                                  (block
-                                    :connected
-                                      (loop (if (>= (load attempts) 200)
-                                                (break (: 0 i32))
-                                                (let [fd (session-connect path)]
-                                                  (if (>= fd 0)
-                                                      (return-from
-                                                        :connected (attach fd))
-                                                      (do
-                                                        (nanosleep (p/cast (ptr i8)
-                                                                           (mut delay))
-                                                                   (p/cast (ptr i8)
-                                                                           0))
-                                                        (set! attempts
-                                                              (+ (load attempts)
-                                                                 1))))))
-                                        ; Not ENOENT, which means the daemon is gone.
-                                        (set-errno! EIO)
-                                        (: -1 i32)))))))))))))))
+            (let [adopting (!= (p/cast i64 upstream) 0)
+                  status (launch! executable path cwd resources upstream)]
+              (cond (< status (: 0 i32)) (: -1 i32)
+                    (and adopting
+                         (= status (p/cast i32 (<< EXIT-UPSTREAM-GONE 8))))
+                      (do (set-errno! ENOENT) (: -1 i32))
+                    :else
+                      (let [(mut attempts) 0
+                            (mut delay)
+                              (: (Timespec :seconds 0 :nanoseconds 10000000)
+                                 Timespec)]
+                        (block :connected
+                          (loop (if (>= (load attempts) 200)
+                                    (break (: 0 i32))
+                                    (let [fd (session-connect path)]
+                                      (if (>= fd 0)
+                                          (return-from :connected (attach fd))
+                                          (do
+                                            (nanosleep (p/cast (ptr i8)
+                                                               (mut delay))
+                                                       (p/cast (ptr i8) 0))
+                                            (set! attempts
+                                                  (+ (load attempts) 1)))))))
+                          ; Not ENOENT, which means the daemon is gone.
+                          (set-errno! EIO)
+                          (: -1 i32)))))))))
 
 (defn session-kill [(path (ptr i8))] (-> i32)
   (let [fd (session-connect path)]

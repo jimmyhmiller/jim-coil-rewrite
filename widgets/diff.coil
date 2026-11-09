@@ -14,6 +14,7 @@
 (import "jim.widget-kit.diff" :as d)
 (import "jim.widget-kit.git-view" :as gv)
 (import "jim.widget-kit.live" :as live)
+(import "jim.widget-kit.wall" :as wall)
 
 ;;; A code diff / review pane, ported from Jim's diff.ft.
 ;;;
@@ -25,6 +26,11 @@
 ;;; the shared review threads from `jimctl review`: click a line to comment,
 ;;; resolve or reopen threads inline. Only the rows near the viewport are
 ;;; built, so a large diff stays cheap to render and scroll.
+;;;
+;;; A diff wall's tiles are this widget too, opened as "diff tile ID SLOT file|hunk
+;;; BASE-REF" by the wall: one file or hunk, no controls. The wall runs git and
+;;; `jimctl review` once for all of them, leaves each tile's diff and the threads
+;;; in files, and says when they change.
 (const WORKING 0)
 
 (const RANGE 1)
@@ -33,6 +39,8 @@
 
 (const FILE 3)
 
+(const TILE 4)
+
 (const UNIFIED 0)
 
 (const SPLIT 1)
@@ -40,6 +48,8 @@
 ;;; Estimated offset of the first diff row below the pane top (toolbar, file
 ;;; header); the virtualizer only needs to be close.
 (const BODY-TOP 150.0)
+
+(const TILE-BODY-TOP 40.0)
 
 (defstruct Reply
   [(author-at i64) (author-len i64) (body-at i64) (body-len i64)])
@@ -100,7 +110,11 @@
    ;; A diff that arrived while another was being parsed.
    (pending (ArrayList u8))
    (diff-refresh live/Refresher)
-   (review-refresh live/Refresher)])
+   (review-refresh live/Refresher)
+   ;; A tile's wall and place on it, from its arguments.
+   (wall-id i64)
+   (slot (ArrayList u8))
+   (per-hunk bool)])
 
 (defn say! [(s (ptr Diff)) (message (slice u8))] (-> void)
   (text/set-str! (field s status) message))
@@ -112,6 +126,9 @@
 
 (defn now-ms [] (-> i64)
   (try (let [v (try-or! (time/wall-now-ms) 0)] v)))
+
+(defn tile? [(s (ptr Diff))] (-> bool)
+  (= (.source (.state s)) TILE))
 
 ;;; ---- loading ---------------------------------------------------------------
 (defn word [(s (slice u8)) (n i64)] (-> (slice u8))
@@ -130,11 +147,30 @@
       (free! (mut spans))
       result)))
 
+;;; Load this tile's diff, as the wall last left it. Missing means the wall has
+;;; yet to write it (a restart after the temporary directory was cleared) and will
+;;; say when it has.
+(defn load-tile! [(s (ptr Diff))] (-> void)
+  (let [(mut path) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wall/push-patch-path! (mut path)
+                           (.wall-id s)
+                           (text/parse-i64 (slice (.slot s)) -1))
+    (try (let [raw
+                 (try-or! (fs/read-file (alloc/malloc-allocator) (slice path))
+                          (do (say! s "Waiting for the wall…") 0))]
+           (do
+             (load-diff! s raw)
+             (alloc/free [u8] (alloc/malloc-allocator) raw)
+             0)))
+    (free! (mut path))
+    (do)))
+
 (defn run-source! [(s (ptr Diff))] (-> void)
   (live/started! (field s diff-refresh))
   (let [r (repo s)
         arg (text/trim (slice (.arg (.state s))))]
-    (cond (= (.source (.state s)) FILE)
+    (cond (= (.source (.state s)) TILE) (load-tile! s)
+          (= (.source (.state s)) FILE)
             (let [(mut path) (ArrayList::new [u8] (alloc/malloc-allocator))]
               (when (not (text/starts-with? arg "/"))
                 (text/push-str! (mut path) r)
@@ -241,9 +277,26 @@
           (text/push-str! (field s status) " −")
           (text/push-i64! (field s status) (.b t))))))
 
+;;; A tile's threads, as the wall last left them.
+(defn load-tile-reviews! [(s (ptr Diff))] (-> void)
+  (let [(mut path) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (wall/push-reviews-path! (mut path) (.wall-id s))
+    (try (let [raw
+                 (try-or! (fs/read-file (alloc/malloc-allocator) (slice path))
+                          0)]
+           (do
+             (read-threads! s raw)
+             (alloc/free [u8] (alloc/malloc-allocator) raw)
+             0)))
+    (free! (mut path))
+    (do)))
+
 (defn load-reviews! [(s (ptr Diff))] (-> void)
   (live/started! (field s review-refresh))
-  (when (not (proc/running? (field s review-job)))
+  (when (and (tile? s) (not (proc/running? (field s review-job))))
+    (load-tile-reviews! s)
+    0)
+  (when (and (not (tile? s)) (not (proc/running? (field s review-job))))
     (proc/start! (field s review-job)
                  ["jimctl" "review" "list" "--repo" (repo s) "--status" "all"]
                  (repo s)
@@ -317,7 +370,16 @@
     (do)))
 
 (defn base-ref [(s (ptr Diff)) (out (ptr (ArrayList u8)))] (-> void)
-  (cond (= (.source (.state s)) RANGE)
+  (cond (= (.source (.state s)) TILE)
+          (let [arg (text/trim (slice (.arg (.state s))))]
+            ; "ID SLOT file|hunk BASE-REF"
+            (text/push-str! out
+                            (text/trim (text/from arg
+                                                  (+ (len (word arg 0))
+                                                     (len (word arg 1))
+                                                     (len (word arg 2))
+                                                     3)))))
+        (= (.source (.state s)) RANGE)
           (do
             (text/push-str! out "range ")
             (text/push-str! out (text/trim (slice (.arg (.state s))))))
@@ -434,7 +496,8 @@
             (json/error-into! (mut r) (field s status))
             (do)))
       (json/free! (mut r)))
-    (load-reviews! s)
+    ; A tile's threads arrive through the wall, which review.changed just told.
+    (when (not (tile? s)) (load-reviews! s) 0)
     0)
   ; Refresh what outside changes touched, once the previous refresh is done.
   (when (live/due? (field s diff-refresh) (proc/running? (field s diff-job)))
@@ -632,8 +695,9 @@
         path (d/path m f)
         now (now-ms)
         (mut on) (ArrayList::new [i64] (alloc/malloc-allocator))
-        view-top (- (- (.scroll-y ui) BODY-TOP) (* (.height ui) 0.5))
-        view-bottom (+ (- (.scroll-y ui) BODY-TOP) (* (.height ui) 1.5))
+        body-top (if (tile? s) TILE-BODY-TOP BODY-TOP)
+        view-top (- (- (.scroll-y ui) body-top) (* (.height ui) 0.5))
+        view-bottom (+ (- (.scroll-y ui) body-top) (* (.height ui) 1.5))
         split (= (.view (.state s)) SPLIT)
         count (if split (do (build-pairs! s f) (len (.pairs s))) (.lines-len f))
         (mut y) 0.0
@@ -740,6 +804,63 @@
   (button! ui "load" "Load")
   (end! ui))
 
+;;; The first changed line of the first hunk, to name a hunk's tile.
+(defn first-change [(s (ptr Diff))] (-> i64)
+  (let [m (field s model)
+        f (current-file s)
+        (mut found) 0]
+    (for [k (.lines-at f) (+ (.lines-at f) (.lines-len f))]
+      (let [l (d/line m k)]
+        (when (and (= (load found) 0)
+                   (or (= (.tag l) d/ADD) (= (.tag l) d/DEL)))
+          (set! found (if (= (.tag l) d/ADD) (.new l) (.old l)))
+          0)))
+    (load found)))
+
+(defn tile-title! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (let [(mut t) (ArrayList::new [u8] (alloc/malloc-allocator))
+        m (field s model)]
+    (if (> (d/file-count m) 0)
+        (do
+          (text/push-str! (mut t) (d/path m (current-file s)))
+          (when (and (.per-hunk s) (> (first-change s) 0))
+            (text/push-str! (mut t) ":")
+            (text/push-i64! (mut t) (first-change s))
+            0)
+          (do))
+        (text/push-str! (mut t) "Diff tile"))
+    (title! ui (slice t))
+    (free! (mut t))
+    (do)))
+
+;;; A tile: its numbers and rows, nothing to choose. The pane's title names it.
+(defn tile! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
+  (tile-title! s ui)
+  (vstack! ui 6.0 8.0)
+  (if (= (d/file-count (field s model)) 0)
+      (text! ui
+             (if (parsing? s) "Loading…" (slice (.status s)))
+             13.0
+             gv/MUTED
+             false)
+      (let [m (field s model)
+            f (current-file s)]
+        (hstack! ui 8.0 0.0)
+        (spacer! ui 0.0)
+        (grow! ui 1.0)
+        (gv/stat! ui (.adds f) (.dels f) 11.0)
+        (when (.binary f) (badge! ui "binary" 0x33383f) 0)
+        (when (= (.change-len f) 7)
+          (badge! ui (d/change m f) 0x33383f)
+          0)
+        (end! ui)
+        (when (text/starts-with? (slice (.status s)) "review write")
+          (text! ui (slice (.status s)) 11.0 gv/ERR false)
+          0)
+        (rows! s ui)
+        (do)))
+  (end! ui))
+
 (defn title-text! [(s (ptr Diff)) (ui (ptr Ui))] (-> void)
   (let [(mut t) (ArrayList::new [u8] (alloc/malloc-allocator))]
     (text/push-str! (mut t) "Diff · ")
@@ -752,6 +873,16 @@
     (free! (mut t))
     (do)))
 
+;;; The wall says what changed: reload this tile's diff or threads if it is named.
+(defn wall-changed! [(s (ptr Diff)) (e (ptr Event))] (-> void)
+  (when (wall/notice-names? (.text e) (.wall-id s) (slice (.slot s)))
+    (run-source! s)
+    0)
+  (when (wall/notice-names? (.text e) (.wall-id s) "reviews")
+    (load-reviews! s)
+    0)
+  (do))
+
 (defn set-source! [(s (ptr Diff)) (source i64)] (-> void)
   (set! (.source (.state s)) source)
   (if (or (= source WORKING) (> (len (text/trim (slice (.arg (.state s))))) 0))
@@ -761,31 +892,40 @@
 (impl Widget Diff
   (render [(self (ptr Diff)) (ui (ptr Ui))]
     (-> void)
-    (title-text! self ui)
-    (watch! ui (repo self))
-    (watch! ui (slice (.reviews-dir self)))
-    (vstack! ui 10.0 14.0)
-    (toolbar! self ui)
-    (divider! ui)
-    (if (= (d/file-count (field self model)) 0)
-        (text! ui
-               (if (or (proc/running? (field self diff-job))
-                       (parsing? self))
-                   "Loading…"
-                   "No diff loaded. Pick a source and Load.")
-               13.0
-               gv/MUTED
-               false)
+    (if (tile? self)
+        (tile! self ui)
         (do
-          (hstack! ui 14.0 0.0)
-          (align! ui START)
-          (sidebar! self ui)
-          (file-block! self ui)
-          (end! ui)))
-    (end! ui))
+          (title-text! self ui)
+          (watch! ui (repo self))
+          (watch! ui (slice (.reviews-dir self)))
+          (vstack! ui 10.0 14.0)
+          (toolbar! self ui)
+          (divider! ui)
+          (if (= (d/file-count (field self model)) 0)
+              (text! ui
+                     (if (or (proc/running? (field self diff-job))
+                             (parsing? self))
+                         "Loading…"
+                         "No diff loaded. Pick a source and Load.")
+                     13.0
+                     gv/MUTED
+                     false)
+              (do
+                (hstack! ui 14.0 0.0)
+                (align! ui START)
+                (sidebar! self ui)
+                (file-block! self ui)
+                (end! ui)))
+          (end! ui))))
   (event [(self (ptr Diff)) (e (ptr Event))]
     (-> void)
     (cond (tick? e) (poll-jobs! self e)
+          (and (tile? self) (message? e (wall/changed-topic)))
+            (wall-changed! self e)
+          ; The wall watches the repository and reviews for its tiles.
+          (and (tile? self)
+               (or (message? e "git.changed") (message? e "review.changed")))
+            (do)
           (files-changed? e) (files-changed! self e)
           (message? e "git.changed") (live/note! (field self diff-refresh))
           (message? e "review.changed") (live/note! (field self review-refresh))
@@ -854,6 +994,7 @@
     (free! (mut (.pairs self)))
     (free! (mut (.reviews-dir self)))
     (free! (mut (.pending self)))
+    (free! (mut (.slot self)))
     ; Jim destroys a generation only after its tasks finished.
     (when (parsing? self)
       (release-task (.host self) (.parse-handle self))
@@ -867,6 +1008,7 @@
   (cond (= word "range") RANGE
         (= word "pr") PR
         (= word "file") FILE
+        (= word "tile") TILE
         :else WORKING))
 
 ;;; A first boot's state, from the palette arguments: `[repo=PATH] SOURCE ARG…`,
@@ -909,8 +1051,17 @@
                         :parse-handle 0
                         :pending (ArrayList::new [u8] a)
                         :diff-refresh (live/refresher)
-                        :review-refresh (live/refresher)))]
+                        :review-refresh (live/refresher)
+                        :wall-id -1
+                        :slot (ArrayList::new [u8] a)
+                        :per-hunk false))]
     (live/home-path! "/.jim/reviews" (field s reviews-dir))
+    (when (tile? s)
+      (let [arg (text/trim (slice (.arg (.state s))))]
+        (set! (.wall-id s) (text/parse-i64 (word arg 0) -1))
+        (text/set-str! (field s slot) (word arg 1))
+        (set! (.per-hunk s) (= (word arg 2) "hunk")))
+      0)
     (run-source! s)
     (load-reviews! s)
     s))

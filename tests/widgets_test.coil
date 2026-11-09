@@ -60,7 +60,8 @@
   (assert (boots? "stage"))
   (assert (boots? "markdown"))
   (assert (boots? "branches"))
-  (assert (boots? "diff")))
+  (assert (boots? "diff"))
+  (assert (boots? "diffwall")))
 
 (defn probe-source [(label (slice u8)) (extra bool)] (-> (slice u8))
   (let [(mut b) (StrBuf::new (alloc/malloc-allocator))]
@@ -95,6 +96,54 @@
                  true))))
 
 (extern mkdir :cc (cc/C) [(ptr i8) u16] (-> i32))
+
+(deftest panes-of-a-source-share-one-compile
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (write-probe! (probe-source "one" false))
+  (let [first (widgets/create-in "build/widget-tests" "probe" "." "")
+        second (widgets/create-in "build/widget-tests" "probe" "." "")]
+    (widgets/reload! first)
+    ; Waiting on the same compile, not queueing another.
+    (widgets/reload! second)
+    (assert (widgets/settle! first))
+    (assert (widgets/live? second))
+    ; Pane state stays per pane.
+    (assert (widgets/render! first 400.0 300.0 0.0))
+    (assert (widgets/render! second 400.0 300.0 0.0))
+    (click! first "go")
+    (assert (has-text? first "one 1"))
+    (assert (has-text? second "one 0"))
+    ; A later pane boots at once from the generation already compiled.
+    (let [third (widgets/create-in "build/widget-tests" "probe" "." "")]
+      (widgets/reload! third)
+      (assert (widgets/live? third))
+      (assert (not (widgets/loading? third)))
+      ; One save moves every pane to the new generation, with its own state.
+      (write-probe! (probe-source "two" false))
+      (assert (widgets/changed? third))
+      (widgets/reload! third)
+      (assert (not (widgets/changed? first)))
+      (assert (widgets/settle! third))
+      (assert (widgets/render! first 400.0 300.0 0.0))
+      (assert (widgets/render! second 400.0 300.0 0.0))
+      (assert (widgets/render! third 400.0 300.0 0.0))
+      (assert (has-text? first "two 1"))
+      (assert (has-text? second "two 0"))
+      (assert (has-text? third "two 0"))
+      ; Closing one pane leaves the others' code alone.
+      (widgets/free! second)
+      (widgets/service-poll!)
+      (click! first "go")
+      (assert (has-text? first "two 2"))
+      (widgets/free! third))
+    (widgets/free! first)
+    ; With no pane left the next one starts over, so it sees a new compile.
+    (let [again (widgets/create-in "build/widget-tests" "probe" "." "")]
+      (widgets/reload! again)
+      (assert (widgets/loading? again))
+      (assert (widgets/settle! again))
+      (widgets/free! again))))
 
 (deftest reload-carries-state-and-rejects-broken-versions
   (mkdir c"build" (: 493 u16))
@@ -437,3 +486,212 @@
     (assert (widgets/render! r 400.0 300.0 0.0))
     (assert (has-text? r "two 0"))
     (widgets/free! r)))
+
+;;; ---- the diff wall ------------------------------------------------------------
+(extern system :cc (cc/C) [(ptr i8)] (-> i32))
+
+(const WALL-REPO "build/widget-tests/wall-repo")
+
+(defn in-wall-repo! [(script (ptr i8))] (-> void)
+  (assert (= (system script) (: 0 i32))))
+
+(defn make-wall-repo! [] (-> void)
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (in-wall-repo! c"rm -rf build/widget-tests/wall-repo && mkdir build/widget-tests/wall-repo && cd build/widget-tests/wall-repo && git init -q && printf 'one\ntwo\nthree\n' > a.txt && printf 'keep\n' > b.txt && git add . && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm first && printf 'one\nTWO\nthree\n' > a.txt && printf 'brand new\n' > new.txt"))
+
+;;; Tick R until it has asked for requests of KIND, returning how many it has.
+(defn tick-for! [(r (ptr widgets/Runtime)) (kind i64) (wanted i64)] (-> i64)
+  (let [t0 (now-ms)
+        (mut found) 0]
+    (while (and (< (load found) wanted) (< (- (now-ms) t0) 20000))
+      (widgets/service-poll!)
+      (widgets/tick! r 0.016)
+      (usleep (: 5000 u32))
+      (let [q (widgets/requests r)]
+        (set! found 0)
+        (for [i 0 (len (.items q))]
+          (when (= (.kind (get (.items q) i)) kind)
+            (set! found (+ (load found) 1))))))
+    (load found)))
+
+(defn nth-request [(r (ptr widgets/Runtime)) (kind i64) (n i64)]
+  (-> (slice u8))
+  (let [q (widgets/requests r)
+        (mut seen) 0
+        (mut out) ""]
+    (for [i 0 (len (.items q))]
+      (let [item (get (.items q) i)]
+        (when (= (.kind item) kind)
+          (when (= (load seen) n) (set! out (api/request-text q item)))
+          (set! seen (+ (load seen) 1)))))
+    (load out)))
+
+(defn request-count [(r (ptr widgets/Runtime)) (kind i64)] (-> i64)
+  (let [q (widgets/requests r)
+        (mut seen) 0]
+    (for [i 0 (len (.items q))]
+      (when (= (.kind (get (.items q) i)) kind) (set! seen (+ (load seen) 1))))
+    (load seen)))
+
+(defn after-space [(s (slice u8))] (-> (slice u8))
+  (let [(mut at) 0]
+    (for [i 0 (len s)]
+      (when (and (= (load at) 0) (= (get s i) (: 32 u8))) (set! at (+ i 1))))
+    (subslice s (load at) (len s))))
+
+;;; Tick R, rendering, until its text includes NEEDLE.
+(defn shows? [(r (ptr widgets/Runtime)) (needle (slice u8))] (-> bool)
+  (let [t0 (now-ms)
+        (mut found) false]
+    (while (and (not (load found)) (< (- (now-ms) t0) 20000))
+      (widgets/service-poll!)
+      (widgets/tick! r 0.016)
+      (usleep (: 5000 u32))
+      (when (widgets/render! r 800.0 600.0 0.0)
+        (let [ui (widgets/ui-of r)]
+          (for [i 0 (len (.nodes (load ui)))]
+            (let [n (api/node ui i)]
+              (when (and (= (.kind n) api/TEXT)
+                         (contains-text? (api/node-text ui n) needle))
+                (set! found true)))))
+        0))
+    (load found)))
+
+;;; Run WALL, handing its notices to its tiles as Jim's broadcast does, until
+;;; TILE shows NEEDLE.
+(defn forwards-until-shown? [(wall (ptr widgets/Runtime))
+                             (tile (ptr widgets/Runtime))
+                             (other (ptr widgets/Runtime))
+                             (needle (slice u8))] (-> bool)
+  (let [t0 (now-ms)
+        (mut found) false]
+    (while (and (not (load found)) (< (- (now-ms) t0) 20000))
+      (widgets/service-poll!)
+      (widgets/tick! wall 0.016)
+      (let [q (widgets/requests wall)]
+        (for [i 0 (len (.items q))]
+          (let [item (get (.items q) i)]
+            (when (= (.kind item) api/EMIT)
+              (widgets/message! tile
+                                (api/request-text q item)
+                                (api/request-text2 q item))
+              (widgets/message! other
+                                (api/request-text q item)
+                                (api/request-text2 q item)))))
+        (api/requests-clear! q))
+      (set! found (shows-now? tile needle))
+      (usleep (: 5000 u32)))
+    (load found)))
+
+(defn shows-now? [(r (ptr widgets/Runtime)) (needle (slice u8))] (-> bool)
+  (widgets/tick! r 0.016)
+  (let [(mut found) false]
+    (when (widgets/render! r 800.0 600.0 0.0)
+      (let [ui (widgets/ui-of r)]
+        (for [i 0 (len (.nodes (load ui)))]
+          (let [n (api/node ui i)]
+            (when (and (= (.kind n) api/TEXT)
+                       (contains-text? (api/node-text ui n) needle))
+              (set! found true)))))
+      0)
+    (load found)))
+
+(defn contains-text? [(s (slice u8)) (needle (slice u8))] (-> bool)
+  (match (find s needle) (Some [_] true) (None [] false)))
+
+(deftest the-diff-wall-tiles-a-repository-and-stays-current
+  (make-wall-repo!)
+  (let [wall (widgets/create "diffwall" WALL-REPO "")]
+    (widgets/reload! wall)
+    (assert (widgets/settle! wall))
+    (assert (widgets/render! wall 600.0 400.0 0.0))
+    ; A tracked change and an untracked file, placed and framed.
+    (assert (= (tick-for! wall api/OPEN-WIDGET-AT 2) 2))
+    (assert (= (request-count wall api/FIT-CANVAS) 1))
+    (assert (= (request-count wall api/MOVE-SELF) 1))
+    (let [(mut first) (text-copy (nth-request wall api/OPEN-WIDGET-AT 0))
+          (mut second) (text-copy (nth-request wall api/OPEN-WIDGET-AT 1))
+          q (widgets/requests wall)
+          (mut placed-tile) 0.0]
+      (for [i 0 (len (.items q))]
+        (let [item (get (.items q) i)]
+          (when (= (.kind item) api/OPEN-WIDGET-AT)
+            (assert (>= (.w item) 320.0))
+            (assert (>= (.h item) 180.0))
+            (assert (>= (.y item) 40.0))
+            (set! placed-tile (.h item)))))
+      (assert (> (load placed-tile) 0.0))
+      (assert (= (subslice (slice first) 0 10) "diff tile "))
+      (api/requests-clear! q)
+      ; The tiles show what the wall left for them.
+      (assert (shows? wall "a.txt"))
+      (assert (shows? wall "new.txt"))
+      (let [tile (widgets/create "diff" WALL-REPO (after-space (slice first)))
+            other (widgets/create "diff" WALL-REPO (after-space (slice second)))]
+        ; Same source as each other: already compiled for the first, booted
+        ; together for the second.
+        (widgets/reload! tile)
+        (widgets/reload! other)
+        (assert (widgets/settle! tile))
+        (assert (widgets/live? other))
+        (assert (shows? tile "TWO"))
+        ; The pane's title names the file; the tile does not repeat it.
+        (assert (= (api/title (widgets/ui-of tile)) "a.txt"))
+        (assert (shows? other "brand new"))
+        ; An edit reaches the tile through the wall, by way of one notice.
+        (in-wall-repo! c"cd build/widget-tests/wall-repo && printf 'one\nTWO\nTHREE\n' > a.txt")
+        (widgets/message! wall "git.changed" WALL-REPO)
+        (assert (forwards-until-shown? wall tile other "THREE"))
+        (api/requests-clear! (widgets/requests wall))
+        ; A new file gets a tile, and reverting one closes its tile.
+        (in-wall-repo! c"cd build/widget-tests/wall-repo && git checkout -q a.txt && printf 'more\n' > more.txt")
+        (widgets/message! wall "git.changed" WALL-REPO)
+        (assert (= (tick-for! wall api/CLOSE-WIDGET 1) 1))
+        (assert (= (nth-request wall api/CLOSE-WIDGET 0) (slice first)))
+        (assert (>= (tick-for! wall api/OPEN-WIDGET-AT 1) 1))
+        (assert (shows? wall "more.txt"))
+        ; A live update does not take the camera away from anyone.
+        (assert (= (request-count wall api/FIT-CANVAS) 0))
+        (api/requests-clear! (widgets/requests wall))
+        ; After a restart the wall knows its tiles and opens none of them again.
+        (let [(mut saved) (api/snapshot-new (alloc/malloc-allocator))]
+          (assert (widgets/save-state! wall (mut saved)))
+          (let [again (widgets/create "diffwall" WALL-REPO "")]
+            (widgets/restore-state! again (load saved))
+            (widgets/reload! again)
+            (assert (widgets/live? again))
+            (assert (shows? again "more.txt"))
+            (widgets/message! again "git.changed" WALL-REPO)
+            (assert (shows? again "more.txt"))
+            (let [t0 (now-ms)]
+              (while (< (- (now-ms) t0) 1000)
+                (widgets/service-poll!)
+                (widgets/tick! again 0.016)
+                (usleep (: 5000 u32))))
+            (assert (= (request-count again api/OPEN-WIDGET-AT) 0))
+            (assert (= (request-count again api/CLOSE-WIDGET) 0))
+            (widgets/free! again)))
+        (widgets/free! tile)
+        (widgets/free! other))
+      (free! (mut first))
+      (free! (mut second)))
+    (widgets/free! wall)))
+
+(deftest the-diff-wall-says-what-it-cannot-do
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (let [bad (widgets/create "diffwall" "." "banana")
+        outside (widgets/create "diffwall" "/" "")]
+    (widgets/reload! bad)
+    (widgets/reload! outside)
+    (assert (widgets/settle! bad))
+    (assert (shows? bad "don't understand 'banana'"))
+    (assert (shows? outside "not a git repository"))
+    (widgets/free! bad)
+    (widgets/free! outside)))
+
+(defn text-copy [(s (slice u8))] (-> (ArrayList u8))
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (extend! (mut out) (data s) (len s))
+    (load out)))

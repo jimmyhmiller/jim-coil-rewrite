@@ -25,7 +25,9 @@
    (pick-timer (ptr i8))
    (preview-directory (ptr i8))
    (preview-url (ptr i8))
-   (space-taken bool)])
+   (space-taken bool)
+   ;; Times the terminal has asked for attention since take-bells! last looked.
+   (bells i64)])
 
 (defn association-key [] (-> (ptr i8))
   (p/alloc-static i8))
@@ -827,9 +829,9 @@
 (defn accessibility-role [(self (ptr i8)) (cmd (ptr i8))] (-> (ptr i8))
   (ns c"AXTextArea"))
 
-(defn accessibility-value [(self (ptr i8)) (cmd (ptr i8))] (-> (ptr i8))
-  (let [t (terminal self)
-        (mut text) (zeroed g/Text)
+;;; What T shows, as an NSString.
+(defn visible-text [(t (ptr Terminal))] (-> (ptr i8))
+  (let [(mut text) (zeroed g/Text)
         selection
           (g/TextSelection
             :top
@@ -851,6 +853,37 @@
         (let [value (ns (.text text))]
           (do (g/ghostty_surface_free_text (.surface t) (mut text)) value))
         (ns c""))))
+
+(defn accessibility-value [(self (ptr i8)) (cmd (ptr i8))] (-> (ptr i8))
+  (visible-text (terminal self)))
+
+;;; Type TEXT into T as if pasted, then press Return if ENTER: Return inside a paste
+;;; would not submit it. False when T has no live session to type into.
+(defn type-text! [(t (ptr Terminal)) (text (ptr i8)) (enter bool)] (-> bool)
+  (if (= (p/cast i64 (.surface t)) 0)
+      false
+      (let [length (strlen text)]
+        (when (> length (: 0 u64))
+          (g/ghostty_surface_text (.surface t) text length))
+        (when enter
+          (g/ghostty_surface_binding_action (.surface t)
+                                            c"text:\\x0d"
+                                            (: 9 u64))
+          0)
+        true)))
+
+;;; Turn a mouse wheel over T by NOTCHES, positive away from the user, as a wheel
+;;; without precise deltas does, at the pointer's last position in T. False when T
+;;; has no live session.
+(defn wheel! [(t (ptr Terminal)) (notches i64)] (-> bool)
+  (if (= (p/cast i64 (.surface t)) 0)
+      false
+      (do
+        (g/ghostty_surface_mouse_scroll (.surface t)
+                                        0.0
+                                        (p/cast f64 notches)
+                                        0)
+        true)))
 
 (defn view-class [] (-> (ptr i8))
   (let [existing (class c"JimTerminalView")]
@@ -1049,19 +1082,40 @@
            (: 0 i8))
       (release pool))))
 
+;;; How many times T has asked for attention since this was last called.
+(defn take-bells! [(t (ptr Terminal))] (-> i64)
+  (let [bells (.bells t)]
+    (set! (.bells t) 0)
+    bells))
+
+;;; Programs ask for attention by either route: Codex and Claude Code's terminal_bell
+;;; channel ring the bell, and Claude Code's default channel in Ghostty sends a desktop
+;;; notification. Jim shows the request as a count, not as a system notification.
+(defn asks-for-attention? [(tag i32)] (-> bool)
+  (or (= tag g/ACTION-RING-BELL) (= tag g/ACTION-DESKTOP-NOTIFICATION)))
+
 (defn action [(app (ptr i8)) (target g/Target) (value g/Action)] (-> bool)
-  (if (and (= (.tag target) g/TARGET-SURFACE) (= (.tag value) g/ACTION-PWD))
-      (let [t
-              (p/cast (ptr Terminal)
-                      (g/ghostty_surface_userdata (.surface target)))
-            path (p/cast (ptr i8) (load (index (field value data) 0)))]
-        (if (and (!= (p/cast i64 t) 0) (!= (p/cast i64 path) 0))
-            (do
-              (release (.directory t))
-              (set! (.directory t) (msg (ptr i8) (ns path) (sel c"retain") []))
-              true)
-            false))
-      false))
+  (cond (!= (.tag target) g/TARGET-SURFACE) false
+        (= (.tag value) g/ACTION-PWD)
+          (let [t
+                  (p/cast (ptr Terminal)
+                          (g/ghostty_surface_userdata (.surface target)))
+                path (p/cast (ptr i8) (load (index (field value data) 0)))]
+            (if (and (!= (p/cast i64 t) 0) (!= (p/cast i64 path) 0))
+                (do
+                  (release (.directory t))
+                  (set! (.directory t)
+                        (msg (ptr i8) (ns path) (sel c"retain") []))
+                  true)
+                false))
+        (asks-for-attention? (.tag value))
+          (let [t
+                  (p/cast (ptr Terminal)
+                          (g/ghostty_surface_userdata (.surface target)))]
+            (if (!= (p/cast i64 t) 0)
+                (do (set! (.bells t) (+ (.bells t) 1)) true)
+                false))
+        :else false))
 
 ;;; The general pasteboard's type for MIME, or nil when macOS knows none.
 (defn pasteboard-type [(mime (ptr i8))] (-> (ptr i8))

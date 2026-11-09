@@ -6,6 +6,7 @@
 (import "jim.widget-kit.json" :as json)
 (import "jim.widget-kit.diff" :as d)
 (import "jim.widget-kit.highlight" :as hl)
+(import "jim.widget-kit.wall" :as wall)
 
 (defn sample [] (-> (slice u8))
   "diff --git a/src/a.rs b/src/a.rs
@@ -131,3 +132,245 @@ Binary files a/img.png and b/img.png differ
               (assert (>= (.at r) (.at l)))
               (assert (<= (+ (.at r) (.len r)) (+ (.at l) (.len l)))))))))
     (d/free! (mut m))))
+
+;;; ---- the diff wall ------------------------------------------------------------
+
+(defn wall-sample [] (-> (slice u8))
+  "diff --git a/src/a.rs b/src/a.rs
+index 1..2 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,3 @@ fn main
+ fn main() {
+-    let x = 1;
++    let x = 2;
+ }
+@@ -20,2 +20,3 @@ fn other
+ fn other() {
++    let y = 3;
+ }
+diff --git a/img.png b/img.png
+Binary files a/img.png and b/img.png differ
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+diff --git a/old.txt b/moved.txt
+similarity index 100%
+rename from old.txt
+rename to moved.txt
+diff --git a/script.sh b/script.sh
+old mode 100644
+new mode 100755
+")
+
+(defn tiles-of [(text (slice u8)) (spec (ptr wall/Spec))]
+  (-> (ArrayList wall/Tile))
+  (let [(mut out) (ArrayList::new [wall/Tile] (alloc/malloc-allocator))
+        (mut filtered) 0]
+    (wall/split! text spec (mut out) (mut filtered))
+    (load out)))
+
+(deftest a-diff-divides-into-a-tile-per-file
+  (let [(mut spec) (wall/parse-spec "")
+        (mut tiles) (tiles-of (wall-sample) (mut spec))]
+    ; The bare mode change says nothing a reviewer reads, so it has no tile.
+    (assert (= (len tiles) 4))
+    (let [a (elem (mut tiles) 0)]
+      (assert (= (slice (.key a)) "src/a.rs"))
+      (assert (= (.adds a) 2))
+      (assert (= (.dels a) 1))
+      ; Two hunk headers and seven lines.
+      (assert (= (.rows a) 9))
+      (assert (text/starts-with? (slice (.patch a)) "diff --git a/src/a.rs"))
+      (assert (text/ends-with? (slice (.patch a)) "+    let y = 3;\n }\n"))
+      ; Its own patch parses back to the same file.
+      (let [(mut m) (d/model-new)]
+        (d/parse-unified! (mut m) (slice (.patch a)))
+        (assert (= (d/file-count (mut m)) 1))
+        (assert (= (.adds (d/file (mut m) 0)) 2))
+        (d/free! (mut m))))
+    (assert (= (slice (.key (elem (mut tiles) 1))) "img.png"))
+    (assert (= (slice (.key (elem (mut tiles) 2))) "gone.txt"))
+    (assert (= (.dels (elem (mut tiles) 2)) 1))
+    (assert (= (slice (.key (elem (mut tiles) 3))) "moved.txt"))
+    (wall/tiles-clear! (mut tiles))
+    (wall/spec-free! (mut spec))))
+
+(deftest per-hunk-tiles-keep-their-file-header-and-line-numbers
+  (let [(mut spec) (wall/parse-spec "per=hunk path=src")
+        (mut tiles) (tiles-of (wall-sample) (mut spec))]
+    (assert (= (len tiles) 2))
+    (let [one (elem (mut tiles) 0)
+          two (elem (mut tiles) 1)]
+      (assert (= (slice (.key one)) "src/a.rs#0"))
+      ; Titled by the first change in the hunk, not where its context starts.
+      (assert (= (slice (.title one)) "src/a.rs:2"))
+      (assert (= (slice (.key two)) "src/a.rs#1"))
+      (assert (= (slice (.title two)) "src/a.rs:21"))
+      (assert (text/starts-with? (slice (.patch two)) "diff --git"))
+      (let [(mut m) (d/model-new)]
+        (d/parse-unified! (mut m) (slice (.patch two)))
+        (assert (= (d/path (mut m) (d/file (mut m) 0)) "src/a.rs"))
+        (assert (= (.hunks-len (d/file (mut m) 0)) 1))
+        (assert (= (.new (d/line (mut m) 2)) 21))
+        (d/free! (mut m))))
+    (wall/tiles-clear! (mut tiles))
+    (wall/spec-free! (mut spec))))
+
+(defn keeps? [(spec-text (slice u8)) (path (slice u8))] (-> bool)
+  (let [(mut spec) (wall/parse-spec spec-text)]
+    (assert (= (len (.problem spec)) 0))
+    (let [kept (wall/selected? (mut spec) path)]
+      (wall/spec-free! (mut spec))
+      kept)))
+
+(deftest wall-filters-match-files-and-directories
+  (assert (keeps? "" "src/lib.rs"))
+  (assert (keeps? "" ".github/workflows/test.yml"))
+  (assert (keeps? "path=./src/ path=README.md" "src/nested/lib.rs"))
+  (assert (keeps? "path=./src/ path=README.md" "README.md"))
+  (assert (not (keeps? "path=./src/" "src-other/lib.rs")))
+  (assert (not (keeps? "path=README.md" "docs/README.md"))))
+
+(deftest wall-exclusions-take-test-directories-and-globs
+  (let [t "exclude=**/tests/** exclude=**/*.test.* exclude=**/__tests__"]
+    (assert (not (keeps? t "tests/root.rs")))
+    (assert (not (keeps? t "crates/widget/tests/nested/test.rs")))
+    (assert (not (keeps? t "src/widget.test.ts")))
+    (assert (not (keeps? t "root.test.js")))
+    (assert (not (keeps? t "src/__tests__/nested/widget.ts")))
+    (assert (keeps? t "src/widget.ts"))))
+
+(deftest wall-exclusions-win-and-globs-respect-separators
+  (let [t "path=src exclude=src/*.test.ts"]
+    (assert (not (keeps? t "src/widget.test.ts")))
+    (assert (keeps? t "src/nested/widget.test.ts"))
+    (assert (not (keeps? t "other/widget.ts"))))
+  (assert (wall/glob-match? "[a-c]?.rs" "bz.rs"))
+  (assert (not (wall/glob-match? "[!a-c]?.rs" "bz.rs")))
+  (assert (not (wall/glob-match? "a?b" "a/b"))))
+
+(defn problem-of [(input (slice u8))] (-> bool)
+  (let [(mut spec) (wall/parse-spec input)
+        bad (> (len (.problem spec)) 0)]
+    (wall/spec-free! (mut spec))
+    bad))
+
+(deftest wall-specs-say-what-they-cannot-understand
+  (assert (problem-of "exclude="))
+  (assert (problem-of "path="))
+  (assert (problem-of "exclude=["))
+  (assert (problem-of "range"))
+  (assert (problem-of "pr"))
+  (assert (problem-of "max=lots"))
+  (assert (problem-of "banana"))
+  (assert (problem-of "staged unstaged"))
+  (assert (not (problem-of "repo=/x range main per=hunk max=3"))))
+
+(deftest wall-specs-read-their-sources
+  (let [(mut r) (wall/parse-spec "repo=/x range main dev exclude=a")
+        (mut p) (wall/parse-spec "pr 42 per=hunk")
+        (mut d) (wall/parse-spec "range main path=b")
+        (mut name) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (assert (= (slice (.repo r)) "/x"))
+    (assert (= (.source r) wall/RANGE))
+    (assert (= (slice (.base r)) "main"))
+    (assert (= (slice (.head r)) "dev"))
+    (assert (= (.source p) wall/PR))
+    (assert (.per-hunk p))
+    ; A word with = is never taken for the head.
+    (assert (= (slice (.head d)) "HEAD"))
+    (assert (= (len (.include d)) 1))
+    (wall/push-name! (mut r) "/x" (mut name))
+    (assert (= (slice name) "diff main..dev"))
+    (clear! (mut name))
+    (wall/push-name! (mut p) "/repo/jim" (mut name))
+    (assert (= (slice name) "diff jim PR 42"))
+    (free! (mut name))
+    (wall/spec-free! (mut r))
+    (wall/spec-free! (mut p))
+    (wall/spec-free! (mut d))))
+
+(deftest untracked-files-become-new-file-diffs
+  (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
+        (mut spec) (wall/parse-spec "")]
+    (wall/push-new-file! (mut out) "a b.txt" "one\ntwo")
+    (wall/push-new-file! (mut out) "empty.txt" "")
+    (wall/push-new-file! (mut out) "x.bin" "a\x00;b\n")
+    (let [(mut tiles) (tiles-of (slice out) (mut spec))]
+      (assert (= (len tiles) 3))
+      (assert (= (slice (.key (elem (mut tiles) 0))) "a b.txt"))
+      (assert (= (.adds (elem (mut tiles) 0)) 2))
+      (assert (text/contains? (slice (.patch (elem (mut tiles) 0)))
+                              "@@ -0,0 +1,2 @@"))
+      (assert (= (slice (.key (elem (mut tiles) 1))) "empty.txt"))
+      (assert (text/contains? (slice (.patch (elem (mut tiles) 2)))
+                              "Binary files"))
+      (wall/tiles-clear! (mut tiles)))
+    (free! (mut out))
+    (wall/spec-free! (mut spec))))
+
+(deftest the-wall-packs-into-the-shortest-column-and-keeps-to-its-aspect
+  ; Tall enough columns and no taller; a tile never takes more than the limit.
+  (assert (= (wall/tile-height 1) wall/MIN-TILE-H))
+  (assert (= (wall/tile-height 1000) wall/MAX-TILE-H))
+  (assert (= (wall/column-width 0) 560.0))
+  (assert (= (wall/column-width 1000) 1000.0))
+  (assert (= (wall/column-count 100.0 600.0 1) 1))
+  (assert (= (wall/column-count 100000.0 600.0 2) 2))
+  (let [n (wall/column-count 10000.0 600.0 50)]
+    (assert (and (>= n 4) (<= n 6))))
+  (let [(mut w) (wall/wall-new 600.0 2 200.0)
+        a (wall/place! (mut w) 300.0)
+        b (wall/place! (mut w) 100.0)
+        c (wall/place! (mut w) 100.0)]
+    ; The second column starts level with the control pane, not below it.
+    (assert (= (.x a) (+ wall/ORIGIN 600.0 wall/GAP)))
+    (assert (= (.y a) wall/ORIGIN))
+    (assert (= (.x b) wall/ORIGIN))
+    (assert (= (.y b) (+ wall/ORIGIN 200.0 wall/GAP)))
+    ; The first column is now the longer, so the next tile goes under the first.
+    (assert (= (.x c) (.x a)))
+    (assert (= (.y c) (+ (.y a) 300.0 wall/GAP)))
+    ; A tile already placed there keeps a later one off it.
+    (wall/wall-note! (mut w)
+                     (wall/Box
+                       :x (.x a)
+                       :y 2000.0
+                       :w 600.0
+                       :h 100.0))
+    (assert (= (.x (wall/place! (mut w) 50.0)) wall/ORIGIN))
+    (wall/wall-free! (mut w))))
+
+(deftest wall-notices-name-their-wall-and-tiles
+  (assert (wall/notice-names? "17 3 12 reviews" 17 "12"))
+  (assert (wall/notice-names? "17 3 12 reviews" 17 "reviews"))
+  (assert (not (wall/notice-names? "17 3 12 reviews" 17 "1")))
+  (assert (not (wall/notice-names? "17 3 12 reviews" 18 "3")))
+  (assert (not (wall/notice-names? "17 3" 3 "3"))))
+
+(deftest review-comments-copy-as-text
+  (let [reply
+          "{\"ok\":true,\"threads\":[
+      {\"id\":4,\"file\":\"a.rs\",\"line\":9,\"status\":\"open\",\"author\":\"user\",\"body\":\"why?\",
+       \"context_line\":\"let x = 1;\",
+       \"replies\":[{\"author\":\"agent:c\",\"body\":\"fixed\"}]},
+      {\"id\":5,\"file\":\"b.rs\",\"line\":1,\"status\":\"resolved\",\"author\":\"user\",\"body\":\"old\",\"replies\":[]},
+      {\"id\":6,\"file\":\"c.rs\",\"line\":2,\"status\":\"open\",\"author\":\"user\",\"body\":\"no context\",\"replies\":[]}]}"
+        (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
+        (mut count) 0]
+    (wall/push-comments! reply "/repo" (mut out) (mut count))
+    (assert (= (load count) 2))
+    (assert (= (slice out)
+               "Review comments for /repo:\n\na.rs:9 (thread #4)\nCode: let x = 1;\nuser: why?\nagent:c: fixed\n\nc.rs:2 (thread #6)\nuser: no context"))
+    (clear! (mut out))
+    (wall/push-comments! "{\"ok\":true,\"threads\":[]}"
+                         "/repo"
+                         (mut out)
+                         (mut count))
+    (assert (= (load count) 0))
+    (assert (= (len out) 0))
+    (free! (mut out))))

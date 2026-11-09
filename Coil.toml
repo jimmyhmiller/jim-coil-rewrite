@@ -2,7 +2,7 @@
 name = "jim"
 entry = "src/main.coil"
 source-roots = ["src", "tests"]
-exclude = ["src/session/server.coil"]
+exclude = ["src/session/server.coil", "src/jimc/main.coil"]
 
 # Widgets compile through tpde alone, so Jim links no LLVM. Jim itself is still
 # compiled with LLVM.
@@ -24,6 +24,14 @@ entry = "src/session/server.coil"
 out = "build/jim-session"
 optimization = 2
 native-dependencies = ["ghostty-vt"]
+
+# The command line for controlling a running Jim. Needs no frameworks: it is only a
+# socket client.
+[artifacts.jimc]
+kind = "executable"
+entry = "src/jimc/main.coil"
+out = "build/jimc"
+optimization = 2
 
 [test]
 roots = ["tests"]

@@ -57,6 +57,20 @@
              [(ptr i8)]
              (ns relative))))
 
+;;; A bundled build's service lives in the bundle. macOS then treats what its shells do
+;;; as the app's, so privacy permissions granted to the app apply to them even though
+;;; launchd started the service. `coil run` has no bundle and uses the build directory.
+(defn service-executable [] (-> (ptr i8))
+  (let [bundled
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSBundle") (sel c"mainBundle") [])
+               (sel c"pathForAuxiliaryExecutable:")
+               [(ptr i8)]
+               (ns c"jim-session"))]
+    (if (= (p/cast i64 bundled) 0)
+        (in-base c"build/jim-session")
+        (utf8 bundled))))
+
 ;;; ---- original Jim ---------------------------------------------------------------
 ;;; Original Jim keeps each terminal in its own daemon, keyed by a number. A session
 ;;; adopting one remembers that number, so it can adopt it again if its service stops.
@@ -146,7 +160,7 @@
                                     0
                                     0
                                     0))
-                executable (in-base c"build/jim-session")
+                executable (service-executable)
                 resources (in-base c"build/ghostty/share/ghostty")]
             (if (= (load original) NOT-ORIGINAL)
                 (transport/session-open executable socket cwd resources)

@@ -2,6 +2,7 @@
 (import "coil.cc" :as cc)
 (import "jim.objc" :use * :reexport)
 (import "coil.primitive" :as p)
+(import "coil.math" :use [min max])
 
 (defstruct Point [(x f64) (y f64)])
 
@@ -124,10 +125,14 @@
        [(ptr i8)]
        (msg (ptr i8) (color r g b 1.0) (sel c"CGColor") [])))
 
-(defn layer-view [(parent (ptr i8)) (r Rect) (kind (ptr i8))] (-> (ptr i8))
+;;; A view of class VIEW-CLASS in PARENT at R, backed by a layer of class KIND.
+(defn class-layer-view [(parent (ptr i8))
+                        (r Rect)
+                        (view-class (ptr i8))
+                        (kind (ptr i8))] (-> (ptr i8))
   (let [v
           (msg (ptr i8)
-               (msg (ptr i8) (class c"NSView") (sel c"alloc") [])
+               (msg (ptr i8) view-class (sel c"alloc") [])
                (sel c"initWithFrame:")
                [Rect]
                r)]
@@ -141,6 +146,9 @@
       (msg i64 parent (sel c"addSubview:") [(ptr i8)] v)
       (release v)
       v)))
+
+(defn layer-view [(parent (ptr i8)) (r Rect) (kind (ptr i8))] (-> (ptr i8))
+  (class-layer-view parent r (class c"NSView") kind))
 
 (defn view [(parent (ptr i8)) (r Rect)] (-> (ptr i8))
   (layer-view parent r c"CALayer"))
