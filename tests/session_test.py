@@ -266,7 +266,7 @@ class SessionTest(unittest.TestCase):
         client, _ = self.attach()
         # Query while detached; the child cannot finish unless the daemon's
         # terminal core supplies the cursor-position response itself.
-        code = "import os,tty,time; tty.setraw(0); time.sleep(.3); os.write(1,b'\\x1b[6n'); r=os.read(0,64); open('query-result','wb').write(r)"
+        code = "import os,tty,time; tty.setraw(0); time.sleep(.3); os.write(1,b'\\x1b[6n'); r=os.read(0,64); open('query-result.part','wb').write(r); os.rename('query-result.part','query-result')"
         import shlex
         send(client, 2, ('python3 -c ' + shlex.quote(code) + '\n').encode())
         time.sleep(.1)
@@ -344,7 +344,7 @@ class SessionTest(unittest.TestCase):
         colors = bytes([220, 230, 240, 17, 21, 28, 110, 190, 230]) + bytes(768)
         send(client, 5, colors)
         import shlex
-        code = "import os,tty; tty.setraw(0); os.write(1,b'\\x1b]11;?\\x07'); r=os.read(0,128); open('color-response','wb').write(r)"
+        code = "import os,tty; tty.setraw(0); os.write(1,b'\\x1b]11;?\\x07'); r=os.read(0,128); open('color-response.part','wb').write(r); os.rename('color-response.part','color-response')"
         send(client, 2, ('python3 -c ' + shlex.quote(code) + '\n').encode())
         file = self.directory / 'color-response'
         deadline = time.monotonic() + 5
@@ -597,7 +597,7 @@ class AdoptionTest(unittest.TestCase):
         self.adopt()
         client, _ = self.attach()
         code = ("import os,tty,time; tty.setraw(0); time.sleep(.3); os.write(1,b'\\x1b[6n'); "
-                "r=os.read(0,64); open('query-result','wb').write(r)")
+                "r=os.read(0,64); open('query-result.part','wb').write(r); os.rename('query-result.part','query-result')")
         send(client, 2, ('python3 -c ' + shlex.quote(code) + '\n').encode())
         time.sleep(.1)
         client.close()
@@ -610,7 +610,7 @@ class AdoptionTest(unittest.TestCase):
         # while this program is still listening for anything sent to the shell.
         code = ("import os,tty,select; tty.setraw(0); os.write(1,b'\\x1b[6n'); open('asked','w').write('y'); "
                 "r=select.select([0],[],[],2.5)[0]; d=os.read(0,64) if r else b''; "
-                "open('heard','wb').write(b'[' + d + b']')")
+                "open('heard.part','wb').write(b'[' + d + b']'); os.rename('heard.part','heard')")
         self.shell(('python3 -c ' + shlex.quote(code) + '\n').encode(), 'asked')
         self.adopt()
         self.wait_for(lambda: (self.directory / 'heard').exists())
