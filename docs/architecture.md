@@ -265,7 +265,10 @@ wrote, through `insertText:replacementRange:` so listeners hear it. It stops wri
 text has changed, so an edit is never overwritten, or if the target has lost the keyboard.
 
 If Phonon isn't installed, the first ⌘⇧T runs original Jim's installer, compiled in, on a
-background thread and doesn't open the microphone. The pill says when it's ready. It uses
+background thread and doesn't open the microphone. The pill says when it's ready. It needs
+the person's own `uv`, found on PATH or, for an app started from the Dock, through their
+login shell, and says so if there is none. Unlike the original it never installs a pinned
+uv of its own, which would fail on uv settings newer than itself. It uses
 original Jim's files and lock in `~/.jim/phonon`, and the lock is inherited by the script,
 so an app that quits mid-install leaves it running and the next one waits for it. Any
 finished install counts, whichever pin, so the two apps can't reinstall over each other.

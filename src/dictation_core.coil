@@ -1020,13 +1020,14 @@
 ;;; As original Jim does: on first use, in the background, with the same script, lock and
 ;;; files, so whichever app gets there first installs it for both.
 
-;;; Original Jim's scripts/install-phonon.sh. It's compiled in so a release can run it.
+;;; Original Jim's scripts/install-phonon.sh, compiled in so a release can run it, except
+;;; that it uses only the person's own uv. The original falls back to a pinned uv 0.5.9 in
+;;; $PHONON_HOME/uv, which fails on settings newer than itself.
 (defn install-script [] (-> (ptr i8))
   c"set -euo pipefail
 
 PIN=\"fermion-research==0.2.11\"
 PYTHON_VERSION=\"3.12\"
-UV_VERSION=\"0.5.9\"
 PHONON_HOME=\"${PHONON_HOME:-$HOME/.jim/phonon}\"
 VENV=\"$PHONON_HOME/venv\"
 MARKER=\"$PHONON_HOME/installed\"
@@ -1034,15 +1035,12 @@ MARKER=\"$PHONON_HOME/installed\"
 mkdir -p \"$PHONON_HOME\"
 rm -f \"$MARKER\"
 
-if command -v uv >/dev/null 2>&1; then
-    UV=\"$(command -v uv)\"
-elif [ -x \"$PHONON_HOME/uv/uv\" ]; then
-    UV=\"$PHONON_HOME/uv/uv\"
-else
-    echo \"[install-phonon] no uv on PATH; installing uv $UV_VERSION into $PHONON_HOME/uv\"
-    curl -LsSf \"https://astral.sh/uv/$UV_VERSION/install.sh\" \\
-        | UV_UNMANAGED_INSTALL=\"$PHONON_HOME/uv\" sh
-    UV=\"$PHONON_HOME/uv/uv\"
+# An app started from the Dock doesn't have the shell's PATH, so ask the shell too.
+UV=\"$(command -v uv || \"${SHELL:-/bin/zsh}\" -lic 'command -v uv' </dev/null 2>/dev/null | tail -n 1 || true)\"
+if [ -z \"$UV\" ] || [ ! -x \"$UV\" ]; then
+    echo \"[install-phonon] no uv in $PATH or in ${SHELL:-/bin/zsh}'s PATH\"
+    echo \"uv isn't installed. Install it from https://docs.astral.sh/uv and try again.\"
+    exit 1
 fi
 echo \"[install-phonon] using $UV ($(\"$UV\" --version))\"
 
