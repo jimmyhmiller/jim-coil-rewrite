@@ -234,6 +234,93 @@ the widgets running each. One JIT session is hundreds of megabytes, and a wall c
 panes. Panes placed by a widget (`open-widget-at!`) never take the keyboard, and closing a
 pane other than the focused one leaves focus alone, since either can happen mid-comment.
 
+## Widgets built ahead of time
+
+The JIT takes most of a second to compile a widget, and every launch used to compile
+every widget on screen, one at a time, behind "Loading widget…". Instead,
+`scripts/widget_cache.py` builds each widget into `build/widget-cache/NAME.dylib`. It
+runs from `scripts/build.py`, so `dev-restart.sh` and releases have it. Each library is
+the widget followed by `src/widget_shim.txt`, compiled with `coil.safety` and linked with
+`-undefined dynamic_lookup`, so libc comes from Jim's process.
+
+`NAME.key` beside the library is an FNV-1a hash of what it was built from:
+- the shim;
+- the widget's source;
+- `widget_api.coil`;
+- every widget-kit file.
+
+When `compile!` reads a source, `use-precompiled!` hashes the same inputs from disk. If
+the key matches, it loads the library with `dlopen` on the main thread and boots the
+panes at once, so a pane never waits behind another widget's compile. A widget edited
+since it was built doesn't match and goes to the JIT as before. The guard counts a
+widget library's code as widget code (`guard/widget-image!`), so the watchdog can still
+stop it. A loaded library stays loaded.
+
+## Widgets that crash
+
+Widget code runs inside Jim, so `src/guard.coil` keeps a broken widget from taking Jim
+down with it. Every call into a widget (render, events, save, boot, destroy and
+`animating?`) and every task it starts goes through `guard/call!`. The call saves its
+place with `sigsetjmp`. Coil can't mark a function as returning twice, so `enter` makes
+that call in LLVM IR, whose `returns_twice` tells the optimizer.
+
+Each of these jumps back with `siglongjmp`, and the call reports the signal:
+- a fault, or a trap;
+- an abort, which is what a failed check, assertion or panic does;
+- a main-thread call running past two seconds, which a watchdog thread interrupts.
+
+Signal handlers run on a stack of their own, so a stack overflow is caught too.
+`src/widgets.coil` then marks the runtime crashed and never calls into that widget again,
+not even `destroy!`, since its memory may be broken. Its code stays mapped until its
+tasks end. The pane says what happened and offers Restart, which boots it from its last
+good save. Saving the widget's file boots the new code.
+
+A crash is saved with the layout (`jim.crashed`, `jim.crash-stamp`), so after a relaunch
+the pane stays stopped until it's restarted or its file changes.
+
+Widgets compile with `coil.safety` (`safety-prelude`). An out-of-bounds index, a null
+read or a double free then fails a check and stops the widget where it happens, instead
+of corrupting memory to fail later somewhere else. It costs about 2.6× on a heavy render
+(the README in the markdown widget: 2.3 → 6 ms) and about 0.35 s per compile. The shim
+caps the debug allocator's quarantine at 8 MiB per source.
+
+Two cases aren't recovered, because jumping out would abandon a lock the rest of Jim
+needs:
+- **A fault inside the system allocator**, which holds its zone lock while it works.
+- **A hang interrupt that lands outside widget code.** The guard records each loaded
+  image's `__TEXT` range. Widget code is JIT-compiled and lies outside all of them, while
+  system libraries and Jim itself lie inside one. When the interrupt lands in an image,
+  the watchdog tries again 50 ms later.
+
+A crash that isn't recovered writes the widget's name to `~/.jim-coil/widget-crash`
+before Jim ends. On the next launch, `widget-view/protect!` reads it, and restored panes
+of that widget stay stopped.
+
+`coil.panic` keeps a panic's message and place to itself, so the pane only says to look
+in Jim's log, where the report names the file and line.
+
+## The editor
+
+`widgets/editor.coil` edits text in the widget's native text area (an `NSTextView`).
+As in original Jim, a pane's text is part of its saved state, so a pane needs no file.
+**Editor: New note** opens a note whose text comes back after reloads and restarts.
+⌘S on a note shows the Save sheet and attaches the pane to the file chosen. ⌘O opens a
+file in a new pane, so a note's text is never replaced.
+
+A file-backed pane keeps the file's contents as of its last read or write beside the
+text, and reads the file again before writing. If someone else changed it meanwhile,
+the editor reports a conflict instead of writing, and offers Reload or Overwrite. A
+watched change that arrives with nothing unsaved just replaces the text. A restored pane
+takes its text from the saved state and then compares the file with what it last read,
+so a change made while Jim was closed reloads a clean pane and conflicts with unsaved
+edits.
+
+Showing a reload in a text area that has the keyboard needs `sync-fields!` in
+`src/widget_view.coil` to write the widget's value into it while it's being edited.
+Writing every frame would fight the typing, so each field remembers the value the
+widget gave last and takes a new one only when the widget changed it. Typing doesn't
+count: the next frame's value is what the view already holds.
+
 ## Control from outside
 
 `jimc` (`src/jimc/main.coil`) spells a command line as one JSON request, sends it and

@@ -1,0 +1,94 @@
+(module jim.guard-test)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "jim.guard" :as guard)
+
+(extern abort :cc (cc/C) [] (-> void))
+
+(defn ran [] (-> (ptr i64))
+  (p/alloc-static i64))
+
+(defn fine [(arg (ptr i8))] (-> void)
+  (set! (ran) (+ (load (ran)) 1))
+  (do))
+
+(export-c [fine :as "jim_guard_test_fine"])
+
+(defn null-read [(arg (ptr i8))] (-> void)
+  (set! (ran) (load (p/cast (ptr i64) arg)))
+  (do))
+
+(export-c [null-read :as "jim_guard_test_null_read"])
+
+(defn aborts [(arg (ptr i8))] (-> void)
+  (abort)
+  (do))
+
+(export-c [aborts :as "jim_guard_test_aborts"])
+
+(defn deep-cell [] (-> (ptr (ptr i8)))
+  (p/alloc-static (ptr i8)))
+
+;;; Recursion the optimizer can't turn into a loop: each call goes through a
+;;; pointer read at run time, and keeps its frame's array alive for the callee.
+(defn deep [(n i64) (above (ptr i64))] (-> i64)
+  (let [(mut pad) (zeroed (array i64 64))
+        f
+          (p/cast (fnptr (cc/C) [i64 (ptr i64)] i64)
+                  (p/volatile-load (ptr i8) (deep-cell)))]
+    (set! (index (p/cast (ptr i64) (mut pad)) 0) (+ n (load above)))
+    (+ (call-ptr f (+ n 1) (p/cast (ptr i64) (mut pad))) 1)))
+
+(export-c [deep :as "jim_guard_test_deep"])
+
+(defn overflows [(arg (ptr i8))] (-> void)
+  (let [(mut start) 0]
+    (p/volatile-store! (deep-cell) (p/cast (ptr i8) (fnptr-of deep)))
+    (set! (ran) (deep 0 (mut start))))
+  (do))
+
+(export-c [overflows :as "jim_guard_test_overflows"])
+
+(defn nested [(arg (ptr i8))] (-> void)
+  (set! (ran)
+        (guard/call! (p/cast (ptr i8) (fnptr-of null-read))
+                     (p/cast (ptr i8) 0)
+                     "inner"))
+  (do))
+
+(export-c [nested :as "jim_guard_test_nested"])
+
+(defn run [(f (ptr i8))] (-> i64)
+  (guard/call! f (p/cast (ptr i8) 0) "test"))
+
+(deftest crashes-in-guarded-calls-come-back
+  (assert (guard/install! "" 0))
+  (set! (ran) 0)
+  (assert (= (run (p/cast (ptr i8) (fnptr-of fine))) 0))
+  (assert (= (load (ran)) 1))
+  (assert (= (run (p/cast (ptr i8) (fnptr-of null-read))) 11))
+  (assert (= (run (p/cast (ptr i8) (fnptr-of aborts))) 6))
+  ; A stack overflow is a fault too, handled on the signal stack.
+  (let [s (run (p/cast (ptr i8) (fnptr-of overflows)))]
+    (assert (or (= s 11) (= s 10))))
+  ; An inner guard takes its own crash; the outer call goes on.
+  (assert (= (run (p/cast (ptr i8) (fnptr-of nested))) 0))
+  (assert (= (load (ran)) 11))
+  ; Everything still works afterwards, more than once.
+  (set! (ran) 0)
+  (assert (= (run (p/cast (ptr i8) (fnptr-of fine))) 0))
+  (assert (= (run (p/cast (ptr i8) (fnptr-of null-read))) 11))
+  (assert (= (run (p/cast (ptr i8) (fnptr-of fine))) 0))
+  (assert (= (load (ran)) 2)))
+
+(deftest code-in-a-widget-library-is-widget-code
+  (assert (guard/install! "" 0))
+  ; This test binary is a loaded image, so its code is off limits to the watchdog
+  ; until it is named a widget's library.
+  (let [pc (p/cast i64 (p/cast (ptr i8) (fnptr-of fine)))]
+    (assert (guard/in-image? pc))
+    (assert (guard/widget-image! pc))
+    (assert (not (guard/in-image? pc)))
+    ; Naming it again changes nothing.
+    (assert (not (guard/widget-image! pc)))
+    (assert (not (guard/in-image? pc)))))

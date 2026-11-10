@@ -4,7 +4,6 @@
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
 (import "coil.fs" :as fs)
-(import "coil.os" :as os)
 (import "coil.serde" :use *)
 (import "coil.serde.derive" :use *)
 (import "jim.widget-api" :use *)
@@ -40,26 +39,6 @@
   (text/set-str! (field s status) message))
 
 ;;; ---- loading -----------------------------------------------------------------
-(defn resolve-path [(s (ptr Markdown))
-                    (path (slice u8))
-                    (out (ptr (ArrayList u8)))] (-> void)
-  (cond (text/starts-with? path "~/")
-          (let [home (os/getenv c"HOME")]
-            (when (!= (p/cast i64 home) 0)
-              (let [c (p/cast (ptr u8) home)
-                    (mut n) 0]
-                (while (!= (load (index c (load n))) (: 0 u8))
-                  (set! n (+ (load n) 1)))
-                (text/push-str! out (slice::new c (load n))))
-              0)
-            (text/push-str! out (text/from path 1)))
-        (text/starts-with? path "/") (text/push-str! out path)
-        :else
-          (do
-            (text/push-str! out (slice (.project s)))
-            (text/push-str! out "/")
-            (text/push-str! out path))))
-
 (defn load! [(s (ptr Markdown)) (path (slice u8))] (-> void)
   (if (= (len path) 0)
       (do
@@ -68,7 +47,7 @@
         (clear! (mut (.full s)))
         (say! s "welcome"))
       (let [(mut full) (ArrayList::new [u8] (alloc/malloc-allocator))]
-        (resolve-path s path (mut full))
+        (text/push-resolved! (mut full) (slice (.project s)) path)
         (text/set-str! (field s full) (slice full))
         (try (let [bytes
                      (try-or! (fs/read-file (alloc/malloc-allocator)

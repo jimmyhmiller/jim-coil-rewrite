@@ -84,6 +84,8 @@
 
 (const FAULT-CHILD-OF-LEAF 6)
 
+(const FAULT-BAD-KEY 7)
+
 ;;; One element. Children are an intrusive list of node indices. Text, ids and
 ;;; placeholders are byte ranges in Ui.bytes. Colors are 0xRRGGBB, or NONE.
 ;;; Width and height 0 mean "size to content"; grow shares a row's spare width.
@@ -124,13 +126,18 @@
    (id-at i64)
    (id-len i64)
    (placeholder-at i64)
-   (placeholder-len i64)])
+   (placeholder-len i64)
+   ;; The key that presses this element with ⌘, or 0.
+   (key i64)])
 
 (defstruct Watch [(at i64) (len i64)])
+
+(defstruct Shortcut [(key i64) (at i64) (len i64)])
 
 (defstruct Ui
   [(nodes (ArrayList Node))
    (watches (ArrayList Watch))
+   (shortcuts (ArrayList Shortcut))
    (bytes (ArrayList u8))
    (open (ArrayList i64))
    (width f64)
@@ -144,6 +151,7 @@
   (Ui
     :nodes (ArrayList::new [Node] a)
     :watches (ArrayList::new [Watch] a)
+    :shortcuts (ArrayList::new [Shortcut] a)
     :bytes (ArrayList::new [u8] a)
     :open (ArrayList::new [i64] a)
     :width 0.0
@@ -156,6 +164,7 @@
 (defn ui-free! [(ui (ptr Ui))] (-> void)
   (free! (mut (.nodes ui)))
   (free! (mut (.watches ui)))
+  (free! (mut (.shortcuts ui)))
   (free! (mut (.bytes ui)))
   (free! (mut (.open ui)))
   (do))
@@ -166,6 +175,7 @@
   (-> void)
   (clear! (mut (.nodes ui)))
   (clear! (mut (.watches ui)))
+  (clear! (mut (.shortcuts ui)))
   (clear! (mut (.bytes ui)))
   (clear! (mut (.open ui)))
   (set! (.width ui) width)
@@ -244,7 +254,8 @@
     :id-at 0
     :id-len 0
     :placeholder-at 0
-    :placeholder-len 0))
+    :placeholder-len 0
+    :key 0))
 
 ;;; Append a node under the innermost open container. Returns its index, or
 ;;; NONE when the tree already has a closed root.
@@ -447,15 +458,18 @@
     (do)))
 
 ;;; A native single-line text field. Editing delivers INPUT-CHANGE events and
-;;; Return delivers INPUT-SUBMIT; both carry the field's whole text. VALUE is
-;;; applied only while the field is not being edited.
+;;; Return delivers INPUT-SUBMIT; both carry the field's whole text. While the
+;;; field is being edited, VALUE replaces its text only when it differs from the
+;;; VALUE of the frame before, so a field shows what the widget changed (a file
+;;; reloaded, a box cleared) without fighting the typing.
 (defn input! [(ui (ptr Ui))
               (id (slice u8))
               (value (slice u8))
               (placeholder (slice u8))] (-> void)
   (field! ui INPUT id value placeholder 1))
 
-;;; A native multi-line text area, ROWS lines tall. ⌘Return submits.
+;;; A native multi-line text area, ROWS lines tall; height! overrides ROWS.
+;;; ⌘Return submits. VALUE is applied as for input!.
 (defn textarea! [(ui (ptr Ui))
                  (id (slice u8))
                  (value (slice u8))
@@ -574,6 +588,34 @@
     (set! (.checked n) selected)
     (do)))
 
+;;; ⌘KEY presses the element made most recently, a button, toggle or clickable
+;;; container, while its pane has the keyboard. KEY is one lowercase letter or
+;;; digit. Jim's own shortcuts come first, so ⌘T stays a new terminal.
+(defn key! [(ui (ptr Ui)) (key (slice u8))] (-> void)
+  (let [c (if (= (len key) 1) (primitive/cast i64 (get key 0)) 0)]
+    (if (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)))
+        (set! (.key (styled ui)) c)
+        (fault! ui FAULT-BAD-KEY))
+    (do)))
+
+;;; ⌘KEY delivers a CLICK with ID while the pane has the keyboard, with nothing to
+;;; click on screen. KEY is as for key!; an element's key! wins over a shortcut!.
+(defn shortcut! [(ui (ptr Ui)) (key (slice u8)) (id (slice u8))] (-> void)
+  (let [c (if (= (len key) 1) (primitive/cast i64 (get key 0)) 0)]
+    (if (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)))
+        (let [at (copy-bytes! ui id)]
+          (push! (mut (.shortcuts ui))
+                 (Shortcut
+                   :key c
+                   :at at
+                   :len (len id)))
+          (do))
+        (fault! ui FAULT-BAD-KEY))
+    (do)))
+
+(defn shortcut-id [(ui (ptr Ui)) (s Shortcut)] (-> (slice u8))
+  (bytes-at ui (.at s) (.len s)))
+
 ;;; Requests a widget makes of Jim while handling an event.
 (const OPEN-WIDGET 1)
 
@@ -603,6 +645,13 @@
 
 ;;; Put text on the system clipboard.
 (const COPY-TEXT 11)
+
+;;; Show the Open sheet; the request's text is the directory it starts in.
+(const CHOOSE-FILE 12)
+
+;;; Show the Save sheet; the request's text is the directory it starts in, and its
+;;; second text the file name it suggests.
+(const CHOOSE-SAVE-PATH 13)
 
 (defstruct Request
   [(kind i64)
@@ -692,6 +741,10 @@
 ;;; paths, one per line.
 (const FILES-CHANGED 7)
 
+;;; A sheet choose-file! or choose-save-path! showed was answered: `id` is "open"
+;;; or "save", and `text` the file's path.
+(const FILE-CHOSEN 8)
+
 ;;; `id` and `text` borrow Jim's memory for the duration of the event call.
 ;;; `text` is the field's contents for INPUT-CHANGE and INPUT-SUBMIT.
 (defstruct Event
@@ -722,6 +775,9 @@
 
 (defn files-changed? [(e (ptr Event))] (-> bool)
   (= (.kind e) FILES-CHANGED))
+
+(defn file-chosen? [(e (ptr Event)) (id (slice u8))] (-> bool)
+  (and (= (.kind e) FILE-CHOSEN) (= (.id e) id)))
 
 ;;; True when the event's id starts with PREFIX (for ids like "file:3").
 (defn id-prefix? [(e (ptr Event)) (prefix (slice u8))] (-> bool)
@@ -785,6 +841,21 @@
 ;;; Put TEXT on the system clipboard.
 (defn copy-text! [(e (ptr Event)) (text (slice u8))] (-> void)
   (push-request! (.requests e) COPY-TEXT text "" 0.0))
+
+;;; Ask which file to open, with the Open sheet starting in DIRECTORY. The sheet
+;;; doesn't hold anything up. Choosing a file delivers FILE-CHOSEN "open"; cancelling
+;;; delivers nothing. While one sheet is up, another request is ignored.
+(defn choose-file! [(e (ptr Event)) (directory (slice u8))] (-> void)
+  (push-request! (.requests e) CHOOSE-FILE directory "" 0.0))
+
+;;; Ask where to save, with the Save sheet starting in DIRECTORY and suggesting
+;;; NAME. The sheet asks before replacing a file that exists. Choosing delivers
+;;; FILE-CHOSEN "save"; cancelling delivers nothing. Ignored while a sheet is up.
+(defn choose-save-path! [(e (ptr Event))
+                         (directory (slice u8))
+                         (name (slice u8))]
+  (-> void)
+  (push-request! (.requests e) CHOOSE-SAVE-PATH directory name 0.0))
 
 ;;; Open a terminal pane in DIRECTORY.
 (defn open-terminal! [(e (ptr Event)) (directory (slice u8))] (-> void)

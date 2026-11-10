@@ -54,14 +54,30 @@
       (widgets/free! r)
       ok)))
 
+(deftest widgets-built-ahead-of-time-load-at-once
+  ; scripts/test.sh builds build/widget-cache first. A widget whose library matches
+  ; its sources is live as soon as it loads, with no compile to wait for.
+  (let [r (widgets/create "counter" "." "")]
+    (widgets/reload! r)
+    (assert (widgets/live? r))
+    (assert (not (widgets/loading? r)))
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (click! r "inc")
+    (assert (has-text? r "n = 1"))
+    (widgets/free! r)))
+
 (deftest every-widget-compiles-and-boots
+  ; Through the JIT, as after an edit, not from the libraries built ahead of time.
+  (widgets/set-cache! false)
   (assert (boots? "counter"))
   (assert (boots? "git"))
   (assert (boots? "stage"))
   (assert (boots? "markdown"))
+  (assert (boots? "editor"))
   (assert (boots? "branches"))
   (assert (boots? "diff"))
-  (assert (boots? "diffwall")))
+  (assert (boots? "diffwall"))
+  (widgets/set-cache! true))
 
 (defn probe-source [(label (slice u8)) (extra bool)] (-> (slice u8))
   (let [(mut b) (StrBuf::new (alloc/malloc-allocator))]
@@ -96,6 +112,8 @@
                  true))))
 
 (extern mkdir :cc (cc/C) [(ptr i8) u16] (-> i32))
+
+(extern unlink :cc (cc/C) [(ptr i8)] (-> i32))
 
 (deftest panes-of-a-source-share-one-compile
   (mkdir c"build" (: 493 u16))
@@ -289,6 +307,18 @@
     (api/ui-clear! (mut ui) 100.0 100.0 0.0)
     (api/bg! (mut ui) 0x112233)
     (assert (= (.fault ui) api/FAULT-STYLE-WITHOUT-ELEMENT))
+    ; A key is one lowercase letter or digit.
+    (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+    (api/vstack! (mut ui) 0.0 0.0)
+    (api/button! (mut ui) "go" "Go")
+    (api/key! (mut ui) "O")
+    (assert (= (.fault ui) api/FAULT-BAD-KEY))
+    (api/ui-clear! (mut ui) 100.0 100.0 0.0)
+    (api/vstack! (mut ui) 0.0 0.0)
+    (api/button! (mut ui) "go" "Go")
+    (api/key! (mut ui) "7")
+    (assert (= (.fault ui) 0))
+    (assert (= (.key (api/node (mut ui) 1)) 55))
     (api/ui-free! (mut ui))))
 
 (deftest styles-apply-to-the-latest-element
@@ -341,6 +371,8 @@
   (try (let [v (try-or! (time/monotonic-now-ms) 0)] v)))
 
 (deftest reload-returns-before-the-compile-finishes
+  ; The JIT's path: a widget built ahead of time loads at once instead.
+  (widgets/set-cache! false)
   (let [r (widgets/create "counter" "." "")
         t0 (now-ms)]
     (widgets/reload! r)
@@ -349,7 +381,8 @@
     (assert (widgets/loading? r))
     (assert (widgets/settle! r))
     (assert (not (widgets/loading? r)))
-    (widgets/free! r)))
+    (widgets/free! r))
+  (widgets/set-cache! true))
 
 (deftest state-survives-a-restart
   (let [r (widgets/create "counter" "." "")]
@@ -413,6 +446,170 @@
     (assert (widgets/render! r 400.0 300.0 0.0))
     (assert (has-text? r "heard 2"))
     (widgets/free! r)))
+
+;;; The text the widget gave element ID.
+(defn element-text [(r (ptr widgets/Runtime)) (id (slice u8))] (-> (slice u8))
+  (let [i (find-id r id)]
+    (assert (>= i 0))
+    (api/node-text (field r ui) (api/node (field r ui) i))))
+
+(defn write-note! [(text (slice u8))] (-> void)
+  (assert (try (let [_
+                       (try-or! (fs/write-file (alloc/malloc-allocator)
+                                               "build/widget-tests/note.txt"
+                                               text)
+                                false)]
+                 true))))
+
+;;; The file at PATH, or "" when it can't be read.
+(defn read-text [(path (slice u8))] (-> (slice u8))
+  (try (let [bytes (try-or! (fs/read-file (alloc/malloc-allocator) path) "")]
+         bytes)))
+
+(defn note [] (-> (slice u8))
+  (read-text "build/widget-tests/note.txt"))
+
+(defn type! [(r (ptr widgets/Runtime)) (text (slice u8)) (submit bool)]
+  (-> void)
+  (widgets/input! r "text" text submit)
+  (assert (widgets/render! r 400.0 300.0 0.0)))
+
+(defn editor-in [(args (slice u8))] (-> (ptr widgets/Runtime))
+  (let [r (widgets/create "editor" "build/widget-tests" args)]
+    (widgets/reload! r)
+    (assert (widgets/settle! r))
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    r))
+
+;;; R saved and booted again in a new runtime, as after relaunching Jim.
+(defn relaunched [(r (ptr widgets/Runtime)) (args (slice u8))]
+  (-> (ptr widgets/Runtime))
+  (let [(mut saved) (api/snapshot-new (alloc/malloc-allocator))]
+    (assert (widgets/save-state! r (mut saved)))
+    (widgets/free! r)
+    (let [again (widgets/create "editor" "build/widget-tests" args)]
+      (widgets/restore-state! again (load saved))
+      (widgets/reload! again)
+      (assert (widgets/settle! again))
+      (assert (widgets/render! again 400.0 300.0 0.0))
+      again)))
+
+;;; Press the shortcut! for ID, as ⌘ and its key do.
+(defn shortcut! [(r (ptr widgets/Runtime)) (key i64) (id (slice u8))] (-> void)
+  (let [u (field r ui)
+        (mut found) false]
+    (for [i 0 (len (.shortcuts (.ui r)))]
+      (let [sc (get (.shortcuts (.ui r)) i)]
+        (when (and (= (.key sc) key) (= (api/shortcut-id u sc) id))
+          (set! found true))))
+    (assert (load found))
+    (widgets/click! r id)
+    (assert (widgets/render! r 400.0 300.0 0.0))))
+
+(defn only-request [(r (ptr widgets/Runtime))] (-> api/Request)
+  (let [q (widgets/requests r)]
+    (assert (= (len (.items q)) 1))
+    (get (.items q) 0)))
+
+(deftest an-editor-note-keeps-its-text-without-a-file
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (unlink c"build/widget-tests/saved-note.md")
+  (let [r (editor-in "")]
+    (assert (= (element-text r "text") ""))
+    (assert (= (api/title (field r ui)) "Note"))
+    (type! r "hello\n" false)
+    ; Its text comes back after a restart, with no file anywhere.
+    (let [again (relaunched r "")]
+      (assert (= (element-text again "text") "hello\n"))
+      ; The pane is only the text.
+      (assert (< (find-id again "save") 0))
+      (assert (< (find-id again "open") 0))
+      ; ⌘S on a note asks where to save it, then attaches the pane to that file.
+      (shortcut! again 115 "save")
+      (let [item (only-request again)]
+        (assert (= (.kind item) api/CHOOSE-SAVE-PATH))
+        (assert (= (api/request-text (widgets/requests again) item)
+                   "build/widget-tests"))
+        (assert (= (api/request-text2 (widgets/requests again) item) "Note.md")))
+      (api/requests-clear! (widgets/requests again))
+      (widgets/file-chosen! again "save" "build/widget-tests/saved-note.md")
+      (assert (widgets/render! again 400.0 300.0 0.0))
+      (assert (= (read-text "build/widget-tests/saved-note.md") "hello\n"))
+      (assert (= (api/title (field again ui)) "saved-note.md"))
+      ; ⌘O opens the chosen file in a pane of its own.
+      (shortcut! again 111 "open")
+      (assert (= (.kind (only-request again)) api/CHOOSE-FILE))
+      (api/requests-clear! (widgets/requests again))
+      (widgets/file-chosen! again "open" "/tmp/other.txt")
+      (let [item (only-request again)]
+        (assert (= (.kind item) api/OPEN-WIDGET))
+        (assert (= (api/request-text (widgets/requests again) item)
+                   "editor /tmp/other.txt")))
+      (api/requests-clear! (widgets/requests again))
+      (assert (= (element-text again "text") "hello\n"))
+      (widgets/free! again)))
+  (unlink c"build/widget-tests/saved-note.md"))
+
+(deftest an-editor-on-a-file-saves-reloads-and-keeps-unsaved-edits
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (write-note! "first\n")
+  (let [r (editor-in "note.txt")]
+    (assert (= (element-text r "text") "first\n"))
+    ; The frame watches the file it shows.
+    (assert (= (len (.watches (.ui r))) 1))
+    ; ⌘S writes what was typed.
+    (type! r "first\nsecond\n" false)
+    (assert (= (api/title (field r ui)) "note.txt •"))
+    (shortcut! r 115 "save")
+    (assert (= (note) "first\nsecond\n"))
+    (assert (= (api/title (field r ui)) "note.txt"))
+    ; Hearing about its own save changes nothing.
+    (widgets/files-changed! r "" "")
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (= (element-text r "text") "first\nsecond\n"))
+    ; A change on disk shows up when nothing is unsaved.
+    (write-note! "outside\n")
+    (widgets/files-changed! r "" "")
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (= (element-text r "text") "outside\n"))
+    ; Under unsaved edits it is a conflict, and saving doesn't write over it.
+    (type! r "mine\n" false)
+    (write-note! "theirs\n")
+    (widgets/files-changed! r "" "")
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (>= (find-id r "overwrite") 0))
+    (assert (= (element-text r "text") "mine\n"))
+    (type! r "mine\n" true)
+    (assert (= (note) "theirs\n"))
+    ; The unsaved edits and the conflict survive a restart.
+    (let [again (relaunched r "note.txt")]
+      (assert (= (element-text again "text") "mine\n"))
+      (assert (>= (find-id again "overwrite") 0))
+      (click! again "overwrite")
+      (assert (= (note) "mine\n"))
+      (assert (< (find-id again "overwrite") 0))
+      ; A clean pane takes a change made while Jim was closed.
+      (let [(mut saved) (api/snapshot-new (alloc/malloc-allocator))]
+        (assert (widgets/save-state! again (mut saved)))
+        (widgets/free! again)
+        (write-note! "while away\n")
+        (let [later (widgets/create "editor" "build/widget-tests" "note.txt")]
+          (widgets/restore-state! later (load saved))
+          (widgets/reload! later)
+          (assert (widgets/settle! later))
+          (assert (widgets/render! later 400.0 300.0 0.0))
+          (assert (= (element-text later "text") "while away\n"))
+          (widgets/free! later)))))
+  ; A file that doesn't exist yet is created by the first save.
+  (unlink c"build/widget-tests/new-note.txt")
+  (let [r (editor-in "new-note.txt")]
+    (assert (= (element-text r "text") ""))
+    (type! r "fresh\n" true)
+    (assert (= (read-text "build/widget-tests/new-note.txt") "fresh\n"))
+    (widgets/free! r))
+  (unlink c"build/widget-tests/new-note.txt"))
 
 (defn sleeper-source [(label (slice u8))] (-> (slice u8))
   (let [(mut b) (StrBuf::new (alloc/malloc-allocator))]
@@ -695,3 +892,153 @@
   (let [(mut out) (ArrayList::new [u8] (alloc/malloc-allocator))]
     (extend! (mut out) (data s) (len s))
     (load out)))
+
+;;; A widget that crashes on request: "jim.args" names how. Its count survives
+;;; reloads, so a restart can show it kept its state.
+(defn crasher-source [] (-> (slice u8))
+  "(module widgets.crasher)
+(import \"coil.primitive\" :as p)
+(import \"coil.alloc\" :as alloc)
+(import \"coil.slice\" :use *)
+(import \"jim.widget-api\" :use *)
+(defstruct Fault [(n i64)])
+(impl Task Fault (run [(self (ptr Fault))] (-> void) (set! (.n self) (load (p/cast (ptr i64) 0))) (do)))
+(defstruct Crasher [(how (array u8 32)) (len i64) (n i64) (host (dyn Host)) (task i64)])
+(defn how [(self (ptr Crasher))] (-> (slice u8)) (slice::new (p/cast (ptr u8) (field self how)) (.len self)))
+(defn spin [(n i64)] (-> i64) (let [(mut i) n] (while (>= (load i) 0) (set! i (+ (load i) 1))) (load i)))
+(impl Widget Crasher
+  (render [(self (ptr Crasher)) (ui (ptr Ui))] (-> void)
+    (when (= (how self) \"render\") (set! (.n self) (load (p/cast (ptr i64) 0))) 0)
+    (vstack! ui 0.0 0.0) (text! ui \"n \" 12.0 0 false) (append-i64! ui (.n self)) (button! ui \"go\" \"go\") (end! ui))
+  (event [(self (ptr Crasher)) (e (ptr Event))] (-> void)
+    (when (clicked? e \"go\")
+      (set! (.n self) (+ (.n self) 1))
+      (cond (= (how self) \"panic\") (panic \"boom {}\" (.n self))
+            (= (how self) \"hang\") (set! (.n self) (spin (.n self)))
+            (= (how self) \"task\") (set! (.task self) (start-task (.host self) (alloc/box! (alloc/malloc-allocator) Fault (Fault :n 0))))
+            :else 0)
+      0))
+  (save [(self (ptr Crasher)) (s (ptr Snapshot))] (-> void) (put-i64! s \"n\" (.n self)))
+  (animating? [(self (ptr Crasher))] (-> bool) false)
+  (destroy! [(self (ptr Crasher))] (-> void) (alloc/destroy [Crasher] (alloc/malloc-allocator) self) (do)))
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (let [how (get-text saved \"jim.args\" \"\")
+        c (alloc/box! (alloc/malloc-allocator) Crasher (Crasher :how (zeroed (array u8 32)) :len (len how) :n (get-i64 saved \"n\" 0) :host (host saved) :task 0))]
+    (for [i 0 (len how)] (set! (index (p/cast (ptr u8) (field c how)) i) (get how i)))
+    (when (= how \"boot\") (set! (.n c) (load (p/cast (ptr i64) 0))) 0)
+    (set! out c)))
+")
+
+(defn crasher [(how (slice u8))] (-> (ptr widgets/Runtime))
+  (let [r (widgets/create-in "build/widget-tests" "crasher" "." how)]
+    (widgets/reload! r)
+    (widgets/settle! r)
+    r))
+
+(defn stopped-while? [(r (ptr widgets/Runtime)) (doing (slice u8))] (-> bool)
+  (and (widgets/crashed? r)
+       (not (widgets/live? r))
+       (contains? (widgets/diagnostic r) doing)))
+
+(deftest a-crashing-widget-stops-and-jim-carries-on
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (assert (try (let [_
+                       (try-or! (fs/write-file (alloc/malloc-allocator)
+                                               "build/widget-tests/crasher.coil"
+                                               (crasher-source))
+                                false)]
+                 true)))
+  ; A null read while drawing fails a check and stops that pane; another pane of
+  ; the same code runs on.
+  (let [bad (crasher "render")
+        good (crasher "")]
+    (assert (not (widgets/render! bad 400.0 300.0 0.0)))
+    (assert (stopped-while? bad "drawing: it failed a check"))
+    (assert (widgets/render! good 400.0 300.0 0.0))
+    (click! good "go")
+    (assert (has-text? good "n 1"))
+    ; Nothing calls into the stopped widget again.
+    (assert (not (widgets/render! bad 400.0 300.0 0.0)))
+    (assert (not (widgets/animating? bad)))
+    (widgets/free! bad)
+    (widgets/free! good))
+  ; So does a panic.
+  (let [r (crasher "panic")]
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (widgets/activate! r (find-id r "go")))
+    (assert (stopped-while? r
+                            "handling an event: it failed a check or assertion, or panicked"))
+    (assert (contains? (widgets/diagnostic r) "in Jim's log"))
+    (widgets/free! r))
+  ; A call that never returns is stopped once it runs past the limit.
+  (widgets/protect! "")
+  (guard-limit! 300)
+  (let [r (crasher "hang")]
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (widgets/activate! r (find-id r "go")))
+    (assert (stopped-while? r "it ran too long"))
+    (widgets/free! r))
+  (guard-limit! widgets/HANG-LIMIT-MS)
+  ; So does one that crashes as it starts.
+  (let [r (crasher "boot")]
+    (assert (stopped-while? r "starting"))
+    (widgets/free! r))
+  ; And one whose background task crashes, the next time Jim calls it.
+  (let [r (crasher "task")]
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (widgets/activate! r (find-id r "go")))
+    (let [(mut tries) 0]
+      (while (and (< (load tries) 500) (not (widgets/crashed? r)))
+        (usleep (: 2000 u32))
+        (widgets/render! r 400.0 300.0 0.0)
+        (set! tries (+ (load tries) 1))))
+    (assert (stopped-while? r "running a background task"))
+    (widgets/free! r))
+  (widgets/service-poll!))
+
+(defn guard-limit! [(ms i64)] (-> void)
+  (widgets/set-hang-limit! ms))
+
+(deftest a-stopped-widget-restarts-from-its-last-save-and-stays-stopped-across-runs
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (assert (try (let [_
+                       (try-or! (fs/write-file (alloc/malloc-allocator)
+                                               "build/widget-tests/crasher.coil"
+                                               (crasher-source))
+                                false)]
+                 true)))
+  (let [r (crasher "panic")
+        (mut saved) (api/snapshot-new (alloc/malloc-allocator))]
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    ; A good save, then the crash: the click counted to 1 before panicking.
+    (assert (widgets/save-state! r (mut saved)))
+    (api/snapshot-free! (mut saved))
+    (set! saved (api/snapshot-new (alloc/malloc-allocator)))
+    (assert (widgets/activate! r (find-id r "go")))
+    (assert (widgets/crashed? r))
+    ; Saving a stopped widget keeps its last good state and that it stopped.
+    (assert (widgets/save-state! r (mut saved)))
+    (assert (= (api/get-i64 (mut saved) "n" -1) 0))
+    (assert (> (len (api/get-text (mut saved) "jim.crashed" "")) 0))
+    ; Restart boots it from that state.
+    (widgets/restart! r)
+    (assert (widgets/live? r))
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (has-text? r "n 0"))
+    (widgets/free! r)
+    ; Restored in a later run, it stays stopped until restarted.
+    (let [again (widgets/create-in "build/widget-tests" "crasher" "." "panic")]
+      (widgets/restore-state! again (load saved))
+      (widgets/reload! again)
+      (widgets/settle! again)
+      (assert (widgets/crashed? again))
+      (assert (not (widgets/live? again)))
+      (widgets/restart! again)
+      (widgets/settle! again)
+      (assert (widgets/live? again))
+      (assert (widgets/render! again 400.0 300.0 0.0))
+      (assert (has-text? again "n 0"))
+      (widgets/free! again)))
+  (widgets/service-poll!))

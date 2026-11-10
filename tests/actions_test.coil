@@ -67,3 +67,14 @@
     (set! (.picked state) 2)
     (assert (= (palette/take-pick!) 2))
     (assert (= (palette/take-pick!) -1))))
+
+(deftest the-editor-is-found-without-opening-a-widget
+  (assert (>= (actions/match-score (ns c"editor") 33) 0))
+  (assert (>= (actions/match-score (ns c"edit") 34) 0))
+  (assert (>= (actions/match-score (ns c"note") 34) 0))
+  (assert (>= (actions/match-score (ns c"open file") 33) 0))
+  ; Typing "editor" ranks both above opening a widget by name.
+  (assert (> (actions/match-score (ns c"editor") 33)
+             (actions/match-score (ns c"editor") 28)))
+  (assert (> (actions/match-score (ns c"editor") 34)
+             (actions/match-score (ns c"editor") 28))))

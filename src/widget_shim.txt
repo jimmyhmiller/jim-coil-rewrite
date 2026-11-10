@@ -1,0 +1,20 @@
+; Compiled after every widget, in the widget's own module: Jim boots widgets
+; through jim_shim_boot, whatever the widget named its imports. src/widgets.coil
+; embeds this file for the JIT, and scripts/widget_cache.py appends it to each
+; widget it builds ahead of time.
+(import "coil.primitive" :as jim-shim-primitive)
+(import "coil.debug-allocator" :as jim-shim-debug)
+(import "jim.widget-api" :as jim-shim-api)
+
+(defn jim-shim-boot [(saved i64) (out i64)] (-> void)
+  ; coil.safety makes the widget's heap the debug allocator, which holds freed
+  ; blocks back to catch their reuse; keep that to 8 MiB a widget, not its 64.
+  (let [(mut heap) (jim-shim-debug/DebugAllocator::global)]
+    (jim-shim-debug/DebugAllocator::set-quarantine-limit!
+      (load (jim-shim-primitive/cast (ptr (ptr jim-shim-debug/DebugAllocator))
+                                     (mut heap)))
+      8388608))
+  (boot (jim-shim-primitive/cast (ptr jim-shim-api/Snapshot) saved)
+        (jim-shim-primitive/cast (ptr (dyn jim-shim-api/Widget)) out)))
+
+(export-c [jim-shim-boot :as "jim_shim_boot"])

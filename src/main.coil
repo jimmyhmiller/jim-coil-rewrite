@@ -1343,8 +1343,20 @@
           (= id 28)
             (if (>= (.selected s) 0)
                 (palette/prompt! 28
-                                 c"Widget: NAME [ARGS] — e.g. diff, stage, branches, markdown README.md"
+                                 c"Widget: NAME [ARGS] — e.g. diff, stage, branches, editor notes.md"
                                  c"")
+                (do (status! c"Create or show a project first") (do)))
+          (= id 33)
+            (if (>= (.selected s) 0)
+                (widget-view/choose-file-then! (.window s)
+                                               (widget-view/string-bytes (.directory (current)))
+                                               (p/cast (ptr i8)
+                                                       (fnptr-of open-chosen-in-editor)))
+                (do (status! c"Create or show a project first") (do)))
+          (= id 34)
+            (if (>= (.selected s) 0)
+                ; A note with no file: its text is kept with the layout.
+                (do (canvas/add-widget-visible! (current) (ns c"editor")) (do))
                 (do (status! c"Create or show a project first") (do)))
           (= id 32)
             (palette/prompt! 32
@@ -1358,6 +1370,24 @@
           (or (= id 9) (= id 10) (and (>= id 11) (< id 15))) (canvas-action! id)
           (>= (.selected s) 0) (canvas-action! id)
           :else (do (status! c"Create or show a project first") (do)))))
+
+;;; Open PATH, an NSString, in a new editor pane on the current canvas.
+(defn open-in-editor! [(path (ptr i8))] (-> void)
+  (canvas/add-widget-visible! (current)
+                              (msg (ptr i8)
+                                   (ns c"editor ")
+                                   (sel c"stringByAppendingString:")
+                                   [(ptr i8)]
+                                   path))
+  (do))
+
+;;; The Open sheet of Editor: Open file… was answered with PATH.
+(defn open-chosen-in-editor [(path (ptr i8))] (-> void)
+  (if (>= (.selected (shell)) 0)
+      (open-in-editor! path)
+      (do (status! c"Create or show a project first") (do))))
+
+(export-c [open-chosen-in-editor :as "jim_open_chosen_in_editor"])
 
 ;;; Whether answering action ID needs a project to be selected.
 (defn answer-needs-project? [(id i64)] (-> bool)
@@ -2133,7 +2163,9 @@
           (for [i 0 (count)]
             (set! (.space-held (project i)) (= kind 10)))
           0)
-      (cond (and (= kind 10) (= (actions/key-action key flags) 31))
+      (cond ; The Open sheet is AppKit's: typing a file name there is no shortcut.
+            (widget-view/sheet-event? event) false
+            (and (= kind 10) (= (actions/key-action key flags) 31))
               ; Ahead of the palette, which otherwise swallows it, since dictation can
               ; write there. Holding the keys down must not start and stop it repeatedly.
               (do
@@ -2180,6 +2212,7 @@
                 (cond (and command (= key (: 12 u16)))
                         (do (set! (.running s) false) true)
                       (>= action 0) (do (invoke! action) true)
+                      (widget-view/press-key! event) true
                       (.overview s)
                         (do
                           (cond (= key (: 53 u16)) (dive! (.origin s))
@@ -2594,6 +2627,9 @@
 (defn start! [] (-> bool)
   (setenv c"GHOSTTY_RESOURCES_DIR" c"build/ghostty/share/ghostty" 1)
   (adopt-login-path!)
+  (when (not (widget-view/protect!))
+    (printf c"Jim: could not install the widget crash guard.\n")
+    0)
   (widget-view/prewarm!)
   (setup!))
 

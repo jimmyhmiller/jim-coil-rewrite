@@ -9,7 +9,7 @@
 
 ;;; Stable action IDs are shared by shortcuts and the searchable registry.
 ;;; Fixed actions come first; one action per project follows.
-(const FIRST-PROJECT 33)
+(const FIRST-PROJECT 35)
 
 (defn count [] (-> i64)
   (+ FIRST-PROJECT (storage/count (projects/list (load (model))))))
@@ -48,6 +48,8 @@
         (= id 30) c"Project: Import from original Jim"
         (= id 31) c"Dictation: Start or stop hands-free"
         (= id 32) c"Diff: Open diff wall"
+        (= id 33) c"Editor: Open file…"
+        (= id 34) c"Editor: New note"
         :else
           (utf8 (msg (ptr i8)
                      (ns c"Project: ")
@@ -89,6 +91,8 @@
           c" transcribe transcript live speech voice microphone phonon talk"
         (= id 32)
           c" review git changes code canvas tile tiles pull request range"
+        (= id 33) c" edit text note notes file open"
+        (= id 34) c" edit text notes scratch write new editor pane"
         :else c""))
 
 ;;; Original Jim's subsequence score: consecutive and word-start bonuses.

@@ -5,11 +5,14 @@ import plistlib
 import os
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'build/JimCoil.app'
 (APP / 'Contents/MacOS').mkdir(parents=True, exist_ok=True)
 subprocess.run(['coil', 'build', '-o', 'build/jim-next'], cwd=ROOT, check=True)  # also builds build/jim-session and build/jimc
+# Widgets built ahead of time, so Jim loads them at launch instead of compiling them.
+subprocess.run([sys.executable, 'scripts/widget_cache.py'], cwd=ROOT, check=True)
 # Rename a completed executable atomically; never truncate a running image.
 (ROOT / 'build/jim-next').replace(APP / 'Contents/MacOS/jim-coil')
 # Original Jim's icon (assets/PROVENANCE).

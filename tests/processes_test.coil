@@ -16,7 +16,7 @@
     (load code)))
 
 (deftest spawn-returns-at-once-and-collects-output
-  (let [h (services/host (services/services-new))
+  (let [h (services/host (services/services-new "test"))
         (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
         handle
           (api/spawn h
@@ -28,7 +28,7 @@
     (free! (mut out))))
 
 (deftest missing-programs-fail-with-a-message
-  (let [h (services/host (services/services-new))
+  (let [h (services/host (services/services-new "test"))
         (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
         handle (api/spawn h ["jim-no-such-program-anywhere"] "/tmp")]
     (assert (= (wait h handle (mut out)) -1))
@@ -38,7 +38,7 @@
     (free! (mut out))))
 
 (deftest releasing-a-running-process-stops-it
-  (let [h (services/host (services/services-new))
+  (let [h (services/host (services/services-new "test"))
         (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
         handle (api/spawn h ["sleep" "30"] "/tmp")]
     (usleep (: 50000 u32))
@@ -47,7 +47,7 @@
     (free! (mut out))))
 
 (deftest children-see-git-optional-locks-off
-  (let [h (services/host (services/services-new))
+  (let [h (services/host (services/services-new "test"))
         (mut out) (ArrayList::new [u8] (alloc/malloc-allocator))
         handle
           (api/spawn h
@@ -69,7 +69,7 @@
       (do))))
 
 (deftest tasks-run-on-a-worker-and-report-done
-  (let [s (services/services-new)
+  (let [s (services/services-new "test")
         h (services/host s)
         sum
           (alloc/box! (alloc/malloc-allocator)

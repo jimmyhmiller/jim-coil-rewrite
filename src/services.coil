@@ -9,6 +9,7 @@
 (import "coil.atomic" :as atomic)
 (import "jim.widget-api" :as api)
 (import "jim.processes" :as processes)
+(import "jim.guard" :as guard)
 
 ;;; What Jim offers a widget generation, as api/Host: child processes (see
 ;;; jim.processes) and background tasks. Each generation gets its own Services,
@@ -23,7 +24,9 @@
 
 (const ABANDONED 2)
 
-(defstruct Services [(running i64)])
+;;; CRASHED is the signal that stopped one of its tasks (see jim.guard), or 0; NAME
+;;; is the widget's, for the guard.
+(defstruct Services [(running i64) (crashed i64) (name (ArrayList u8))])
 
 (defstruct Record [(task (dyn api/Task)) (owner (ptr Services)) (state i64)])
 
@@ -71,8 +74,13 @@
           (set! (elem (field pool queue) (- i 1)) (get (.queue pool) i)))
         (set! (.len (field pool queue)) (- (len (.queue pool)) 1))
         (unlock! pool)
-        (api/run (.task record))
-        (let [owner (.owner record)]
+        (let [owner (.owner record)
+              sig
+                (guard/call! (p/cast (ptr i8) (fnptr-of run-task))
+                             (p/cast (ptr i8) record)
+                             (slice (.name owner)))]
+          ; The widget hears of it on its next call, and stops.
+          (when (!= sig 0) (atomic/cas (field owner crashed) 0 sig) 0)
           (when (!= (atomic/cas (field record state) PENDING FINISHED)
                     PENDING)
             ; Released while running: nobody will ask about it again.
@@ -81,6 +89,12 @@
           ; Last, so the owner's count reaches zero only after the task's code is done.
           (atomic/sub (field owner running) 1))))
     (p/cast (ptr i8) 0)))
+
+(defn run-task [(arg (ptr i8))] (-> void)
+  (api/run (.task (p/cast (ptr Record) arg)))
+  (do))
+
+(export-c [run-task :as "jim_services_run_task"])
 
 (defn pool [] (-> (ptr Pool))
   (let [pool (pool-cell)]
@@ -150,8 +164,20 @@
     (-> void)
     (release-task task)))
 
-(defn services-new [] (-> (ptr Services))
-  (alloc/box! (alloc/malloc-allocator) Services (Services :running 0)))
+(defn services-new [(name (slice u8))] (-> (ptr Services))
+  (let [a (alloc/malloc-allocator)
+        (mut owned) (ArrayList::new [u8] a)]
+    (extend! (mut owned) (data name) (len name))
+    (alloc/box! a
+                Services
+                (Services
+                  :running 0
+                  :crashed 0
+                  :name (load owned)))))
+
+;;; The signal that stopped one of this generation's tasks, or 0.
+(defn crashed [(s (ptr Services))] (-> i64)
+  (atomic/read (field s crashed)))
 
 (defn host [(s (ptr Services))] (-> (dyn api/Host))
   (p/make-dyn api/Host s))
@@ -161,5 +187,6 @@
   (> (atomic/read (field s running)) 0))
 
 (defn free! [(s (ptr Services))] (-> void)
+  (ArrayList::free! (mut (.name s)))
   (alloc/destroy [Services] (alloc/malloc-allocator) s)
   (do))

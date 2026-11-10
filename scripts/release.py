@@ -9,7 +9,8 @@ with neither (see src/runtime.coil):
                                JIT links no LLVM
   Contents/Frameworks/         any libraries the app links that macOS lacks
                                (none today, so it is left out)
-  Contents/Resources/root/     Coil.toml, src/, widgets/, config/, build/jimc
+  Contents/Resources/root/     Coil.toml, src/, widgets/, config/, build/jimc,
+                               build/widget-cache (widgets built ahead of time)
                                and Ghostty's resources: copied to Application
                                Support on first launch, where Jim works
   Contents/Resources/coil/     lib/coil, the standard library of the toolchain
@@ -160,6 +161,14 @@ def main():
         shutil.copytree(ROOT / name, root / name)
     (root / 'build/ghostty').mkdir(parents=True)
     shutil.copy2(ROOT / 'build/jimc', root / 'build/jimc')
+    # Widgets built ahead of time, which Jim loads instead of compiling them.
+    widget_cache = root / 'build/widget-cache'
+    widget_cache.mkdir(parents=True)
+    widget_libraries = []
+    for path in sorted((ROOT / 'build/widget-cache').glob('*.dylib')):
+        shutil.copy2(path, widget_cache / path.name)
+        shutil.copy2(path.with_suffix('.key'), widget_cache / (path.stem + '.key'))
+        widget_libraries.append(widget_cache / path.name)
     shutil.copytree(ROOT / 'build/ghostty/share', root / 'build/ghostty/share', symlinks=True)
 
     bundled = contents / 'Resources/coil'
@@ -207,7 +216,7 @@ def main():
     # built with. The service shares the app's identity: macOS applies the app's privacy
     # permissions to what the service's shells do.
     identity = os.environ.get('JIM_RELEASE_SIGN_IDENTITY', '-')
-    for path in libraries:
+    for path in libraries + widget_libraries:
         run('codesign', '--force', '--sign', identity, '--timestamp=none', str(path))
     run('codesign', '--force', '--sign', identity, '--timestamp=none',
         '--identifier', 'dev.jim.coil.release', str(service_binary))

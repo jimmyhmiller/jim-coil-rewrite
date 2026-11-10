@@ -919,6 +919,13 @@
                   0)
               (= kind api/FIT-CANVAS) (do (fit-within! c 1.0) 0)
               (= kind api/COPY-TEXT) (do (copy-to-clipboard! text) 0)
+              (= kind api/CHOOSE-FILE) (do (widget-view/choose-file! w text) 0)
+              (= kind api/CHOOSE-SAVE-PATH)
+                (do
+                  (widget-view/choose-save-path! w
+                                                 text
+                                                 (api/request-text2 r item))
+                  0)
               (= kind api/SCROLL-TO)
                 (do (widget-view/scroll-to! w (.value item)) 0)
               (= kind api/EMIT)

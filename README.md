@@ -208,6 +208,7 @@ with Coil's JIT and hot-reloads on save. Open one with the palette action
 | `stage` | `stage.ft` | `stage [REPO]` — stage/unstage hunks or files, commit |
 | `branches` | `branches.ft` | `branches [REPO]` — checkout, new branch, worktrees, diffs |
 | `markdown` | `markdown.ft` | `markdown [PATH]` |
+| `editor` | — | the palette's **Editor: New note** (no file: its text is kept with the layout) or **Editor: Open file…**, or `editor [PATH]`. ⌘S saves (a note asks where), ⌘O opens a file in a new pane |
 | `counter` | `controls_demo.ft` | `counter` |
 | `git` | — | `git` — status and recent commits |
 
@@ -288,6 +289,16 @@ time. The longest passes were first opens, when all of a widget's text is new:
 up to about 14 ms for the markdown widget, under one 60 Hz frame. The first
 text field or text view a process creates sets up AppKit's text system, so Jim
 creates and discards one of each at startup, before its window opens.
+
+**Built ahead of time.** `scripts/build.py` also builds every widget into
+`build/widget-cache`, so a launch loads widgets in milliseconds instead of compiling
+them. A widget you've edited since compiles with the JIT as usual.
+
+**Crashes.** A widget that crashes, fails a check or assertion, panics or runs for more
+than two seconds stops there, and Jim carries on. Widgets compile with `coil.safety`, so
+a bad index or null read is caught where it happens. The pane says what went wrong and
+offers **Restart**, which boots the widget from its last saved state; saving its file
+runs the new code. A panic's message and line are in Jim's log.
 
 **Live refresh.** `watch!` in `render` names paths to watch. Jim follows them
 with FSEvents and delivers changes as `FILES-CHANGED` events. `emit!` sends a

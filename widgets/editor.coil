@@ -1,0 +1,351 @@
+(module widgets.editor)
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.fs" :as fs)
+(import "coil.io" :use [IoError])
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "jim.widget-api" :use *)
+(import "jim.widget-kit.text" :as text)
+(import "jim.widget-kit.git-view" :as gv)
+
+;;; A plain text editor, like original Jim's editor pane.
+;;;
+;;; A pane is a note until it is attached to a file: "editor" (or the palette's
+;;; Editor: New note) opens an empty one. Its text is part of the pane's saved
+;;; state, so it comes back after reloads and restarts with or without a file.
+;;; The pane is only the text: ⌘S on a note asks where to save it (Save As) and
+;;; attaches the pane to that file, ⌘S on a file writes it, and ⌘O opens a file in
+;;; a new pane, as does
+;;; "editor PATH" (relative to the project, absolute, or under "~/"), where a
+;;; file that doesn't exist yet is created by the first save.
+;;;
+;;; A file-backed pane never writes over a change it hasn't seen. When the file
+;;; changes on disk it reloads, unless there are unsaved edits; then it says so
+;;; and offers to reload (dropping the edits) or overwrite. It keeps the file's
+;;; contents as of the last read or write beside the text, so a restart can still
+;;; tell whether the file changed while Jim was closed.
+(defstruct State
+  ;; The file, as given or relative to the project; empty for a note.
+  [(path (ArrayList u8))
+   ;; What is in the text area.
+   (text (ArrayList u8))
+   ;; The file's contents when last read or written; TEXT differs while dirty.
+   (base (ArrayList u8))
+   ;; TEXT differs from the file's.
+   (dirty bool)])
+
+(derive (Serialize (field path (with text-ser text-de))
+                   (field text (with text-ser text-de))
+                   (field base (with text-ser text-de)))
+        (Deserialize (field path (with text-ser text-de))
+                     (field text (with text-ser text-de))
+                     (field base (with text-ser text-de)))
+        State)
+
+(defstruct Editor
+  [(state State)
+   (project (ArrayList u8))
+   ;; The resolved path of the file, watched for outside changes; empty for a note.
+   (full (ArrayList u8))
+   ;; The file changed on disk under unsaved edits.
+   (conflict bool)
+   (status (ArrayList u8))])
+
+(extern strerror :cc (cc/C) [i32] (-> (ptr u8)))
+
+(extern strlen :cc (cc/C) [(ptr u8)] (-> u64))
+
+(defn push-io-error! [(out (ptr (ArrayList u8))) (e IoError)] (-> void)
+  (match e
+    (Errno [code]
+           (let [m (strerror (p/cast i32 code))]
+             (text/push-str! out (slice::new m (p/cast i64 (strlen m))))))
+    (OutOfMemory [] (text/push-str! out "out of memory"))
+    (_ (text/push-str! out "I/O error"))))
+
+(defn say! [(s (ptr Editor)) (message (slice u8))] (-> void)
+  (text/set-str! (field s status) message))
+
+(defn note? [(s (ptr Editor))] (-> bool)
+  (= (len (.full s)) 0))
+
+;;; ---- the file on disk ------------------------------------------------------
+(const DISK-READ 0)
+
+(const DISK-MISSING 1)
+
+(const DISK-FAILED 2)
+
+;;; Read the file at FULL into OUT. On DISK-FAILED the reason is in OUT.
+(defn read-disk [(full (slice u8)) (out (ptr (ArrayList u8)))] (-> i64)
+  (clear! (mut out))
+  (match (fs/read-file (alloc/malloc-allocator) full)
+    (Ok [bytes]
+        (text/push-str! out bytes)
+        (alloc/free [u8] (alloc/malloc-allocator) bytes)
+        DISK-READ)
+    (Err [(Errno [2])] DISK-MISSING)
+    (Err [e] (push-io-error! out e) DISK-FAILED)))
+
+;;; Attach the pane to PATH: kept relative to the project when it is inside it.
+(defn attach! [(s (ptr Editor)) (path (slice u8))] (-> void)
+  (let [(mut prefix) (text/owned (slice (.project s)))]
+    (text/push-str! (mut prefix) "/")
+    (text/set-str! (field (field s state) path)
+                   (if (and (text/starts-with? path (slice prefix))
+                            (> (len path) (len prefix)))
+                       (text/from path (len prefix))
+                       path))
+    (clear! (mut (.full s)))
+    (text/push-resolved! (field s full)
+                         (slice (.project s))
+                         (slice (.path (.state s))))
+    (free! (mut prefix))
+    (do)))
+
+;;; Show the file the pane is attached to as it is on disk.
+(defn load-file! [(s (ptr Editor))] (-> void)
+  (let [st (field s state)
+        (mut disk) (ArrayList::new [u8] (alloc/malloc-allocator))
+        result (read-disk (slice (.full s)) (mut disk))]
+    (set! (.conflict s) false)
+    (set! (.dirty st) false)
+    (cond (= result DISK-FAILED)
+            (do
+              (say! s "Cannot read it: ")
+              (text/push-str! (field s status) (slice disk)))
+          (= result DISK-MISSING)
+            (do
+              (clear! (mut (.text st)))
+              (clear! (mut (.base st)))
+              (clear! (mut (.status s))))
+          :else
+            (do
+              (text/set-str! (field st text) (slice disk))
+              (text/set-str! (field st base) (slice disk))
+              (clear! (mut (.status s)))))
+    (free! (mut disk))
+    (do)))
+
+;;; Write the text to the file. Without FORCE, a file that changed on disk since
+;;; it was read is left alone and reported as a conflict.
+(defn save! [(s (ptr Editor)) (force bool)] (-> void)
+  (let [st (field s state)
+        (mut disk) (ArrayList::new [u8] (alloc/malloc-allocator))
+        result (read-disk (slice (.full s)) (mut disk))]
+    (cond (and (= result DISK-READ)
+               (not force)
+               (not (= (slice disk) (slice (.base st))))
+               (not (= (slice disk) (slice (.text st)))))
+            (do
+              (set! (.conflict s) true)
+              (say! s "Changed on disk since you opened it"))
+          (and (= result DISK-FAILED) (not force))
+            (do
+              (say! s "Cannot read it to check before saving: ")
+              (text/push-str! (field s status) (slice disk)))
+          :else (write! s))
+    (free! (mut disk))
+    (do)))
+
+(defn write! [(s (ptr Editor))] (-> void)
+  (let [st (field s state)]
+    (match (fs/write-file (alloc/malloc-allocator)
+                          (slice (.full s))
+                          (slice (.text st)))
+      (Ok [_]
+          (text/set-str! (field st base) (slice (.text st)))
+          (set! (.dirty st) false)
+          (set! (.conflict s) false)
+          (clear! (mut (.status s))))
+      (Err [e] (say! s "Cannot save: ") (push-io-error! (field s status) e)))))
+
+;;; The Save sheet chose PATH for a note (or a file saved under a new name):
+;;; attach the pane to it and write it. The sheet already asked before replacing.
+(defn save-as! [(s (ptr Editor)) (path (slice u8))] (-> void)
+  (attach! s path)
+  (write! s))
+
+;;; The file changed on disk: take the new contents unless that would lose
+;;; unsaved edits.
+(defn disk-changed! [(s (ptr Editor))] (-> void)
+  (let [st (field s state)
+        (mut disk) (ArrayList::new [u8] (alloc/malloc-allocator))
+        result (read-disk (slice (.full s)) (mut disk))]
+    (cond (= result DISK-MISSING)
+            (when (> (len (.base st)) 0)
+              (say! s "Deleted on disk: Save writes it again"))
+          (= result DISK-FAILED)
+            (do
+              (say! s "Cannot read: ")
+              (text/push-str! (field s status) (slice disk)))
+          ; Our own save, or someone made the same edit.
+          (= (slice disk) (slice (.text st)))
+            (do
+              (text/set-str! (field st base) (slice disk))
+              (set! (.dirty st) false)
+              (set! (.conflict s) false))
+          (= (slice disk) (slice (.base st))) (do)
+          (not (.dirty st))
+            (do
+              (text/set-str! (field st text) (slice disk))
+              (text/set-str! (field st base) (slice disk))
+              (clear! (mut (.status s))))
+          :else
+            (do
+              (set! (.conflict s) true)
+              (say! s "Changed on disk under your edits")))
+    (free! (mut disk))
+    (do)))
+
+(defn edited! [(s (ptr Editor)) (value (slice u8))] (-> void)
+  (let [st (field s state)]
+    (text/set-str! (field st text) value)
+    (set! (.dirty st)
+          (and (not (note? s)) (not (= value (slice (.base st))))))
+    (do)))
+
+;;; ⌘S: write the file, or for a note ask where.
+(defn save-pressed! [(s (ptr Editor)) (e (ptr Event))] (-> void)
+  (if (note? s)
+      (choose-save-path! e (slice (.project s)) "Note.md")
+      (save! s false)))
+
+;;; Where the Open sheet starts: the file's directory, or the project's.
+(defn open-directory [(s (ptr Editor))] (-> (slice u8))
+  (if (note? s) (slice (.project s)) (text/dirname (slice (.full s)))))
+
+;;; ---- the pane --------------------------------------------------------------
+(const PAD 10.0)
+
+(const GAP 8.0)
+
+;;; Room for the strip that says what's wrong: a button is about 25 points tall.
+(const TOOLBAR-H 28.0)
+
+(defn render-title! [(s (ptr Editor)) (ui (ptr Ui))] (-> void)
+  (let [st (field s state)
+        (mut t) (ArrayList::new [u8] (alloc/malloc-allocator))]
+    (text/push-str! (mut t)
+                    (if (note? s) "Note" (text/basename (slice (.path st)))))
+    (when (.dirty st) (text/push-str! (mut t) " •") 0)
+    (title! ui (slice t))
+    (free! (mut t))
+    (do)))
+
+(impl Widget Editor
+  (render [(self (ptr Editor)) (ui (ptr Ui))]
+    (-> void)
+    (let [st (field self state)]
+      (when (not (note? self)) (watch! ui (slice (.full self))) 0)
+      (render-title! self ui)
+      (shortcut! ui "s" "save")
+      (shortcut! ui "o" "open")
+      (vstack! ui GAP PAD)
+      ; Only something wrong takes room from the text.
+      (let [strip (or (.conflict self) (> (len (.status self)) 0))]
+        (when strip
+          (hstack! ui 6.0 0.0)
+          (text! ui (slice (.status self)) 11.0 0xf0b4b4 false)
+          (spacer! ui 0.0)
+          (grow! ui 1.0)
+          (when (.conflict self)
+            (button! ui "reload" "Reload")
+            (button! ui "overwrite" "Overwrite")
+            (variant! ui DANGER)
+            0)
+          (end! ui)
+          0)
+        (textarea! ui "text" (slice (.text st)) "" 0)
+        (height! ui
+                 (max-f 80.0
+                        (- (.height ui)
+                           (+ (* 2.0 PAD) (if strip (+ GAP TOOLBAR-H) 0.0)))))
+        0)
+      (end! ui)))
+  (event [(self (ptr Editor)) (e (ptr Event))]
+    (-> void)
+    (cond (changed? e "text") (edited! self (.text e))
+          ; ⌘Return in the text area.
+          (submitted? e "text")
+            (do (edited! self (.text e)) (save-pressed! self e))
+          (clicked? e "save") (save-pressed! self e)
+          (clicked? e "overwrite") (save! self true)
+          (clicked? e "reload") (load-file! self)
+          ; A file opens in a pane of its own, so a note's text is never replaced.
+          (clicked? e "open") (choose-file! e (open-directory self))
+          (file-chosen? e "open")
+            (let [(mut spec) (text/owned "editor ")]
+              (text/push-str! (mut spec) (.text e))
+              (open-widget! e (slice spec))
+              (free! (mut spec))
+              (do))
+          (file-chosen? e "save") (save-as! self (.text e))
+          (and (files-changed? e) (not (note? self))) (disk-changed! self)
+          :else (do)))
+  (save [(self (ptr Editor)) (s (ptr Snapshot))]
+    (-> void)
+    (save-state! s (.state self)))
+  (animating? [(self (ptr Editor))]
+    (-> bool)
+    false)
+  (destroy! [(self (ptr Editor))]
+    (-> void)
+    (free! (mut (.path (.state self))))
+    (free! (mut (.text (.state self))))
+    (free! (mut (.base (.state self))))
+    (free! (mut (.project self)))
+    (free! (mut (.full self)))
+    (free! (mut (.status self)))
+    (alloc/destroy [Editor] (alloc/malloc-allocator) self)
+    (do)))
+
+(defn max-f [(a f64) (b f64)] (-> f64)
+  (if (> a b) a b))
+
+(defn new-editor [(saved (ptr Snapshot)) (state State)] (-> (ptr Editor))
+  (let [a (alloc/malloc-allocator)]
+    (alloc/box! a
+                Editor
+                (Editor
+                  :state state
+                  :project (text/owned (get-text saved "jim.dir" "."))
+                  :full (ArrayList::new [u8] a)
+                  :conflict false
+                  :status (ArrayList::new [u8] a)))))
+
+;;; A new pane: a note, or the file named after "editor".
+(defn fresh [(saved (ptr Snapshot))] (-> (ptr Editor))
+  (let [a (alloc/malloc-allocator)
+        s
+          (new-editor saved
+                      (State
+                        :path (ArrayList::new [u8] a)
+                        :text (ArrayList::new [u8] a)
+                        :base (ArrayList::new [u8] a)
+                        :dirty false))
+        path (text/trim (get-text saved "jim.args" ""))]
+    (when (> (len path) 0) (attach! s path) (load-file! s) 0)
+    s))
+
+;;; A pane as it was: its text comes from the saved state, as in original Jim,
+;;; and a file it is attached to is checked for changes made meanwhile.
+(defn restored [(saved (ptr Snapshot)) (state State)] (-> (ptr Editor))
+  (let [s (new-editor saved state)]
+    (when (> (len (.path (.state s))) 0)
+      (let [(mut path) (text/owned (slice (.path (.state s))))]
+        (attach! s (slice path))
+        (free! (mut path)))
+      (disk-changed! s)
+      0)
+    s))
+
+(defn boot [(saved (ptr Snapshot)) (out (ptr (dyn Widget)))] (-> void)
+  (match (load-state [State] saved)
+    (Fresh [] (set! out (fresh saved)))
+    (Loaded [state] (set! out (restored saved state)))
+    (Refused [] (do))))

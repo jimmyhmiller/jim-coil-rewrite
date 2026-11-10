@@ -19,8 +19,15 @@
 ;;; positions in content coordinates (the pane's scroll offset is applied when
 ;;; drawing). Children always follow their parent in the array, so a reverse
 ;;; sweep sees every child before its container.
+;;; GIVEN is the value the widget rendered last, so a change the widget makes is
+;;; told apart from the view merely having been edited.
 (defstruct Field
-  [(id (ArrayList u8)) (view (ptr i8)) (editor (ptr i8)) (kind i64) (seen bool)])
+  [(id (ArrayList u8))
+   (view (ptr i8))
+   (editor (ptr i8))
+   (kind i64)
+   (given (ArrayList u8))
+   (seen bool)])
 
 (defstruct WidgetPane
   [(view (ptr i8))
@@ -43,7 +50,9 @@
    (last-tick f64)
    (stream (ptr i8))
    (watch-key (ArrayList u8))
-   (state-dirty bool)])
+   (state-dirty bool)
+   ;; A press on a stopped pane's Restart button, not yet released.
+   (restart-pressed bool)])
 
 (defn pane-key [] (-> (ptr i8))
   (p/alloc-static i8))
@@ -340,6 +349,77 @@
     (release f)
     (release tv)
     (do)))
+
+;;; Guard every call into widget code (see jim.guard), before any widget runs. A
+;;; crash the guard couldn't recover from last run left the widget's name in the
+;;; marker; panes of it restored now stay stopped until restarted.
+(defn protect! [] (-> bool)
+  (let [manager
+          (msg (ptr i8) (class c"NSFileManager") (sel c"defaultManager") [])
+        directory
+          (msg (ptr i8)
+               (ns c"~/.jim-coil")
+               (sel c"stringByExpandingTildeInPath")
+               [])
+        marker
+          (msg (ptr i8)
+               (ns c"~/.jim-coil/widget-crash")
+               (sel c"stringByExpandingTildeInPath")
+               [])
+        left
+          (msg (ptr i8)
+               (class c"NSString")
+               (sel c"stringWithContentsOfFile:encoding:error:")
+               [(ptr i8) u64 (ptr i8)]
+               marker
+               (: 4 u64)
+               (nil))]
+    (msg i8
+         manager
+         (sel c"createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+         [(ptr i8) i8 (ptr i8) (ptr i8)]
+         directory
+         (: 1 i8)
+         (nil)
+         (nil))
+    (when (!= (p/cast i64 left) 0)
+      (widgets/held-crashed! (string-bytes left))
+      (msg i8
+           manager
+           (sel c"removeItemAtPath:error:")
+           [(ptr i8) (ptr i8)]
+           marker
+           (nil))
+      0)
+    (widgets/protect! (string-bytes marker))))
+
+;;; Whether pane W's widget is stopped by a crash, with a Restart button.
+(defn stopped? [(w (ptr WidgetPane))] (-> bool)
+  (widgets/crashed? (.runtime w)))
+
+(defn message-font [] (-> (ptr i8))
+  (font 12.0 false false))
+
+;;; Where a stopped pane's Restart button is, in its view, below the message.
+(defn restart-rect [(w (ptr WidgetPane))] (-> Rect)
+  (let [bounds (view-bounds w)
+        message-h
+          (wrapped-height (widgets/diagnostic (.runtime w))
+                          (message-font)
+                          (- (.w bounds) 28.0))
+        label (line-size "Restart" (message-font))]
+    (rect 14.0
+          (+ 26.0 message-h)
+          (+ (.w label) (* 2.0 BUTTON-PAD-X))
+          (+ (.h label) (* 2.0 BUTTON-PAD-Y)))))
+
+(defn view-point [(self (ptr i8)) (event (ptr i8))] (-> Point)
+  (msg Point
+       self
+       (sel c"convertPoint:fromView:")
+       [Point (ptr i8)]
+       (msg Point event (sel c"locationInWindow") [])
+       (nil)))
 
 ;;; Warm text measurement on a background thread and native fields here.
 (defn prewarm! [] (-> void)
@@ -948,6 +1028,7 @@
             :view f
             :editor f
             :kind kind
+            :given (ArrayList::new [u8] a)
             :seen true))
         (let [scroll
                 (msg (ptr i8)
@@ -988,6 +1069,7 @@
             :view scroll
             :editor tv
             :kind kind
+            :given (ArrayList::new [u8] a)
             :seen true)))))
 
 (defn find-field [(w (ptr WidgetPane)) (kind i64) (id (slice u8))] (-> i64)
@@ -1014,6 +1096,7 @@
   (msg i64 (.view f) (sel c"removeFromSuperview") [])
   (release (.view f))
   (ArrayList::free! (mut (.id f)))
+  (ArrayList::free! (mut (.given f)))
   (do))
 
 (defn same-string? [(a (ptr i8)) (b (ptr i8))] (-> bool)
@@ -1046,8 +1129,15 @@
                   visible
                     (and (> (rect-h (intersect b clip)) 0.0)
                          (or (= (.dialog w) api/NONE) (inside-dialog? w i)))
-                  value (string (api/node-text u n))]
+                  given (api/node-text u n)
+                  value (string given)
+                  ; A field being edited keeps its text unless the widget
+                  ; changed the value, such as by reloading a file.
+                  apply
+                    (or (not (editing? w f)) (not (= given (slice (.given f)))))]
               (set! (.seen f) true)
+              (clear! (mut (.given f)))
+              (extend! (mut (.given f)) (data given) (len given))
               (frame! (.view f)
                       (rect (.x b) (- (.y b) (.scroll w)) (.w b) (.h b)))
               (msg i64
@@ -1055,7 +1145,7 @@
                    (sel c"setHidden:")
                    [i8]
                    (p/cast i8 (if visible 0 1)))
-              (when (not (editing? w f))
+              (when apply
                 (if (= kind api/INPUT)
                     (when (not (same-string? (msg (ptr i8)
                                                   (.editor f)
@@ -1335,8 +1425,20 @@
                                    14.0
                                    (- (.w bounds) 28.0)
                                    (- (.h bounds) 28.0))
-                             (font 12.0 false false)
+                             (message-font)
                              0xf0b4b4)
+              (when (stopped? w)
+                (let [b (restart-rect w)]
+                  (fill! b
+                         (rgb (if (.restart-pressed w) 0x3a8260 0x2f6f4f))
+                         5.0)
+                  (draw-text! "Restart"
+                              (Point
+                                :x (+ (.x b) BUTTON-PAD-X)
+                                :y (+ (.y b) BUTTON-PAD-Y))
+                              (message-font)
+                              0xe1e6ee))
+                0)
               0)))
       0)
     (do)))
@@ -1374,7 +1476,8 @@
 
 ;;; Whether an element under PT, a point in W's view, reacts to clicks.
 (defn reacts-at? [(w (ptr WidgetPane)) (pt Point)] (-> bool)
-  (!= (hit w (Point :x (.x pt) :y (+ (.y pt) (.scroll w)))) api/NONE))
+  (or (and (stopped? w) (contains? (restart-rect w) pt))
+      (!= (hit w (Point :x (.x pt) :y (+ (.y pt) (.scroll w)))) api/NONE)))
 
 (defn local [(self (ptr i8)) (event (ptr i8))] (-> Point)
   (let [w (pane-of self)
@@ -1390,6 +1493,9 @@
 (defn mouse-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
   (let [w (pane-of self)]
     (when (live-pane? w)
+      (set! (.restart-pressed w)
+            (and (stopped? w)
+                 (contains? (restart-rect w) (view-point self event))))
       (set! (.pressed w) (hit w (local self event)))
       (msg i64 self (sel c"setNeedsDisplay:") [i8] (: 1 i8))
       0)
@@ -1398,6 +1504,15 @@
 ;;; Activate on release over the pressed element, like AppKit buttons.
 (defn mouse-up [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))] (-> void)
   (let [w (pane-of self)]
+    (when (and (live-pane? w) (.restart-pressed w))
+      (set! (.restart-pressed w) false)
+      (when (and (stopped? w)
+                 (contains? (restart-rect w) (view-point self event)))
+        (widgets/restart! (.runtime w))
+        (set! (.state-dirty w) true)
+        0)
+      (refresh! w)
+      0)
     (when (live-pane? w)
       (let [pressed (.pressed w)]
         (set! (.pressed w) api/NONE)
@@ -1609,6 +1724,263 @@
     (do)))
 
 (export-c [files-changed :as "jim_widget_files_changed"])
+
+;;; ---- ⌘ keys ------------------------------------------------------------------
+
+;;; The widget pane holding VIEW, or one of its ancestors, or nil.
+(defn pane-holding [(view (ptr i8))] (-> (ptr WidgetPane))
+  (let [(mut v) view
+        (mut found) (p/cast (ptr WidgetPane) 0)]
+    (while (and (!= (p/cast i64 (load v)) 0) (= (p/cast i64 (load found)) 0))
+      (set! found (pane-of (load v)))
+      (set! v (msg (ptr i8) (load v) (sel c"superview") [])))
+    (load found)))
+
+;;; Press the element a widget gave ⌘KEY (key!), or deliver its shortcut!, in the
+;;; pane with the keyboard.
+;;; True when one took EVENT, a key press.
+(defn press-key! [(event (ptr i8))] (-> bool)
+  (let [flags (msg u64 event (sel c"modifierFlags") [])
+        window (msg (ptr i8) event (sel c"window") [])
+        ; ⌘ alone: ⌃, ⌥ and ⇧ make other shortcuts.
+        plain
+          (and (!= (& flags 1048576) (: 0 u64))
+               (= (& flags (: 917504 u64)) (: 0 u64)))
+        chars
+          (if plain
+              (string-bytes (msg (ptr i8)
+                                 event
+                                 (sel c"charactersIgnoringModifiers")
+                                 []))
+              "")]
+    (if (or (!= (len chars) 1) (= (p/cast i64 window) 0))
+        false
+        (let [w (pane-holding (msg (ptr i8) window (sel c"firstResponder") []))
+              key (p/cast i64 (get chars 0))
+              (mut target) api/NONE]
+          (when (and (live-pane? w) (.shown w))
+            (for [i 0 (node-count w)]
+              (when (and (= (load target) api/NONE)
+                         (= (.key (nd w i)) key)
+                         (widgets/active? (.runtime w) i))
+                (set! target i)
+                0))
+            0)
+          (cond (!= (load target) api/NONE)
+                  (do
+                    (widgets/activate! (.runtime w) (load target))
+                    (set! (.state-dirty w) true)
+                    (refresh! w)
+                    true)
+                (and (live-pane? w) (.shown w))
+                  (let [u (ui w)
+                        (mut found) -1]
+                    (for [i 0 (len (.shortcuts u))]
+                      (when (and (< (load found) 0)
+                                 (= (.key (get (.shortcuts u) i)) key))
+                        (set! found i)
+                        0))
+                    (if (< (load found) 0)
+                        false
+                        (do
+                          (widgets/click! (.runtime w)
+                                          (api/shortcut-id u
+                                                           (get (.shortcuts u)
+                                                                (load found))))
+                          (set! (.state-dirty w) true)
+                          (refresh! w)
+                          true)))
+                :else false)))))
+
+;;; ---- the Open sheet ----------------------------------------------------------
+
+;;; A block literal, as clang lays one out. The sheet's completion handler is a
+;;; global block: it captures nothing, because which pane asked is in Choosing.
+(defstruct BlockDescriptor [(reserved u64) (size u64)])
+
+(defstruct Block
+  [(isa (ptr i8))
+   (flags i32)
+   (reserved i32)
+   (invoke (ptr i8))
+   (descriptor (ptr BlockDescriptor))])
+
+;;; BLOCK_IS_GLOBAL: copying the block returns it, and nothing frees it.
+(const BLOCK-IS-GLOBAL 268435456)
+
+;;; RTLD_DEFAULT on Darwin.
+(const RTLD-DEFAULT -2)
+
+(extern dlsym :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+;;; The sheet showing, if any, and who asked for it: a widget view, retained
+;;; until the sheet is answered since its pane may be gone by then, or else DONE,
+;;; a C function called with the chosen path as an NSString. SAVING is a Save
+;;; sheet rather than an Open one.
+(defstruct Choosing
+  [(panel (ptr i8)) (view (ptr i8)) (done (ptr i8)) (saving bool)])
+
+(defn choosing [] (-> (ptr Choosing))
+  (p/alloc-static Choosing))
+
+;;; True for an event meant for the sheet, which belongs to AppKit alone.
+(defn sheet-event? [(event (ptr i8))] (-> bool)
+  (let [panel (.panel (choosing))]
+    (and (!= (p/cast i64 panel) 0)
+         (= (p/cast i64 (msg (ptr i8) event (sel c"window") []))
+            (p/cast i64 panel)))))
+
+;;; NSModalResponseOK
+(const RESPONSE-OK 1)
+
+(defn file-chosen [(block (ptr i8)) (response i64)] (-> void)
+  (let [c (choosing)
+        panel (.panel c)
+        view (.view c)
+        done (.done c)]
+    (set! (.panel c) (nil))
+    (set! (.view c) (nil))
+    (set! (.done c) (nil))
+    (when (= response RESPONSE-OK)
+      (let [url (msg (ptr i8) panel (sel c"URL") [])
+            path
+              (if (= (p/cast i64 url) 0)
+                  (nil)
+                  (msg (ptr i8) url (sel c"path") []))]
+        (cond (= (p/cast i64 path) 0) 0
+              (!= (p/cast i64 view) 0)
+                (let [w (pane-of view)]
+                  (when (live-pane? w)
+                    (widgets/file-chosen! (.runtime w)
+                                          (if (.saving c) "save" "open")
+                                          (string-bytes path))
+                    (set! (.state-dirty w) true)
+                    (refresh! w)
+                    0)
+                  0)
+              :else
+                (do
+                  (call-ptr (p/cast (fnptr (cc/C) [(ptr i8)] void) done) path)
+                  0)))
+      0)
+    (release panel)
+    (when (!= (p/cast i64 view) 0) (release view) 0)
+    (do)))
+
+(export-c [file-chosen :as "jim_widget_file_chosen"])
+
+(defn chosen-block [] (-> (ptr Block))
+  (let [b (p/alloc-static Block)
+        d (p/alloc-static BlockDescriptor)]
+    (when (= (p/cast i64 (.isa b)) 0)
+      (set! (.reserved d) (: 0 u64))
+      (set! (.size d) (p/cast u64 (sizeof Block)))
+      (set! (.flags b) (p/cast i32 BLOCK-IS-GLOBAL))
+      (set! (.reserved b) (: 0 i32))
+      (set! (.invoke b) (p/cast (ptr i8) (fnptr-of file-chosen)))
+      (set! (.descriptor b) d)
+      (set! (.isa b)
+            (dlsym (p/cast (ptr i8) RTLD-DEFAULT) c"_NSConcreteGlobalBlock"))
+      0)
+    b))
+
+;;; Show the Open sheet for pane W, starting in DIRECTORY. Ignored while one is
+;;; already up.
+(defn choose-file! [(w (ptr WidgetPane)) (directory (slice u8))] (-> void)
+  (begin-choosing! (msg (ptr i8) (.view w) (sel c"window") [])
+                   (open-panel)
+                   directory
+                   (msg (ptr i8) (.view w) (sel c"retain") [])
+                   (nil)
+                   false))
+
+;;; Show the Save sheet for pane W, starting in DIRECTORY and suggesting NAME.
+(defn choose-save-path! [(w (ptr WidgetPane))
+                         (directory (slice u8))
+                         (name (slice u8))] (-> void)
+  (when (= (p/cast i64 (.panel (choosing))) 0)
+    (let [panel
+            (msg (ptr i8)
+                 (msg (ptr i8) (class c"NSSavePanel") (sel c"savePanel") [])
+                 (sel c"retain")
+                 [])]
+      (msg i64 panel (sel c"setCanCreateDirectories:") [i8] (: 1 i8))
+      (msg i64 panel (sel c"setNameFieldStringValue:") [(ptr i8)] (string name))
+      (begin-choosing! (msg (ptr i8) (.view w) (sel c"window") [])
+                       panel
+                       directory
+                       (msg (ptr i8) (.view w) (sel c"retain") [])
+                       (nil)
+                       true))
+    0)
+  (do))
+
+;;; An Open panel for one file, retained.
+(defn open-panel [] (-> (ptr i8))
+  (let [panel
+          (msg (ptr i8)
+               (msg (ptr i8) (class c"NSOpenPanel") (sel c"openPanel") [])
+               (sel c"retain")
+               [])]
+    (msg i64 panel (sel c"setCanChooseFiles:") [i8] (: 1 i8))
+    (msg i64 panel (sel c"setCanChooseDirectories:") [i8] (: 0 i8))
+    (msg i64 panel (sel c"setAllowsMultipleSelection:") [i8] (: 0 i8))
+    (msg i64 panel (sel c"setCanCreateDirectories:") [i8] (: 1 i8))
+    panel))
+
+;;; Show the Open sheet on WINDOW, starting in DIRECTORY, and call DONE, a C
+;;; function taking an NSString, with the chosen path. Ignored while one is up.
+(defn choose-file-then! [(window (ptr i8))
+                         (directory (slice u8))
+                         (done (ptr i8))]
+  (-> void)
+  (begin-choosing! window (open-panel) directory (nil) done false))
+
+;;; Begin PANEL, retained, as the sheet. PANEL and VIEW are released here when a
+;;; sheet is already up.
+(defn begin-choosing! [(window (ptr i8))
+                       (panel (ptr i8))
+                       (directory (slice u8))
+                       (view (ptr i8))
+                       (done (ptr i8))
+                       (saving bool)] (-> void)
+  (let [c (choosing)]
+    (if (!= (p/cast i64 (.panel c)) 0)
+        (do
+          (release panel)
+          (when (!= (p/cast i64 view) 0) (release view) 0)
+          0)
+        (let [block (p/cast (ptr i8) (chosen-block))]
+          (when (> (len directory) 0)
+            (msg i64
+                 panel
+                 (sel c"setDirectoryURL:")
+                 [(ptr i8)]
+                 (msg (ptr i8)
+                      (class c"NSURL")
+                      (sel c"fileURLWithPath:isDirectory:")
+                      [(ptr i8) i8]
+                      (string directory)
+                      (: 1 i8)))
+            0)
+          (set! (.panel c) panel)
+          (set! (.view c) view)
+          (set! (.done c) done)
+          (set! (.saving c) saving)
+          (if (= (p/cast i64 window) 0)
+              (msg i64
+                   panel
+                   (sel c"beginWithCompletionHandler:")
+                   [(ptr i8)]
+                   block)
+              (msg i64
+                   panel
+                   (sel c"beginSheetModalForWindow:completionHandler:")
+                   [(ptr i8) (ptr i8)]
+                   window
+                   block))
+          0))
+    (do)))
 
 ;;; Keep one FSEvents stream covering exactly the paths the last frame watched.
 (defn sync-watches! [(w (ptr WidgetPane))] (-> void)
