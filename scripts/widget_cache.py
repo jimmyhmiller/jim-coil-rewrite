@@ -62,7 +62,9 @@ def build(widget, sign):
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
     # Undefined symbols are libc's and the system's, found in Jim when it loads it.
     staged = CACHE / (name + '.dylib.next')
-    subprocess.run(['cc', '-dynamiclib', '-undefined', 'dynamic_lookup', str(obj), '-o', str(staged)],
+    # Named for itself, not for where it was built: Jim loads it by path.
+    subprocess.run(['cc', '-dynamiclib', '-undefined', 'dynamic_lookup',
+                    '-install_name', '@rpath/' + name + '.dylib', str(obj), '-o', str(staged)],
                    check=True)
     if sign:
         subprocess.run(['codesign', '--force', '--sign', sign, '--timestamp=none', str(staged)], check=True)
