@@ -177,12 +177,15 @@ def main():
     if libraries:
         add_rpath(app_binary, '@executable_path/../Frameworks')
 
+    # Original Jim's icon (assets/PROVENANCE).
+    shutil.copy2(ROOT / 'assets/icon.icns', contents / 'Resources/icon.icns')
+
     with (contents / 'Info.plist').open('wb') as f:
         # Its own identifier: macOS keys privacy permissions to the identifier
         # and signature, and a release sharing the development build's would
         # unsettle the permissions that build was given.
         plistlib.dump({'CFBundleIdentifier': 'dev.jim.coil.release', 'CFBundleName': 'Jim Coil',
-            'CFBundleExecutable': 'jim-coil', 'CFBundlePackageType': 'APPL',
+            'CFBundleExecutable': 'jim-coil', 'CFBundleIconFile': 'icon', 'CFBundlePackageType': 'APPL',
             'CFBundleShortVersionString': version, 'CFBundleVersion': version,
             'LSMinimumSystemVersion': minimum_macos(app_binary),
             'NSHighResolutionCapable': True,

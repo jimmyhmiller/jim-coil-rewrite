@@ -12,9 +12,12 @@ APP = ROOT / 'build/JimCoil.app'
 subprocess.run(['coil', 'build', '-o', 'build/jim-next'], cwd=ROOT, check=True)  # also builds build/jim-session and build/jimc
 # Rename a completed executable atomically; never truncate a running image.
 (ROOT / 'build/jim-next').replace(APP / 'Contents/MacOS/jim-coil')
+# Original Jim's icon (assets/PROVENANCE).
+(APP / 'Contents/Resources').mkdir(exist_ok=True)
+shutil.copy2(ROOT / 'assets/icon.icns', APP / 'Contents/Resources/icon.icns')
 with (APP / 'Contents/Info.plist').open('wb') as f:
     plistlib.dump({'CFBundleIdentifier': 'dev.jim.coil', 'CFBundleName': 'Jim Coil',
-        'CFBundleExecutable': 'jim-coil', 'CFBundlePackageType': 'APPL',
+        'CFBundleExecutable': 'jim-coil', 'CFBundleIconFile': 'icon', 'CFBundlePackageType': 'APPL',
         'NSHighResolutionCapable': True,
         'NSMicrophoneUsageDescription': 'Jim transcribes your speech into the focused terminal when you start dictation.', 'NSPrincipalClass': 'NSApplication'}, f)
 identity = os.environ.get('JIM_SIGN_IDENTITY', 'TerminalBevy Local Signing')
