@@ -198,7 +198,8 @@ still how you do those things. Everything else in `jimctl` talks to original Jim
 ## Widgets
 
 A widget is a Coil source file, `widgets/NAME.coil`, that Jim compiles in-process
-with Coil's JIT and hot-reloads on save. Open one with the palette action
+with Coil's JIT and hot-reloads on save. To write one, see
+[docs/widgets.md](docs/widgets.md). Open one with the palette action
 **Widget: Open widget** and enter `NAME ARGS…`:
 
 | Widget | Port of | Open with |

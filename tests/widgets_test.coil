@@ -1042,3 +1042,83 @@
       (assert (has-text? again "n 0"))
       (widgets/free! again)))
   (widgets/service-poll!))
+
+;;; The source of the guide's widget NAME: the ```coil block after
+;;; "<!-- widget: NAME -->" in docs/widgets.md.
+(defn guide-widget [(guide (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut marker) (StrBuf::new (alloc/malloc-allocator))]
+    (push-str! (mut marker) "<!-- widget: ")
+    (push-str! (mut marker) name)
+    (push-str! (mut marker) " -->\n```coil\n")
+    (let [m (str marker)
+          (mut at) -1]
+      (for [i 0 (+ (- (len guide) (len m)) 1)]
+        (when (and (< (load at) 0) (= (subslice guide i (+ i (len m))) m))
+          (set! at (+ i (len m)))))
+      (assert (>= (load at) 0))
+      (let [rest (subslice guide (load at) (len guide))
+            (mut end) -1]
+        (for [i 0 (- (len rest) 3)]
+          (when (and (< (load end) 0) (= (subslice rest i (+ i 4)) "\n```"))
+            (set! end (+ i 1))))
+        (assert (> (load end) 0))
+        (subslice rest 0 (load end))))))
+
+(defn write-guide-widget! [(guide (slice u8)) (name (slice u8))] (-> void)
+  (let [(mut path) (StrBuf::new (alloc/malloc-allocator))]
+    (push-str! (mut path) "build/widget-tests/")
+    (push-str! (mut path) name)
+    (push-str! (mut path) ".coil")
+    (assert (try (let [_
+                         (try-or! (fs/write-file (alloc/malloc-allocator)
+                                                 (str path)
+                                                 (guide-widget guide name))
+                                  false)]
+                   true)))))
+
+(deftest the-guides-widgets-work
+  (mkdir c"build" (: 493 u16))
+  (mkdir c"build/widget-tests" (: 493 u16))
+  (let [guide (read-text "docs/widgets.md")]
+    (assert (> (len guide) 0))
+    (write-guide-widget! guide "guide-hello")
+    (write-guide-widget! guide "guide-head"))
+  ; The first widget greets, counts waves and keeps both.
+  (let [r (widgets/create-in "build/widget-tests" "guide-hello" "." "Ada")]
+    (widgets/reload! r)
+    (assert (widgets/settle! r))
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (has-text? r "Hello, Ada"))
+    (widgets/input! r "name" "Grace" false)
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (click! r "wave")
+    (assert (has-text? r "Hello, Grace"))
+    (assert (has-text? r "waves: 1"))
+    (let [(mut saved) (api/snapshot-new (alloc/malloc-allocator))]
+      (assert (widgets/save-state! r (mut saved)))
+      (widgets/free! r)
+      (let [again
+              (widgets/create-in "build/widget-tests" "guide-hello" "." "Ada")]
+        (widgets/restore-state! again (load saved))
+        (widgets/reload! again)
+        (assert (widgets/settle! again))
+        (assert (widgets/render! again 400.0 300.0 0.0))
+        (assert (has-text? again "Hello, Grace"))
+        (assert (has-text? again "waves: 1"))
+        (widgets/free! again))))
+  ; The second runs git without blocking and shows the latest commit.
+  (let [r (widgets/create-in "build/widget-tests" "guide-head" "." "")]
+    (widgets/reload! r)
+    (assert (widgets/settle! r))
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (widgets/animating? r))
+    (let [(mut tries) 0]
+      (while (and (< (load tries) 1000) (widgets/animating? r))
+        (usleep (: 5000 u32))
+        (widgets/tick! r 0.005)
+        (set! tries (+ (load tries) 1))))
+    (assert (not (widgets/animating? r)))
+    (assert (widgets/render! r 400.0 300.0 0.0))
+    (assert (not (has-text? r "Reading…")))
+    (assert (= (len (widgets/diagnostic r)) 0))
+    (widgets/free! r)))
