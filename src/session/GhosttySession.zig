@@ -190,6 +190,7 @@ fn endReplay(io: *termio.Termio) void {
     io.renderer_state.mutex.lockUncancelable(global.io());
     io.terminal_stream.handler.session_replaying = false;
     io.renderer_state.session_replaying = false;
+    io.terminal_stream.handler.endSessionReplay();
     io.renderer_state.mutex.unlock(global.io());
 }
 fn readLoop(self: *Session, io: *termio.Termio) void {
@@ -199,6 +200,8 @@ fn readLoop(self: *Session, io: *termio.Termio) void {
     jim_session_log_client(self.fd, "attach-sent", null);
     // A stuck service still accepts the connection, in the kernel, and then never
     // speaks. Say so rather than show an empty pane forever.
+    const attached_at = std.Io.Timestamp.now(global.io(), .awake);
+    var replayed: usize = 0;
     var stalled = jim_session_readable(self.fd, attach_patience_ms) == 0;
     if (stalled) {
         jim_session_log_client(self.fd, "attach-unanswered", "service sent nothing in 5s");
@@ -219,8 +222,10 @@ fn readLoop(self: *Session, io: *termio.Termio) void {
         const bytes = buffer[0..@intCast(n)];
         switch (kind) {
             16 => {
+                if (!self.ready.load(.acquire)) replayed += bytes.len;
                 io.processOutput(bytes);
-                io.renderer_state.yieldToDemand(global.io());
+                // Nothing is drawn during replay, so the renderer has nothing to wait for.
+                if (self.ready.load(.acquire)) io.renderer_state.yieldToDemand(global.io());
             },
             3 => {
                 if (bytes.len != 8) {
@@ -253,6 +258,13 @@ fn readLoop(self: *Session, io: *termio.Termio) void {
                     };
                 }
                 endReplay(io);
+                var detail: [96]u8 = undefined;
+                const elapsed = attached_at.durationTo(std.Io.Timestamp.now(global.io(), .awake));
+                const text: ?[*:0]const u8 = if (std.fmt.bufPrint(detail[0 .. detail.len - 1], "bytes={d} ms={d}", .{ replayed, elapsed.toMilliseconds() })) |t| terminated: {
+                    detail[t.len] = 0;
+                    break :terminated @ptrCast(&detail);
+                } else |_| null;
+                jim_session_log_client(self.fd, "replay-done", text);
                 self.queue_mutex.lockUncancelable(global.io());
                 self.ready.store(true, .release);
                 self.queue_changed.signal(global.io());

@@ -108,6 +108,9 @@ until it falls 256 MiB behind, when it loses its connection instead. Replay afte
 trim starts with the size and directory the trimmed frames established, and ends with
 the input modes and Kitty keyboard flags the session's core reports as set, so keys
 and mice keep working. It may begin mid-sequence, as original Jim's replay can.
+The service sends as many frames as fit in 1 MiB at once, on a socket with a 1 MiB send
+buffer. One frame per send had the service and the app taking turns a kilobyte at a
+time, and a full journal took up to 20 seconds to replay. It now takes about half a second.
 
 `GhosttySession.zig` adds a native Ghostty IO backend connected directly to this
 socket. It replays output and terminal-size changes in order, then processes live
@@ -118,6 +121,10 @@ block Ghostty’s IO thread. Input typed during replay is queued until attachmen
 is ready. Renderer shutdown shuts down the socket, joins both transport threads,
 and frees pending writes; daemon shutdown is a separate explicit action.
 The renderer holds its frames until replay ends, so history is not seen scrolling past.
+So does the stream handler with the title, pwd, mouse shape and progress the history
+sets: it sends each once, final, when replay ends. Ghostty's mailbox to the app holds
+64 messages, and history repeats these thousands of times.
+`replay-done bytes=N ms=M` in `events.log` records each attach's replay.
 Attaching leaves the terminal's size alone: the client reports only its newest size,
 once replay ends, so a running TUI is not resized unless the size really changed.
 Replay is exact for the retained stream, not a model snapshot. Reboot recovery and

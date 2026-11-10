@@ -109,16 +109,24 @@
  
 --- a/src/termio/stream_handler.zig
 +++ b/src/termio/stream_handler.zig
-@@ -92,6 +92,8 @@
+@@ -92,6 +92,16 @@
      /// This is set to true when we've seen a title escape sequence. We use
      /// this to determine if we need to default the window title.
      seen_title: bool = false,
 +    session_render_only: bool = false,
 +    session_replaying: bool = false,
++    /// What a replay changed that the surface hasn't been told. A replay holds
++    /// these back: history repeats them thousands of times, and each would wait
++    /// for room in the app's mailbox. The terminal keeps their final values,
++    /// which `endSessionReplay` sends once.
++    session_title_owed: bool = false,
++    session_mouse_shape_owed: bool = false,
++    session_pwd_owed: bool = false,
++    session_progress_owed: ?terminal.osc.Command.ProgressReport = null,
  
      pub const Stream = terminal.Stream(StreamHandler);
  
-@@ -115,6 +117,7 @@
+@@ -115,6 +125,7 @@
      /// isn't guaranteed to happen immediately but it will happen as soon as
      /// practical.
      pub inline fn queueRender(self: *StreamHandler) !void {
@@ -126,7 +134,7 @@
          try self.renderer_wakeup.notify();
      }
  
-@@ -149,6 +152,16 @@
+@@ -149,6 +160,16 @@
      }
  
      inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
@@ -143,7 +151,7 @@
          self.termio_mailbox.send(msg, self.renderer_state.mutex);
          self.termio_messaged = true;
      }
-@@ -223,7 +236,7 @@
+@@ -223,7 +244,7 @@
                  try self.terminal.printSlice(value.cps);
              },
              .print_repeat => try self.terminal.printRepeat(value),
@@ -152,7 +160,7 @@
              .backspace => self.terminal.backspace(),
              .horizontal_tab => self.horizontalTab(value),
              .horizontal_tab_back => self.horizontalTabBack(value),
-@@ -343,7 +356,7 @@
+@@ -343,7 +364,7 @@
              .decaln => try self.decaln(),
              .window_title => try self.windowTitle(value.title),
              .report_pwd => try self.reportPwd(value.url),
@@ -161,7 +169,74 @@
              .progress_report => self.progressReport(value),
              .start_hyperlink => try self.startHyperlink(value.uri, value.id),
              .clipboard_contents => try self.clipboardContents(value.kind, value.data),
-@@ -1039,6 +1052,7 @@
+@@ -1017,15 +1038,56 @@
+                 buf[pwd.len] = 0;
+             }
+ 
+-            self.surfaceMessageWriter(.{ .set_title = buf });
+             self.seen_title = false;
++            self.sendTitle(&buf);
+             return;
+         }
+ 
+         self.seen_title = true;
+-        self.surfaceMessageWriter(.{ .set_title = buf });
++        self.sendTitle(&buf);
+     }
+ 
++    fn sendTitle(self: *StreamHandler, buf: *const [256]u8) void {
++        if (self.session_replaying) {
++            self.session_title_owed = true;
++            return;
++        }
++        self.surfaceMessageWriter(.{ .set_title = buf.* });
++    }
++
++    /// Tell the surface what the replay that just ended changed. The renderer
++    /// state mutex must be held.
++    pub fn endSessionReplay(self: *StreamHandler) void {
++        if (self.session_title_owed) {
++            self.session_title_owed = false;
++            // As windowTitle leaves it: the title if one was set, else the pwd.
++            var buf: [256]u8 = @splat(0);
++            const title = self.terminal.getTitle() orelse "";
++            const shown = if (title.len > 0) title else (self.terminal.getPwd() orelse "");
++            if (shown.len < buf.len) @memcpy(buf[0..shown.len], shown);
++            self.surfaceMessageWriter(.{ .set_title = buf });
++        }
++        if (self.session_mouse_shape_owed) {
++            self.session_mouse_shape_owed = false;
++            self.surfaceMessageWriter(.{ .set_mouse_shape = self.terminal.mouse_shape });
++        }
++        if (self.session_pwd_owed) {
++            self.session_pwd_owed = false;
++            const pwd = self.terminal.getPwd() orelse "";
++            if (pwd.len == 0) {
++                self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
++            } else if (apprt.surface.Message.WriteReq.init(self.alloc, pwd)) |req| {
++                self.surfaceMessageWriter(.{ .pwd_change = req });
++            } else |err| {
++                log.warn("error notifying surface of pwd change err={}", .{err});
++            }
++        }
++        if (self.session_progress_owed) |report| {
++            self.session_progress_owed = null;
++            self.surfaceMessageWriter(.{ .progress_report = report });
++        }
++    }
++
+     inline fn setMouseShape(
+         self: *StreamHandler,
+         shape: terminal.MouseShape,
+@@ -1035,10 +1097,15 @@
+         if (self.terminal.mouse_shape == shape) return;
+ 
+         self.terminal.mouse_shape = shape;
++        if (self.session_replaying) {
++            self.session_mouse_shape_owed = true;
++            return;
++        }
+         self.surfaceMessageWriter(.{ .set_mouse_shape = shape });
      }
  
      fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
@@ -169,7 +244,7 @@
          // Note: we ignore the "kind" field and always use the standard clipboard.
          // iTerm also appears to do this but other terminals seem to only allow
          // certain. Let's investigate more.
-@@ -1508,7 +1522,7 @@
+@@ -1508,7 +1575,7 @@
          try self.terminal.semanticPrompt(cmd);
      }
  
@@ -178,6 +253,39 @@
          // Special handling for the empty URL. We treat the empty URL
          // as resetting the pwd as if we never saw a pwd. I can't find any
          // other terminal that does this but it seems like a reasonable
+@@ -1527,6 +1594,10 @@
+             }
+ 
+             // Report the change.
++            if (self.session_replaying) {
++                self.session_pwd_owed = true;
++                return;
++            }
+             self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
+             return;
+         }
+@@ -1595,6 +1666,10 @@
+ 
+         // Report it to the surface. If creating our write request fails
+         // then we just ignore it.
++        if (self.session_replaying) {
++            self.session_pwd_owed = true;
++            return;
++        }
+         if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
+             self.surfaceMessageWriter(.{ .pwd_change = req });
+         } else |err| {
+@@ -1945,6 +2020,10 @@
+ 
+     /// Display a GUI progress report.
+     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
++        if (self.session_replaying) {
++            self.session_progress_owed = report;
++            return;
++        }
+         self.surfaceMessageWriter(.{ .progress_report = report });
+     }
+ };
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -453,6 +453,7 @@

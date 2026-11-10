@@ -6,6 +6,7 @@
 (import "jim.sessions" :as sessions)
 (import "jim.image-original" :as original)
 (import "coil.primitive" :as p)
+(import "coil.atomic" :as atomic)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
 
@@ -1062,17 +1063,25 @@
             (objc_registerClassPair cls)
             cls)))))
 
+;;; 1 while a tick: is on its way to the main thread. Ghostty wakes the app for every
+;;; message it posts, from every terminal's threads, and one tick drains them all, so
+;;; asking the main thread once is enough. A replay posts thousands of messages.
+(defn tick-pending [] (-> (ptr i64))
+  (p/alloc-static i64))
+
 (defn tick [(self (ptr i8)) (cmd (ptr i8)) (unused (ptr i8))] (-> void)
   (let [start (timings/now)]
     (do
+      ; Cleared first: a message posted during this tick asks for another.
+      (atomic/store (tick-pending) 0)
       (if (!= (p/cast i64 (load (app-cell))) 0)
           (g/ghostty_app_tick (load (app-cell)))
           (do))
       (timings/record! 3 (* 1000.0 (- (timings/now) start))))))
 
 (defn wakeup [(userdata (ptr i8))] (-> void)
-  (let [pool (new c"NSAutoreleasePool")]
-    (do
+  (when (= (atomic/cas (tick-pending) 0 1) 0)
+    (let [pool (new c"NSAutoreleasePool")]
       (msg i64
            (load (dispatcher-cell))
            (sel c"performSelectorOnMainThread:withObject:waitUntilDone:")
@@ -1080,7 +1089,8 @@
            (sel c"tick:")
            (nil)
            (: 0 i8))
-      (release pool))))
+      (release pool)
+      (do))))
 
 ;;; How many times T has asked for attention since this was last called.
 (defn take-bells! [(t (ptr Terminal))] (-> i64)

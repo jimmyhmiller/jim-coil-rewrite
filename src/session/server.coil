@@ -8,6 +8,17 @@
 
 (const FRAME-CAPACITY 65548)
 
+;;; What one send can carry: many journal frames. Replay sends frames as fast as the
+;;; client reads them, and one frame per send made the service and the client take
+;;; turns, a context switch per kilobyte.
+(const TX-CAPACITY 1048576)
+
+;;; SO_SNDBUF and the size asked for, so a replay's sends don't wait on macOS's 8 KiB
+;;; default for local sockets.
+(const SO-SNDBUF 4097)
+
+(const CLIENT-SEND-BUFFER 1048576)
+
 (const INPUT-CAPACITY 4194304)
 
 (const PATH-CAPACITY 1024)
@@ -216,7 +227,7 @@
    (end i64)
    (cursor i64)
    (replay-end i64)
-   (tx (array i8 65548))
+   (tx (array i8 1048576))
    (rx (array i8 65548))
    (input (array i8 4194304))
    (tx-len i64)
@@ -744,23 +755,28 @@
                         (set! (.tx-len s) 13)
                         (set! (.ready s) true)
                         0)))
-                (if (>= (.cursor s) (.end s))
-                    0
-                    (let [out (index (field s tx) 0)]
-                      (journal-get s (.cursor s) out 12)
-                      (let [length (p/cast i64 (u32-be out 8))]
-                        (if (> length transport/MAX-PAYLOAD)
-                            (disconnect-client s c"journal-frame-too-long")
-                            (do
-                              (journal-get s
-                                           (+ (.cursor s) 12)
-                                           (index out 12)
-                                           length)
-                              (set! (.tx-len s) (+ length 12))
-                              (set! (.cursor s)
-                                    (+ (.cursor s) (.tx-len s)))
-                              0)))))))
+                (pack-journal s)))
         0)))
+
+;;; Journal frames from the cursor, as many as fit. While replaying it stops at the end
+;;; of the history, so the ready frame comes after the history and before live output.
+(defn pack-journal [(s (ptr Session))] (-> i64)
+  (let [limit (if (.ready s) (.end s) (.replay-end s))]
+    (loop (if (or (>= (.cursor s) limit)
+                  (> (+ (.tx-len s) FRAME-CAPACITY) TX-CAPACITY))
+              (break)
+              (let [out (index (field s tx) (.tx-len s))]
+                (journal-get s (.cursor s) out 12)
+                (let [length (p/cast i64 (u32-be out 8))]
+                  (if (> length transport/MAX-PAYLOAD)
+                      (do
+                        (disconnect-client s c"journal-frame-too-long")
+                        (break))
+                      (do
+                        (journal-get s (+ (.cursor s) 12) (index out 12) length)
+                        (set! (.tx-len s) (+ (.tx-len s) length 12))
+                        (set! (.cursor s) (+ (.cursor s) length 12))))))))
+    0))
 
 ;;; Replay that starts after trimmed history first needs what the trimmed frames
 ;;; established: the size the kept frames were written at, and the directory.
@@ -1406,6 +1422,22 @@
                                   ; The attach size is a placeholder, and a running TUI
                                   ; must not see it. The client reports its real
                                   ; size once replay ends.
+                                  (let [(mut buffer)
+                                          (p/cast i32 CLIENT-SEND-BUFFER)]
+                                    (when (!= (setsockopt fd
+                                                          SOL-SOCKET
+                                                          SO-SNDBUF
+                                                          (p/cast (ptr i8)
+                                                                  (mut buffer))
+                                                          (: 4 u32))
+                                              (: 0 i32))
+                                      ; Still works, only slower to replay.
+                                      (transport/log! c"send-buffer-refused errno=%lld"
+                                                      (p/cast i64 (os/errno))
+                                                      0
+                                                      0
+                                                      0)
+                                      0))
                                   (if (set-nonblocking fd)
                                       0
                                       (disconnect-client s
